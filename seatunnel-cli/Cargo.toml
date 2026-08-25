@@ -1,0 +1,28 @@
+[package]
+name = "seatunnel-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - CLI and TUI"
+default-run = "seatunnel"
+
+[[bin]]
+name = "seatunnel"
+path = "src/main.rs"
+
+[dependencies]
+seatunnel-api = { path = "../seatunnel-api" }
+seatunnel-engine-core = { path = "../seatunnel-engine/seatunnel-engine-core" }
+seatunnel-engine-client = { path = "../seatunnel-engine/seatunnel-engine-client" }
+seatunnel-config = { path = "../seatunnel-config" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = "0.8"

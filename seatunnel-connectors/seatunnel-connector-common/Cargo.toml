@@ -1,0 +1,16 @@
+[package]
+name = "seatunnel-connector-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Common connector base classes"
+
+[dependencies]
+seatunnel-api = { path = "../../seatunnel-api" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }

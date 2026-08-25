@@ -1,0 +1,28 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+*.dll
+*.so
+*.dylib
+*.exe
+*.crate
+*.tsan-new.js
+*.tsan-prev.js
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# CI
+.github/actions/*/action.yml.cache
+
+# Docs
+docs/_build/
+docs/**/*.ipynb_checkpoints
+
+# Examples
+examples/**/*.toml.backup

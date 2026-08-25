@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package seatunnel.engine.v1;
+
+// Master service: workers and clients talk to the master
+service MasterService {
+  rpc RegisterWorker(WorkerRegistration) returns (WorkerRegistrationResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportTaskStatus(TaskStatusReport) returns (Empty);
+  rpc ReportCheckpoint(CheckpointReport) returns (Empty);
+  rpc UnregisterWorker(UnregisterWorkerRequest) returns (Empty);
+}
+
+service ClientService {
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc CancelJob(CancelJobRequest) returns (Empty);
+  rpc GetJobStatus(JobStatusRequest) returns (JobStatus);
+  rpc GetClusterInfo(Empty) returns (ClusterInfo);
+  rpc ListJobs(Empty) returns (JobList);
+}
+
+message Empty {}
+
+// --- Worker Registration ---
+message WorkerRegistration {
+  string worker_id = 1;
+  string address = 2;
+  string version = 3;
+  map<string, string> resources = 4;
+  int64 heartbeat_interval_ms = 5;
+}
+
+message WorkerRegistrationResponse {
+  bool success = 1;
+  string message = 2;
+  string leader_address = 3;
+}
+
+message UnregisterWorkerRequest {
+  string worker_id = 1;
+  string address = 2;
+}
+
+// --- Heartbeat ---
+message HeartbeatRequest {
+  string worker_id = 1;
+  string address = 2;
+  int64 timestamp = 3;
+  repeated TaskHeartbeat tasks = 4;
+}
+
+message HeartbeatResponse {
+  string worker_id = 1;
+  int64 next_interval_ms = 2;
+  repeated TaskDescriptor pending_tasks = 3;
+}
+
+message TaskHeartbeat {
+  string task_id = 1;
+  TaskState state = 2;
+  int64 processed_records = 3;
+  int64 last_heartbeat_time = 4;
+  int64 memory_usage = 5;
+}
+
+// --- Task Status ---
+message TaskStatusReport {
+  string worker_id = 1;
+  string task_id = 2;
+  string job_id = 3;
+  TaskState state = 4;
+  int64 timestamp = 5;
+  int64 processed_records = 6;
+  string error_message = 7;
+}
+
+// --- Checkpoint ---
+message CheckpointReport {
+  string job_id = 1;
+  string task_id = 2;
+  int64 checkpoint_id = 3;
+  int64 timestamp = 4;
+  bytes checkpoint_data = 5;
+  bool success = 6;
+}
+
+// --- Client API ---
+message SubmitJobRequest {
+  string job_id = 1;
+  bytes job_config = 2;
+  int32 parallelism = 3;
+  string user = 4;
+  string job_name = 5;
+}
+
+message SubmitJobResponse {
+  bool success = 1;
+  string job_id = 2;
+  string message = 3;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message JobStatusRequest {
+  string job_id = 1;
+}
+
+message JobStatus {
+  string job_id = 1;
+  JobState state = 2;
+  string job_name = 3;
+  int64 start_time = 4;
+  int64 end_time = 5;
+  string error_message = 6;
+  repeated TaskStatusInfo tasks = 7;
+}
+
+message TaskStatusInfo {
+  string task_id = 1;
+  string stage_id = 2;
+  TaskState state = 3;
+  int64 processed_records = 4;
+  int64 start_time = 5;
+  int64 end_time = 6;
+}
+
+message JobList {
+  repeated JobSummary jobs = 1;
+}
+
+message JobSummary {
+  string job_id = 1;
+  string job_name = 2;
+  JobState state = 3;
+  int64 start_time = 4;
+}
+
+message ClusterInfo {
+  repeated WorkerInfo workers = 1;
+  int32 total_tasks = 2;
+  int32 running_tasks = 3;
+  int32 available_workers = 4;
+  string leader_id = 5;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  string address = 2;
+  int64 last_heartbeat = 3;
+  map<string, string> resources = 4;
+  int32 running_tasks = 5;
+}
+
+// --- Task Assignment ---
+message TaskDescriptor {
+  string task_id = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_name = 4;
+  int32 task_index = 5;
+  string source_config_json = 6;
+  string sink_config_json = 7;
+  int32 parallelism = 8;
+  map<string, string> config = 9;
+}
+
+// --- Enums ---
+enum TaskState {
+  TASK_UNKNOWN = 0;
+  TASK_CREATED = 1;
+  TASK_RUNNING = 2;
+  TASK_COMPLETED = 3;
+  TASK_FAILED = 4;
+  TASK_CANCELLED = 5;
+}
+
+enum JobState {
+  JOB_UNKNOWN = 0;
+  JOB_CREATED = 1;
+  JOB_SCHEDULED = 2;
+  JOB_RUNNING = 3;
+  JOB_COMPLETED = 4;
+  JOB_FAILED = 5;
+  JOB_CANCELLED = 6;
+}

@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-master
+  labels:
+    app: {{ .Release.Name }}
+    role: master
+spec:
+  replicas: {{ .Values.master.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+      role: master
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+        role: master
+    spec:
+      containers:
+        - name: master
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.master.port }}
+          command: ["seatunnel", "run", "--config", "/opt/seatunnel/config/v2.stream.template.conf", "-m", "cluster", "-a", "0.0.0.0:{{ .Values.master.port }}"]
+          resources:
+            limits:
+              cpu: {{ .Values.master.resources.limits.cpu }}
+              memory: {{ .Values.master.resources.limits.memory }}
+            requests:
+              cpu: {{ .Values.master.resources.requests.cpu }}
+              memory: {{ .Values.master.resources.requests.memory }}

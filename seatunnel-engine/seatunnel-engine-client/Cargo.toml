@@ -1,0 +1,18 @@
+[package]
+name = "seatunnel-engine-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Engine Client: Job submission client"
+
+[dependencies]
+seatunnel-engine-comm = { path = "../seatunnel-engine-comm" }
+seatunnel-engine-core = { path = "../seatunnel-engine-core" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+reqwest = { workspace = true }

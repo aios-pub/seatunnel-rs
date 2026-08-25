@@ -1,0 +1,20 @@
+[package]
+name = "seatunnel-engine-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Engine Core: DAG, Plan, Task model"
+
+[dependencies]
+seatunnel-api = { path = "../../seatunnel-api" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }

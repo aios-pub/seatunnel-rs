@@ -1,0 +1,20 @@
+# Simple batch job example
+[env]
+parallelism = 2
+job_mode = "BATCH"
+
+[source]
+[[source.fake_source]]
+parallelism = 2
+plugin_output = "fake"
+row_num = 16
+[[source.fake_source.schema.fields]]
+name = "string"
+type = "STRING"
+[[source.fake_source.schema.fields]]
+age = "int"
+type = "INT"
+
+[sink]
+[[sink.console_sink]]
+plugin_input = "fake"

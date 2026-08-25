@@ -1,0 +1,8 @@
+{
+  "name": "apache-seatunnel-rs",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Apache SeaTunnel - A next-generation high-performance, distributed data integration platform written in Rust",
+  "repository": "https://github.com/apache/seatunnel-rs",
+  "license": "Apache-2.0"
+}

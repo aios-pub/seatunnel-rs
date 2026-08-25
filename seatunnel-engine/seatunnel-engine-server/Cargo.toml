@@ -1,0 +1,23 @@
+[package]
+name = "seatunnel-engine-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Engine Server: Master + Worker nodes"
+
+[dependencies]
+seatunnel-engine-core = { path = "../seatunnel-engine-core" }
+seatunnel-engine-comm = { path = "../seatunnel-engine-comm" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+parking_lot = { workspace = true }
+rust-rocksdb = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-util = { workspace = true }

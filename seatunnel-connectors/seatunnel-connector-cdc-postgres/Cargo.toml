@@ -1,0 +1,27 @@
+[package]
+name = "seatunnel-connector-cdc-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - PostgreSQL CDC connector (logical replication)"
+
+[dependencies]
+seatunnel-api = { path = "../../seatunnel-api" }
+seatunnel-connector-common = { path = "../seatunnel-connector-common" }
+seatunnel-connector-cdc-base = { path = "../seatunnel-connector-cdc-base" }
+seatunnel-formats = { path = "../../seatunnel-formats" }
+tokio-postgres = { workspace = true }
+postgres-types = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+regex = "1"
+# pg-walstream: PostgreSQL WAL streaming via logical replication
+# TODO: Add when available on crates.io or switch to alternative
+# pg-walstream = "0.3"

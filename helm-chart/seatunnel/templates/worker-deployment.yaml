@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app: {{ .Release.Name }}
+    role: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+      role: worker
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+        role: worker
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.worker.port }}
+          command: ["seatunnel", "run", "--config", "/opt/seatunnel/config/v2.stream.template.conf", "-m", "cluster", "--address", "{{ .Release.Name }}-master:{{ .Values.master.port }}"]
+          resources:
+            limits:
+              cpu: {{ .Values.worker.resources.limits.cpu }}
+              memory: {{ .Values.worker.resources.limits.memory }}
+            requests:
+              cpu: {{ .Values.worker.resources.requests.cpu }}
+              memory: {{ .Values.worker.resources.requests.memory }}

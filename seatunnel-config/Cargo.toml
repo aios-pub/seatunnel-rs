@@ -1,0 +1,16 @@
+[package]
+name = "seatunnel-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Configuration parsing (YAML/TOML/HOCON)"
+
+[dependencies]
+seatunnel-api = { path = "../seatunnel-api" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+toml = "0.8"

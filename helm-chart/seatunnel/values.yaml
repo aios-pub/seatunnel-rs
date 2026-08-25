@@ -1,0 +1,41 @@
+replicaCount: 1
+
+image:
+  repository: seatunnel/seatunnel-rust
+  tag: 0.1.0
+  pullPolicy: IfNotPresent
+
+master:
+  replicas: 1
+  port: 5000
+  resources:
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+
+worker:
+  replicas: 2
+  port: 5001
+  resources:
+    limits:
+      cpu: "4"
+      memory: "4Gi"
+    requests:
+      cpu: "2"
+      memory: "2Gi"
+
+service:
+  type: ClusterIP
+  port: 5000
+
+config:
+  file: config/v2.stream.template.conf
+  mode: cluster
+
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: ""

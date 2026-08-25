@@ -1,0 +1,153 @@
+[workspace]
+resolver = "2"
+members = [
+    "seatunnel-api",
+    "seatunnel-engine/seatunnel-engine-core",
+    "seatunnel-engine/seatunnel-engine-comm",
+    "seatunnel-engine/seatunnel-engine-server",
+    "seatunnel-engine/seatunnel-engine-client",
+    "seatunnel-config",
+    "seatunnel-formats",
+    "seatunnel-transforms",
+    "seatunnel-cli",
+    "seatunnel-macros",
+    "seatunnel-connectors/seatunnel-connector-common",
+    "seatunnel-connectors/seatunnel-connector-kafka",
+    "seatunnel-connectors/seatunnel-connector-cdc-base",
+    "seatunnel-connectors/seatunnel-connector-cdc-mysql",
+    "seatunnel-connectors/seatunnel-connector-cdc-tidb",
+    "seatunnel-connectors/seatunnel-connector-cdc-postgres",
+    "seatunnel-connectors/seatunnel-connector-jdbc",
+    "seatunnel-benchmarks",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["SeaTunnel Rust Team <dev@seatunnel.apache.org>"]
+repository = "https://github.com/apache/seatunnel-rs"
+homepage = "https://seatunnel.apache.org"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+prost = "0.13"
+prost-types = "0.13"
+
+# gRPC
+tonic = "0.12"
+tonic-build = "0.12"
+prost-build = "0.13"
+
+# HTTP / REST
+axum = { version = "0.7", features = ["macros"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Logging & Metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = "0.13"
+
+# Database
+mysql_async = { version = "0.34", features = ["native-tls-tls"] }
+
+tokio-postgres = "0.7"
+postgres-types = "0.2"
+
+# TiDB / TiKV
+
+
+# PostgreSQL CDC
+
+
+# Kafka
+rdkafka = { version = "0.36", features = ["cmake-build", "libz-static", "ssl", "sasl"] }
+
+# Storage
+rust-rocksdb = "0.52"
+
+# Arrow
+arrow = "53"
+parquet = "53"
+
+# Avro
+avro = "0.2"
+
+# Protobuf
+protobuf = "2.28"
+
+# Schema / Type
+bigdecimal = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Testing
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["mysql", "postgres", "kafka"] }
+
+# Raft
+# raft = "0.7"  # TODO: check availability
+prost-derive = "0.13"
+
+# Utilities
+bytes = "1"
+hex = "0.4"
+once_cell = "1"
+parking_lot = "0.12"
+itertools = "0.14"
+
+# DataFusion for SQL transforms
+datafusion = "43"
+datafusion-expr = "43"
+
+# Workspace members
+seatunnel-api = { path = "seatunnel-api" }
+seatunnel-engine-core = { path = "seatunnel-engine/seatunnel-engine-core" }
+seatunnel-engine-comm = { path = "seatunnel-engine/seatunnel-engine-comm" }
+seatunnel-engine-server = { path = "seatunnel-engine/seatunnel-engine-server" }
+seatunnel-engine-client = { path = "seatunnel-engine/seatunnel-engine-client" }
+seatunnel-config = { path = "seatunnel-config" }
+seatunnel-formats = { path = "seatunnel-formats" }
+seatunnel-transforms = { path = "seatunnel-transforms" }
+seatunnel-cli = { path = "seatunnel-cli" }
+seatunnel-macros = { path = "seatunnel-macros" }
+seatunnel-connector-common = { path = "seatunnel-connectors/seatunnel-connector-common" }
+seatunnel-connector-kafka = { path = "seatunnel-connectors/seatunnel-connector-kafka" }
+seatunnel-connector-cdc-base = { path = "seatunnel-connectors/seatunnel-connector-cdc-base" }
+seatunnel-connector-cdc-mysql = { path = "seatunnel-connectors/seatunnel-connector-cdc-mysql" }
+seatunnel-connector-cdc-tidb = { path = "seatunnel-connectors/seatunnel-connector-cdc-tidb" }
+seatunnel-connector-cdc-postgres = { path = "seatunnel-connectors/seatunnel-connector-cdc-postgres" }
+seatunnel-connector-jdbc = { path = "seatunnel-connectors/seatunnel-connector-jdbc" }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "warn" }
+perf = { level = "warn" }
+style = { level = "warn" }
+suspicious = { level = "warn" }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+unused_imports = "warn"
+unused_variables = "warn"
+dead_code = "warn"

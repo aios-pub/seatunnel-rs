@@ -1,0 +1,19 @@
+[package]
+name = "seatunnel-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Data format serializers (JSON, Avro, Protobuf, etc.)"
+
+[dependencies]
+seatunnel-api = { path = "../seatunnel-api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost = { workspace = true }
+avro = { workspace = true }
+arrow = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }

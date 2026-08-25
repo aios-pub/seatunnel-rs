@@ -1,0 +1,22 @@
+[package]
+name = "seatunnel-connector-cdc-tidb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - TiDB CDC connector (using TiKV client)"
+
+[dependencies]
+seatunnel-api = { path = "../../seatunnel-api" }
+seatunnel-connector-common = { path = "../seatunnel-connector-common" }
+seatunnel-connector-cdc-base = { path = "../seatunnel-connector-cdc-base" }
+seatunnel-formats = { path = "../../seatunnel-formats" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+mysql_async = { workspace = true }

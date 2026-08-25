@@ -1,0 +1,23 @@
+[package]
+name = "seatunnel-engine-comm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Engine Communication: gRPC layer"
+
+[dependencies]
+seatunnel-engine-core = { path = "../seatunnel-engine-core" }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
