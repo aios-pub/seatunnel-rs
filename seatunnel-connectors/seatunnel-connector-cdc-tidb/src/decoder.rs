@@ -296,7 +296,21 @@ impl TransactionTracker {
 
     /// Feed a CDC row event from the EventFeed stream.
     pub fn on_row(&mut self, row: &CdcRow) {
+        tracing::debug!(
+            "TiKV CDC tracker: on_row type={} key_len={} start_ts={} commit_ts={}",
+            row.r#type,
+            row.key.len(),
+            row.start_ts,
+            row.commit_ts
+        );
         let Some((_table_id, handle)) = decode_record_key(&row.key) else {
+            tracing::debug!(
+                "TiKV CDC tracker: failed to decode record key: {}",
+                row.key
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
             return;
         };
         // LogType: PREWRITE=1, COMMIT=2, ROLLBACK=3, COMMITTED=4

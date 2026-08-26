@@ -254,20 +254,31 @@ impl CdcEngine {
     }
 
     /// Ensure the stream for `region_id` is open; reconnect with backoff on error.
+    ///
+    /// The subscription span is the **table's key range intersected with the
+    /// region**, matching official TiCDC: subscribing with raw region bounds
+    /// makes the server-side entry filter reject everything (the observed
+    /// range must decode to the same keyspace as the streamed entries).
     async fn ensure_stream(&mut self, region_id: u64) -> anyhow::Result<()> {
         let region = self.regions.get(&region_id).unwrap();
         let already_open = region.stream.is_some();
         if already_open {
             return Ok(());
         }
-        let addr = region.leader_addr.clone().unwrap_or_default();
-        let start_key = region.start_key.clone();
-        let end_key = region.end_key.clone();
+        // Span = the table prefix itself (PLAIN keys — official TiCDC notes
+        // they are *not* memcomparable-wrapped; any other form makes TiKV's
+        // ObservedRange decode fail and every entry gets filtered server-side).
+        // TiKV intersects the span with the region internally.
+        let sk = self.config.start_key.clone();
+        let ek = self.config.end_key.clone();
         let epoch = region.epoch;
         let checkpoint = self.config.checkpoint_ts;
+        let addr = region.leader_addr.clone().unwrap_or_default();
+
+        // cdc_client wraps sk/ek with EncodeBytes on the wire.
         let stream = self
             .cdc
-            .open_region_stream(&addr, region_id, epoch, &start_key, &end_key, checkpoint)
+            .open_region_stream(&addr, region_id, epoch, &sk, &ek, checkpoint)
             .await?;
         if let Some(s) = self.regions.get_mut(&region_id) {
             s.stream = Some(stream);
@@ -375,7 +386,15 @@ impl CdcEngine {
                 }
             };
             match &res {
-                Ok(Some(_)) => tracing::debug!("TiKV CDC: region {} delivered an event", region_id),
+                Ok(Some(_)) => {
+                    tracing::debug!("TiKV CDC: region {} delivered an event", region_id);
+                    // count entries inside for diagnosis
+                    if let Some(r) = self.regions.get(&region_id) {
+                        if let Some(st) = &r.stream {
+                            let _ = st;
+                        }
+                    }
+                }
                 Ok(None) => tracing::debug!("TiKV CDC: region {} stream ended (None)", region_id),
                 Err(e) => tracing::debug!("TiKV CDC: region {} read error: {}", region_id, e),
             }
