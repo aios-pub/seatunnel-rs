@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::error::Error;
 
 pub mod avro;
+pub mod canal_client_json;
 pub mod canal_json;
 pub mod compatible_debezium_json;
 pub mod compatible_kafka_connect_json;
@@ -30,6 +31,7 @@ pub enum MessageFormat {
     Json,
     Text,
     CanalJson,
+    CanalClientJson,
     DebeziumJson,
     CompatibleDebeziumJson,
     CompatibleKafkaConnectJson,
@@ -49,6 +51,9 @@ impl MessageFormat {
             "json" => Some(MessageFormat::Json),
             "text" => Some(MessageFormat::Text),
             "canal_json" | "canal-json" => Some(MessageFormat::CanalJson),
+            "canal_client_json" | "canal-client-json" | "canal_client" | "canal-client" => {
+                Some(MessageFormat::CanalClientJson)
+            }
             "debezium_json" | "debezium-json" => Some(MessageFormat::DebeziumJson),
             "compatible_debezium_json" | "compatible-debezium-json" => {
                 Some(MessageFormat::CompatibleDebeziumJson)
@@ -70,6 +75,7 @@ impl MessageFormat {
             MessageFormat::Json => "JSON",
             MessageFormat::Text => "TEXT",
             MessageFormat::CanalJson => "CANAL_JSON",
+            MessageFormat::CanalClientJson => "CANAL_CLIENT_JSON",
             MessageFormat::DebeziumJson => "DEBEZIUM_JSON",
             MessageFormat::CompatibleDebeziumJson => "COMPATIBLE_DEBEZIUM_JSON",
             MessageFormat::CompatibleKafkaConnectJson => "COMPATIBLE_KAFKA_CONNECT_JSON",
@@ -93,6 +99,7 @@ pub fn deserialize(
         MessageFormat::Json => json::deserialize(bytes, schema)?,
         MessageFormat::Text => text::deserialize(bytes, schema)?,
         MessageFormat::CanalJson => canal_json::deserialize(bytes, schema)?,
+        MessageFormat::CanalClientJson => canal_client_json::deserialize(bytes, schema)?,
         MessageFormat::DebeziumJson => debezium_json::deserialize(bytes, schema)?,
         MessageFormat::CompatibleDebeziumJson => {
             compatible_debezium_json::deserialize(bytes, schema)?
@@ -121,6 +128,7 @@ pub fn deserialize_all(
         MessageFormat::Json => json::deserialize(bytes, schema),
         MessageFormat::Text => text::deserialize(bytes, schema),
         MessageFormat::CanalJson => canal_json::deserialize(bytes, schema),
+        MessageFormat::CanalClientJson => canal_client_json::deserialize(bytes, schema),
         MessageFormat::DebeziumJson => debezium_json::deserialize(bytes, schema),
         MessageFormat::CompatibleDebeziumJson => {
             compatible_debezium_json::deserialize(bytes, schema)
@@ -146,6 +154,7 @@ pub fn serialize(
         MessageFormat::Json => json::serialize(schema, row),
         MessageFormat::Text => text::serialize(schema, row),
         MessageFormat::CanalJson => canal_json::serialize(schema, row),
+        MessageFormat::CanalClientJson => canal_client_json::serialize(schema, row),
         MessageFormat::DebeziumJson => debezium_json::serialize(schema, row),
         MessageFormat::CompatibleDebeziumJson => compatible_debezium_json::serialize(schema, row),
         MessageFormat::CompatibleKafkaConnectJson => {

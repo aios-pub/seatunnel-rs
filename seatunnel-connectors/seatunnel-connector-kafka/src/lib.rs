@@ -702,6 +702,8 @@ pub struct KafkaSinkConfig {
     pub message_timeout_ms: u64,
     /// Field names (or `#ordinal` like `#0`) routed into the message key.
     pub partition_key_fields: Vec<String>,
+    /// Canal-client format configuration (format = canal_client_json).
+    pub canal_client: Option<seatunnel_formats::canal_client_json::CanalClientConfig>,
     /// Delimiter joining fields for TEXT format payloads.
     pub field_delimiter: String,
 }
@@ -719,6 +721,7 @@ impl Default for KafkaSinkConfig {
             message_timeout_ms: 30_000,
             partition_key_fields: Vec::new(),
             field_delimiter: ",".to_string(),
+            canal_client: None,
         }
     }
 }
@@ -753,6 +756,33 @@ impl KafkaSinkConfig {
                 .map(|f| f.trim().to_string())
                 .filter(|f| !f.is_empty())
                 .collect(),
+            canal_client: config
+                .get_string("format", "")
+                .eq_ignore_ascii_case("canal_client_json")
+                .then(|| {
+                    Some(seatunnel_formats::canal_client_json::CanalClientConfig {
+                        database_name: config.get_string(
+                            "canal-client.database-name",
+                            &config.get_string("database-name", ""),
+                        ),
+                        table_name: config.get_string(
+                            "canal-client.table-name",
+                            &config.get_string("table-name", ""),
+                        ),
+                        columns: config
+                            .get_string("canal-client.columns", &config.get_string("columns", ""))
+                            .split(',')
+                            .map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect(),
+                        tables: serde_json::from_str(&config.get_string(
+                            "canal-client.sub-table-fields",
+                            &config.get_string("canal-client.sub_table_fields", "{}"),
+                        ))
+                        .unwrap_or_default(),
+                    })
+                })
+                .flatten(),
             field_delimiter: config.get_string("field.delimiter", &config.get_string("field_delimiter", ",")),
         }
     }
@@ -796,7 +826,7 @@ impl Sink for KafkaSink {
             >,
         >,
     > {
-        Ok(Box::new(KafkaSinkWriter::new(self.config.clone())))
+        Ok(Box::new(KafkaSinkWriter::new(self.config.clone())?))
     }
 
     fn restore_writer(
@@ -812,7 +842,7 @@ impl Sink for KafkaSink {
             >,
         >,
     > {
-        Ok(Box::new(KafkaSinkWriter::new(self.config.clone())))
+        Ok(Box::new(KafkaSinkWriter::new(self.config.clone())?))
     }
 
     fn get_input_schema(&self) -> Option<TableSchema> {
@@ -844,16 +874,30 @@ pub struct KafkaSinkWriter {
     batch: Vec<Row>,
     total_written: usize,
     producer: Option<FutureProducer>,
+    /// Stateful canal-client encoder (row pairing + filtering + keys).
+    canal_encoder: Option<seatunnel_formats::canal_client_json::CanalClientEncoder>,
 }
 
 impl KafkaSinkWriter {
-    pub fn new(config: KafkaSinkConfig) -> Self {
-        KafkaSinkWriter {
+    pub fn new(config: KafkaSinkConfig) -> anyhow::Result<Self> {
+        let canal_encoder = config
+            .canal_client
+            .clone()
+            .map(seatunnel_formats::canal_client_json::CanalClientEncoder::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("canal-client format config: {}", e))?;
+        Ok(KafkaSinkWriter {
             config,
             batch: Vec::new(),
             total_written: 0,
             producer: None,
-        }
+            canal_encoder,
+        })
+    }
+
+    /// Whether the canal-client stateful encoder is active (diagnostics).
+    pub fn uses_canal_client(&self) -> bool {
+        self.canal_encoder.is_some()
     }
 
     /// Lazily initialize the rdkafka producer from `bootstrap.servers`.
@@ -899,6 +943,75 @@ impl KafkaSinkWriter {
             None => anyhow::bail!("kafka producer unavailable"),
         };
         let records: Vec<Row> = std::mem::take(&mut self.batch);
+
+        // Canal-client format: the stateful encoder pairs update rows,
+        // filters changeless updates and derives the Kafka key per
+        // message. Runs even for empty batches so held before-images
+        // whose pairing window expired are emitted as real deletes.
+        if let Some(encoder) = &mut self.canal_encoder {
+            if self.config.transactions_enabled {
+                producer
+                    .begin_transaction()
+                    .map_err(|e| anyhow::anyhow!("begin_transaction failed: {}", e))?;
+            }
+            let topic = self.config.topic.clone();
+            let mut sent = 0usize;
+            let mut failures = Vec::new();
+            for record in &records {
+                let messages = encoder
+                    .encode(record)
+                    .map_err(|e| anyhow::anyhow!("canal-client encode: {}", e))?;
+                for (key, payload) in messages {
+                    match producer
+                        .send(
+                            FutureRecord::<str, str>::to(&topic)
+                                .key(key.as_str())
+                                .payload(&payload),
+                            Duration::from_millis(self.config.message_timeout_ms),
+                        )
+                        .await
+                    {
+                        Ok(_) => sent += 1,
+                        Err((e, _)) => failures.push(e.to_string()),
+                    }
+                }
+            }
+            for (key, payload) in encoder.expire_pending() {
+                match producer
+                    .send(
+                        FutureRecord::<str, str>::to(&topic)
+                            .key(key.as_str())
+                            .payload(&payload),
+                        Duration::from_millis(self.config.message_timeout_ms),
+                    )
+                    .await
+                {
+                    Ok(_) => sent += 1,
+                    Err((e, _)) => failures.push(e.to_string()),
+                }
+            }
+            if !failures.is_empty() {
+                if self.config.transactions_enabled {
+                    let _ = producer.abort_transaction(Duration::from_secs(10));
+                }
+                anyhow::bail!(
+                    "failed to deliver {} record(s): {}",
+                    failures.len(),
+                    failures.first().map(String::as_str).unwrap_or("unknown")
+                );
+            }
+            if self.config.transactions_enabled {
+                producer
+                    .commit_transaction(Duration::from_secs(30))
+                    .map_err(|e| {
+                        let _ = producer.abort_transaction(Duration::from_secs(10));
+                        anyhow::anyhow!("commit_transaction failed: {}", e)
+                    })?;
+            }
+            self.total_written += sent;
+            return Ok(sent);
+        }
+
         if records.is_empty() {
             return Ok(0);
         }
@@ -1044,6 +1157,22 @@ impl SinkWriter for KafkaSinkWriter {
                     self.batch.len()
                 );
                 self.flush_batch().await?;
+            }
+            // Canal-client: emit any held before-image as a final delete.
+            if let (Some(encoder), Some(producer)) = (&mut self.canal_encoder, &self.producer) {
+                for (key, payload) in encoder.flush() {
+                    if let Err((e, _)) = producer
+                        .send(
+                            FutureRecord::<str, str>::to(&self.config.topic)
+                                .key(key.as_str())
+                                .payload(&payload),
+                            Duration::from_millis(self.config.message_timeout_ms),
+                        )
+                        .await
+                    {
+                        tracing::warn!("KafkaSinkWriter: canal-client final flush failed: {}", e);
+                    }
+                }
             }
             if let Some(producer) = &self.producer {
                 producer.poll(Duration::from_secs(5));
@@ -1250,7 +1379,8 @@ mod tests {
         let writer = KafkaSinkWriter::new(KafkaSinkConfig {
             batch_size: 50,
             ..KafkaSinkConfig::default()
-        });
+        })
+        .unwrap();
         assert!(writer.batch.is_empty());
         assert_eq!(writer.total_written, 0);
     }
@@ -1325,6 +1455,63 @@ mod tests {
         row.set(2, seatunnel_api::Field::Null);
         let text = encode_row(&row, &MessageFormat::Text, ",");
         assert_eq!(text, "1,alice,");
+    }
+
+    #[test]
+    fn test_canal_client_config_parsing() {
+        let props: HashMap<String, String> = [
+            ("bootstrap.servers", "b:9092"),
+            ("format", "canal_client_json"),
+            ("canal-client.database-name", "MyDb"),
+            ("canal-client.table-name", "l_class_student"),
+            ("canal-client.columns", "id,name,status"),
+            (
+                "canal-client.sub-table-fields",
+                r#"{"lClassStudent": {"key": "id", "must": {"id": "id"}, "update": {"status": "status"}}}"#,
+            ),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
+        let canal = config.canal_client.expect("canal config present");
+        assert_eq!(canal.database_name, "MyDb");
+        assert_eq!(canal.columns, vec!["id", "name", "status"]);
+        assert!(canal.tables.contains_key("lClassStudent"));
+        // Encoder builds and finds the mapping.
+        assert!(seatunnel_formats::canal_client_json::CanalClientEncoder::new(canal).is_ok());
+        // Non-canal-client formats leave it off.
+        let props2: HashMap<String, String> =
+            [("format".to_string(), "json".to_string())].into_iter().collect();
+        assert!(
+            KafkaSinkConfig::from_config(&ConnectorConfig::new(props2))
+                .canal_client
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_canal_client_yaml_shape_enables_encoder() {
+        // Exact key set produced from the example yaml's sink section
+        // (dotted scalar keys survive the json→flat-map flattening).
+        let props: HashMap<String, String> = [
+            ("bootstrap.servers", "127.0.0.1:9092"),
+            ("topic", "users-canal-client"),
+            ("format", "canal_client_json"),
+            ("canal-client.database-name", "seatunnel"),
+            ("canal-client.table-name", "users"),
+            ("canal-client.columns", "id,name,score"),
+            (
+                "canal-client.sub-table-fields",
+                "{ \"users\": { \"key\": \"id\", \"must\": { \"id\": \"id\", \"name\": \"name\" }, \"update\": { \"score\": \"score\" } } }",
+            ),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let cfg = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
+        let writer = KafkaSinkWriter::new(cfg).unwrap();
+        assert!(writer.uses_canal_client());
     }
 
     #[test]

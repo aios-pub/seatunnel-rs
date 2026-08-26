@@ -1,0 +1,49 @@
+# MySQL CDC → Kafka with the canal-client JSON format.
+#
+# Reproduces the message shape of the Java AbstractCanalClient pipeline:
+#   { "requestId", "dbName", "tableName", "eventType",
+#     "data": {...}, "oldData": {...} }
+# with per-table field mapping (must / update), strict date→epoch-millis
+# and pure-number→long conversion, update filtering, and the primary key
+# as the Kafka partition key.
+#
+# Submit:
+#   seatunnel job submit -c examples/mysql-cdc-to-kafka-canal-client.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: mysql-cdc-to-kafka-canal-client
+  parallelism: 1
+  checkpoint.interval: 3000
+
+source:
+  MySQL-CDC:
+    hostname: "127.0.0.1"
+    port: 13306
+    username: root
+    password: root
+    database-name: seatunnel
+    table-name: users
+    startup.mode: initial
+    split.column: id
+
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    topic: users-canal-client
+    format: canal_client_json
+    # Message dbName/tableName (lowercased in the payload); the camelCase
+    # form of the table name (l_class_student → lClassStudent) selects
+    # the sub-table-fields entry.
+    canal-client.database-name: seatunnel
+    canal-client.table-name: users
+    # Positional → db column names (CDC rows arrive positionally).
+    canal-client.columns: "id,name,score"
+    # Java subTableFieldsJson shape: camel table → {key, must, update}.
+    canal-client.sub-table-fields: >-
+      {
+        "users": {
+          "key": "id",
+          "must": { "id": "id", "name": "name" },
+          "update": { "score": "score" }
+        }
+      }

@@ -49,3 +49,6 @@ connector-postgres = ["connectors"]
 connector-tidb = ["connectors"]
 connector-kafka = ["connectors"]
 connector-jdbc = ["connectors"]
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

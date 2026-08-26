@@ -780,7 +780,7 @@ pub fn create_sink(
                     cfg.acks
                 );
                 Ok(Box::new(SinkWriterAdapter {
-                    inner: KafkaSinkWriter::new(cfg),
+                    inner: KafkaSinkWriter::new(cfg)?,
                 }))
             }
             #[cfg(not(feature = "connectors"))]
@@ -967,5 +967,69 @@ fn json_scalar_to_field(v: &serde_json::Value) -> Field {
         }
         serde_json::Value::String(s) => Field::String(s.clone()),
         _ => Field::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_to_config_map_flattens_dotted_canal_client_keys() {
+        // Replicates the sink section of
+        // examples/mysql-cdc-to-kafka-canal-client.yaml through the real
+        // yaml → json → flat-map chain.
+        let yaml = r#"
+Kafka:
+  bootstrap.servers: "127.0.0.1:9092"
+  topic: users-canal-client
+  format: canal_client_json
+  canal-client.database-name: seatunnel
+  canal-client.table-name: users
+  canal-client.columns: "id,name,score"
+  canal-client.sub-table-fields: >-
+    {
+      "users": {
+        "key": "id",
+        "must": { "id": "id", "name": "name" },
+        "update": { "score": "score" }
+      }
+    }
+"#;
+        let value: serde_json::Value = serde_yaml::from_str(yaml).expect("yaml parses");
+        let flat = json_to_config_map(&value["Kafka"]);
+        eprintln!("FLAT_MAP_KEYS={:?}", flat.keys().collect::<Vec<_>>());
+        for key in [
+            "format",
+            "canal-client.database-name",
+            "canal-client.table-name",
+            "canal-client.columns",
+            "canal-client.sub-table-fields",
+        ] {
+            assert!(
+                flat.contains_key(key),
+                "missing key '{}' in {:?}",
+                key,
+                flat.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(flat["format"], "canal_client_json");
+    }
+
+    #[test]
+    fn test_parse_sink_declarations_shapes() {
+        // Array of single-key blocks.
+        let array = serde_json::json!([{ "Kafka": { "topic": "a" } }, { "JDBC": {} }]);
+        let sinks = parse_sink_declarations(&array).unwrap();
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(sinks[0].plugin, "Kafka");
+        // Multi-key map.
+        let map = serde_json::json!({ "Kafka": {}, "JDBC": {} });
+        assert_eq!(parse_sink_declarations(&map).unwrap().len(), 2);
+        // Legacy single block.
+        let single = serde_json::json!({ "Console": {} });
+        assert_eq!(parse_sink_declarations(&single).unwrap().len(), 1);
+        // Empty list is rejected.
+        assert!(parse_sink_declarations(&serde_json::json!([])).is_err());
     }
 }
