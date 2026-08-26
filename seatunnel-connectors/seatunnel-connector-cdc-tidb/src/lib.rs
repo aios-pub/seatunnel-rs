@@ -176,6 +176,10 @@ pub struct TiDBCdcConfig {
     /// Rewrites applied to TiKV leader addresses reported by PD
     /// (`from=to[,from=to…]`, host part only).
     pub store_address_rewrite: Vec<(String, String)>,
+    /// Re-register region streams every N ms (0 disables). Each cycle makes
+    /// TiKV run an incremental scan from the last resolved_ts — the reliably
+    /// delivered change path. Default 10 000.
+    pub resubscribe_interval_ms: u64,
     /// MySQL-compatible connection info for reading table metadata/data.
     pub conn: TiDBCdcConnConfig,
 }
@@ -195,6 +199,7 @@ impl Default for TiDBCdcConfig {
             subtask_count: 1,
             capture_timeout: 300_000,
             store_address_rewrite: Vec::new(),
+            resubscribe_interval_ms: 10_000,
             conn: TiDBCdcConnConfig::new("127.0.0.1", 4000, "root", "", "seatunnel"),
         }
     }
@@ -238,6 +243,8 @@ impl TiDBCdcConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
+            resubscribe_interval_ms: config.get_int("resubscribe-interval-ms", 10_000).max(0)
+                as u64,
             conn: TiDBCdcConnConfig::new(
                 config.get_string("conn-host", "127.0.0.1").as_str(),
                 config.get_int("conn-port", 4000) as u16,
@@ -541,6 +548,7 @@ impl TiDBCdcReader {
             checkpoint_ts: self.resolved_ts.0,
             request_snapshot: false,
             address_rewrite: self.config.store_address_rewrite.clone(),
+            resubscribe_interval_ms: self.config.resubscribe_interval_ms,
         };
         let mut engine = crate::cdc_engine::CdcEngine::new(engine_config);
         engine.start().await.map_err(|e| {
@@ -877,25 +885,35 @@ fn column_value_to_field(col: &crate::decoder::ColumnValue) -> Field {
     }
 }
 
-/// Build the TiKV key range covering all rows of a table.
+/// Memcomparable encoding of an i64 key component: big-endian with the sign
+/// bit flipped (`codec.EncodeIntToCmpUint` in TiDB). Table ids and int
+/// handles in TiKV keys always use this encoding — plain BE sorts BEFORE the
+/// real keyspace and makes TiKV silently filter every entry.
+fn encode_cmp_i64(v: i64) -> [u8; 8] {
+    (v as u64 ^ (1 << 63)).to_be_bytes()
+}
+
+/// Build the TiKV key range covering all rows of a table, mirroring
+/// `tablecodec.GenTableRecordPrefix` and its Next() successor:
 ///
-/// Record keys are `t{table_id}_r{handle}` with an 8-byte memcomparable
-/// handle (big-endian int64, sign bit flipped). TiKV's CDC endpoint
-/// **validates the padding** of both range bounds (`KeyPadding` error),
-/// so the lower bound must carry a complete minimal handle
-/// (`MinInt64 → 0x00 × 8`) and the upper bound is `Next()` of the maximal
-/// record key (`MaxInt64 → 0xFF × 8`, increment-carry → `…_s`).
+/// ```text
+/// start = 't' + cmp_i64(table_id) + "_r" + cmp_i64(MinInt64)   (= 0x00 × 8)
+/// end   = 't' + cmp_i64(table_id) + "_s"                        (Next of max row)
+/// ```
+///
+/// TiKV's CDC endpoint validates these bounds (`ObservedRange`) and uses
+/// them to filter every streamed entry, so the encoding must byte-match the
+/// real record keys exactly.
 fn table_key_range(table_id: i64) -> (Vec<u8>, Vec<u8>) {
     let mut start = Vec::with_capacity(19);
     start.push(b't');
-    start.extend_from_slice(&table_id.to_be_bytes());
-    start.push(b'_');
-    start.push(b'r');
-    start.extend_from_slice(&[0u8; 8]); // enc_handle(MinInt64)
+    start.extend_from_slice(&encode_cmp_i64(table_id));
+    start.extend_from_slice(b"_r");
+    start.extend_from_slice(&encode_cmp_i64(i64::MIN)); // 0x00 × 8
 
     let mut end = Vec::with_capacity(11);
     end.push(b't');
-    end.extend_from_slice(&table_id.to_be_bytes());
+    end.extend_from_slice(&encode_cmp_i64(table_id));
     end.push(b'_');
     end.push(b's'); // Next("…_r" + 0xFF × 8)
     (start, end)
@@ -962,24 +980,25 @@ mod tests {
 
     #[test]
     fn test_tidb_table_key_range_layout() {
-        // Real TiKV layout: 't' + 8-byte BE table id + "_r" + 8-byte handle.
+        // Real TiKV layout: 't' + cmp_i64(table id) + "_r" + cmp_i64(handle).
         let (start, end) = table_key_range(45);
         let mut expected_start = vec![b't'];
-        expected_start.extend_from_slice(&45i64.to_be_bytes());
+        expected_start.extend_from_slice(&encode_cmp_i64(45)); // sign bit set
         expected_start.extend_from_slice(b"_r");
-        expected_start.extend_from_slice(&[0u8; 8]); // enc_handle(MinInt64)
+        expected_start.extend_from_slice(&[0u8; 8]); // cmp_i64(MinInt64)
         assert_eq!(start, expected_start);
+        assert_eq!(expected_start[1], 0x80); // cmpuint flips the sign bit
 
         // Exclusive end: Next() over the maximal record key.
         let mut expected_end = vec![b't'];
-        expected_end.extend_from_slice(&45i64.to_be_bytes());
+        expected_end.extend_from_slice(&encode_cmp_i64(45));
         expected_end.extend_from_slice(b"_s");
         assert_eq!(end, expected_end);
         assert!(start < end);
 
         // A real row key (handle=6) falls inside the range.
         let mut row = expected_start.clone();
-        *row.last_mut().unwrap() = 0x06; // enc_handle(6): sign-flipped BE
+        *row.last_mut().unwrap() = 0x06; // cmp_i64(6): only low bits differ
         assert!(row >= start && row < end);
     }
 

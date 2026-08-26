@@ -21,7 +21,7 @@ use crate::kvproto::kvrpcpb::ExtraOp;
 use crate::kvproto::metapb::RegionEpoch;
 
 /// TiKV CDC service version advertised in the request header.
-const TICDC_VERSION: &str = "8.0.0";
+const TICDC_VERSION: &str = "8.1.0";
 
 /// A single EventFeedV2 stream for one region.
 pub struct RegionCdcStream {
@@ -59,7 +59,7 @@ impl RegionCdcStream {
             request_id,
             extra_op: ExtraOp::ReadOldValue as i32,
             kv_api: KvApi::TiDb as i32,
-            filter_loop: true,
+            filter_loop: false,
             request: Some(Request::Register(Default::default())),
         }
     }
@@ -88,11 +88,20 @@ impl RegionCdcStream {
         // EventFeedV2 is a bidi stream. The registration request goes first,
         // then the send side must STAY OPEN — closing it makes TiKV cancel
         // the whole stream (the server treats client EOF as disconnect).
+        //
+        // The `features: stream-multiplexing` h2 header mirrors official
+        // TiCDC: with it, TiKV buckets per-request state and tags
+        // ResolvedTs messages with their request_id.
         use futures::stream;
         let req_stream = stream::iter(vec![request.clone()]).chain(stream::pending());
+        let mut grpc_req = tonic::Request::new(req_stream);
+        grpc_req.metadata_mut().insert(
+            "features",
+            "stream-multiplexing".parse().expect("valid header value"),
+        );
         let mut client = ChangeDataClient::new(channel);
         let response = client
-            .event_feed_v2(req_stream)
+            .event_feed_v2(grpc_req)
             .await
             .map_err(|e| anyhow::anyhow!("EventFeedV2 for region {} failed: {}", region_id, e))?;
         tracing::info!(
@@ -145,7 +154,12 @@ impl RegionCdcStream {
     pub async fn reconnect(&mut self) -> anyhow::Result<()> {
         use futures::stream;
         let req_stream = stream::iter(vec![self.base_request.clone()]).chain(stream::pending());
-        let response = self.client.event_feed_v2(req_stream).await.map_err(|e| {
+        let mut grpc_req = tonic::Request::new(req_stream);
+        grpc_req.metadata_mut().insert(
+            "features",
+            "stream-multiplexing".parse().expect("valid header value"),
+        );
+        let response = self.client.event_feed_v2(grpc_req).await.map_err(|e| {
             anyhow::anyhow!(
                 "EventFeedV2 reconnect for region {} failed: {}",
                 self.region_id,

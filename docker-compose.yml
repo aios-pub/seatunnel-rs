@@ -80,6 +80,9 @@ services:
     profiles: ["tidb"]
     ports:
       - "2379:2379"
+    volumes:
+      - tidb-pd-data:/data
+      - tidb-pd-peer:/peer
     command:
       - "--name=pd"
       - "--data-dir=/data"
@@ -105,7 +108,7 @@ services:
       - "--advertise-addr=host.docker.internal:30160"
       - "--status-addr=0.0.0.0:20180"
       - "--data-dir=/data"
-      - "--log-level=warn"
+      - "-L=debug"
 
   tidb:
     image: pingcap/tidb:v8.1.0
@@ -123,3 +126,5 @@ services:
 
 volumes:
   tidb-tikv-data:
+  tidb-pd-data:
+  tidb-pd-peer:

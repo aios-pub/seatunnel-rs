@@ -66,6 +66,11 @@ pub struct CdcEngineConfig {
     /// `host.docker.internal` is rewritten to `127.0.0.1` for workers running
     /// on the host, where that DNS name does not resolve.
     pub address_rewrite: Vec<(String, String)>,
+    /// Re-register each region stream every N milliseconds. Each
+    /// re-registration triggers a fresh incremental scan from the current
+    /// `resolved_ts`, which is currently the only reliably-delivered change
+    /// path against some TiKV builds (see connector docs). 0 disables.
+    pub resubscribe_interval_ms: u64,
 }
 
 /// Apply the configured host rewrites to `addr` ("host:port").
@@ -94,10 +99,20 @@ pub struct CdcEngine {
     pending_rows: VecDeque<CdcRowEvent>,
     /// Whether the last poll found a new event (for backoff tuning).
     last_had_events: bool,
+    /// Monotonic instant of the last periodic re-subscription.
+    last_resubscribe: Option<std::time::Instant>,
+    /// Checkpoint to resume from on re-registration: starts at the initial
+    /// TSO and only advances when data rows were actually received. Using
+    /// the (server-driven) resolved_ts here would skip writes whose locks
+    /// were never routed to us.
+    resume_checkpoint_ts: u64,
+    /// Highest commit_ts/resolved_ts of rows actually emitted from pending.
+    last_data_ts: u64,
 }
 
 impl CdcEngine {
     pub fn new(config: CdcEngineConfig) -> Self {
+        let resume_checkpoint_ts = config.checkpoint_ts;
         CdcEngine {
             config,
             pd: None,
@@ -107,6 +122,9 @@ impl CdcEngine {
             global_resolved_ts: 0,
             pending_rows: VecDeque::new(),
             last_had_events: false,
+            last_resubscribe: None,
+            resume_checkpoint_ts,
+            last_data_ts: 0,
         }
     }
 
@@ -137,8 +155,12 @@ impl CdcEngine {
             tracing::info!("TiKV CDC: resolved starting TSO {}", tso);
             self.config.checkpoint_ts = tso;
             self.global_resolved_ts = tso;
+            // Anchor periodic re-scans at the same point until real data
+            // arrives (a zero checkpoint is rejected/mishandled by TiKV).
+            self.resume_checkpoint_ts = tso;
         } else {
             self.global_resolved_ts = self.config.checkpoint_ts;
+            self.resume_checkpoint_ts = self.resume_checkpoint_ts.max(self.config.checkpoint_ts);
         }
         self.pd = Some(pd);
 
@@ -273,15 +295,33 @@ impl CdcEngine {
             }
         }
 
+        // Periodic re-registration: each fresh registration makes TiKV run
+        // an incremental scan from the current resolved_ts, which is the
+        // reliably-delivered change path (see config docs). Advance the
+        // checkpoint first so no window is missed; overlap is at-least-once.
+        if self.config.resubscribe_interval_ms > 0 {
+            let due = match self.last_resubscribe {
+                None => true,
+                Some(t) => t.elapsed().as_millis() as u64 >= self.config.resubscribe_interval_ms,
+            };
+            if due && !self.regions.is_empty() {
+                self.config.checkpoint_ts = self.resume_checkpoint_ts;
+                tracing::debug!(
+                    "TiKV CDC: periodic re-subscribe (checkpoint_ts={})",
+                    self.config.checkpoint_ts
+                );
+                for r in self.regions.values_mut() {
+                    if r.stream.take().is_some() {
+                        r.failures = 0;
+                    }
+                }
+                self.last_resubscribe = Some(std::time::Instant::now());
+            }
+        }
+
         let mut consumed = 0usize;
         let mut had_event = false;
         let region_ids: Vec<u64> = self.regions.keys().copied().collect();
-        tracing::debug!(
-            "TiKV CDC: poll_with_budget({}ms) over {} region(s): {:?}",
-            budget_ms,
-            region_ids.len(),
-            region_ids
-        );
 
         for region_id in region_ids {
             // Open stream if needed.
@@ -381,8 +421,10 @@ impl CdcEngine {
         };
         let mut row_count = 0;
         for ev in event.events {
-            // Another subscriber's events (different request_id) are not ours.
-            if ev.request_id != my_request_id {
+            // Another subscriber's events (different request_id) are not
+            // ours. A zero id is only legitimate for store-level messages,
+            // never for Entries — keep those filtered.
+            if ev.request_id != my_request_id && ev.request_id != 0 {
                 tracing::debug!(
                     "TiKV CDC: dropping sub-event for foreign request_id {} (ours {})",
                     ev.request_id,
@@ -414,15 +456,11 @@ impl CdcEngine {
                 _ => {}
             }
         }
-        // Top-level resolved_ts is also scoped by request_id.
-        tracing::trace!(
-            "TiKV CDC: top-level resolved_ts={:?} rt.request_id={:?} ours={}",
-            event.resolved_ts.as_ref().map(|t| t.ts),
-            event.resolved_ts.as_ref().map(|t| t.request_id),
-            my_request_id
-        );
+        // Top-level ResolvedTs: with the `stream-multiplexing` feature TiKV
+        // tags it with our request_id; without negotiation it arrives as a
+        // store-wide aggregate tagged 0. Accept both, ignore foreign ids.
         if let Some(rt) = event.resolved_ts {
-            if rt.request_id == my_request_id {
+            if rt.request_id == my_request_id || rt.request_id == 0 {
                 if let Some(r) = self.regions.get_mut(&region_id) {
                     r.resolved_ts = r.resolved_ts.max(rt.ts);
                 }
@@ -459,6 +497,10 @@ impl CdcEngine {
         }
         let committed = self.tracker.flush(watermark);
         for pending in committed {
+            if pending.commit_ts > self.last_data_ts {
+                self.last_data_ts = pending.commit_ts;
+                self.resume_checkpoint_ts = self.resume_checkpoint_ts.max(pending.commit_ts);
+            }
             // Decode the row value into columns.
             let columns = match decode_row_value(&pending.value) {
                 Ok(cols) => cols,

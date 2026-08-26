@@ -57,23 +57,33 @@ pub enum ColumnValue {
 ///
 /// Format: `t<8-byte table_id>_r<handle>` where handle is either an int64
 /// (big-endian) or an encoded key for clustered tables.
+/// Sign-flipped big-endian encoding used for i64 components in TiKV keys
+/// (mirrors `codec.EncodeIntToCmpUint`); exposed for tests.
+#[cfg(test)]
+pub(crate) fn encode_cmp_u64_for_test(v: i64) -> [u8; 8] {
+    (v as u64 ^ (1 << 63)).to_be_bytes()
+}
+
 pub fn decode_record_key(key: &[u8]) -> Option<(i64, i64)> {
-    if key.len() < 10 || key[0] != TABLE_PREFIX || key[9] != RECORD_PREFIX {
+    // Layout: 't' + 8B cmp_i64(table_id) + "_r" + 8B cmp_i64(handle)
+    if key.len() < 19 || key[0] != TABLE_PREFIX || key[9] != b'_' || key[10] != RECORD_PREFIX {
         return None;
     }
-    let table_id = i64::from_be_bytes(key[1..9].try_into().ok()?);
-    let handle = decode_handle(&key[10..])?;
+    // Table id and int handles are stored sign-bit-flipped (cmpuint).
+    let table_id = (u64::from_be_bytes(key[1..9].try_into().ok()?) ^ (1 << 63)) as i64;
+    let handle = decode_handle(&key[11..])?;
     Some((table_id, handle))
 }
 
 /// Decode an int64 handle from the tail of a record key.
 fn decode_handle(bytes: &[u8]) -> Option<i64> {
     if bytes.len() == 8 {
-        return Some(i64::from_be_bytes(bytes.try_into().ok()?));
+        // cmpuint int handle: undo the sign-bit flip.
+        return Some((u64::from_be_bytes(bytes.try_into().ok()?) ^ (1 << 63)) as i64);
     }
     // Encoded key handles: first byte is the compact-key marker (0x00 = int).
     if bytes.len() > 8 && bytes[0] == 0x00 {
-        return Some(i64::from_be_bytes(bytes[1..9].try_into().ok()?));
+        return Some((u64::from_be_bytes(bytes[1..9].try_into().ok()?) ^ (1 << 63)) as i64);
     }
     None
 }
@@ -372,14 +382,20 @@ mod tests {
 
     #[test]
     fn test_decode_record_key_int_handle() {
+        // Real TiDB keys store table id and int handles sign-bit-flipped.
         let mut key = Vec::new();
         key.push(b't');
-        key.extend_from_slice(&100i64.to_be_bytes()); // table_id = 100
+        key.extend_from_slice(&encode_cmp_u64_for_test(100));
+        key.push(b'_');
         key.push(b'r');
-        key.extend_from_slice(&42i64.to_be_bytes()); // handle = 42
+        key.extend_from_slice(&encode_cmp_u64_for_test(42));
         let (table_id, handle) = decode_record_key(&key).unwrap();
         assert_eq!(table_id, 100);
         assert_eq!(handle, 42);
+
+        // A plain-BE encoding decodes to garbage (negative ids) — it must
+        // never be produced by the connector's own range builder.
+        assert_ne!(encode_cmp_u64_for_test(100), 100i64.to_be_bytes());
     }
 
     #[test]
@@ -429,9 +445,10 @@ mod tests {
             key: {
                 let mut k = Vec::new();
                 k.push(b't');
-                k.extend_from_slice(&1i64.to_be_bytes());
+                k.extend_from_slice(&encode_cmp_u64_for_test(1));
+                k.push(b'_');
                 k.push(b'r');
-                k.extend_from_slice(&5i64.to_be_bytes());
+                k.extend_from_slice(&encode_cmp_u64_for_test(5));
                 k
             },
             value: vec![1, 2, 3],
