@@ -128,7 +128,14 @@ impl LocalStateStore {
     }
 }
 
-impl seatunnel_engine_core::CheckpointListener for Arc<LocalStateStore> {
+/// Combined checkpoint listener used by workers: persists snapshots locally
+/// and forwards the report to the master. Defined here (rather than as an
+/// impl on `Arc<LocalStateStore>`) to respect Rust's orphan rules.
+pub struct PersistAndReportListener {
+    pub store: Arc<LocalStateStore>,
+}
+
+impl seatunnel_engine_core::CheckpointListener for PersistAndReportListener {
     fn on_checkpoint<'a>(
         &'a self,
         job_id: &'a str,
@@ -138,9 +145,9 @@ impl seatunnel_engine_core::CheckpointListener for Arc<LocalStateStore> {
         state: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            // 1. Durable local persistence (crash recovery).
-            if let Err(e) =
-                self.save_checkpoint(job_id, task_id, checkpoint_id, &state)
+            if let Err(e) = self
+                .store
+                .save_checkpoint(job_id, task_id, checkpoint_id, &state)
             {
                 tracing::error!(
                     "Task {} checkpoint {}: local persist failed: {}",
@@ -149,8 +156,6 @@ impl seatunnel_engine_core::CheckpointListener for Arc<LocalStateStore> {
                     e
                 );
             }
-            // 2. Report to master (observability) — done by the worker's
-            //    chained listener when a gRPC client is available.
             let _ = timestamp;
         })
     }

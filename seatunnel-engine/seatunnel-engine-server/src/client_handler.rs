@@ -105,7 +105,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 Status::failed_precondition(e.to_string())
             })?;
 
-        info!(
+        tracing::info!(
             "Job {} scheduled: {} chained task(s) across {} worker(s)",
             scheduled_id,
             tasks.len(),

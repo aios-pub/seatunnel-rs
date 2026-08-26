@@ -371,7 +371,7 @@ impl JobCoordinator {
                 let reason = f.error.clone().unwrap_or_else(|| "task failed".into());
                 if !job.state.is_terminal() {
                     error!("Job {} failed: task {}: {}", job_id, f.task_id, reason);
-                    job.state = JobState::Failed { reason };
+                    job.state = JobState::Failed { reason: reason.clone() };
                     job.end_time = Some(seatunnel_engine_core::now_millis());
                     job.error_message = Some(reason);
                 }
@@ -383,7 +383,7 @@ impl JobCoordinator {
                         job.state = JobState::Completed;
                         job.end_time = Some(seatunnel_engine_core::now_millis());
                     }
-                } else if running_or_more && !matches!(job.state, JobState::Running | JobState::Deploying) {
+                } else if running_or_more && job.state != JobState::Running {
                     job.state = JobState::Running;
                 }
             }

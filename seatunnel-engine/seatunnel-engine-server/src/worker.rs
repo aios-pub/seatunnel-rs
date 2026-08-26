@@ -269,7 +269,7 @@ async fn run_pipeline(
     let checkpoint_interval: u64 = cfg
         .get("checkpoint.interval")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(seatunnel_engine_core::DEFAULT_CHECKPOINT_INTERVAL_MS);
+        .unwrap_or(crate::job_coordinator::DEFAULT_CHECKPOINT_INTERVAL_MS);
 
     let source_value: serde_json::Value = serde_json::from_str(source_config_raw)?;
     let source_config = seatunnel_engine_core::connector_factory::json_to_config_map(&source_value);

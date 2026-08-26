@@ -144,15 +144,15 @@ async fn run_worker(
     worker.set_master_client(client.clone()).await;
 
     // Register with the master.
-    let reg_request = tonic::Request::new(WorkerRegistration {
-        worker_id: worker_id.to_string(),
-        address: addr.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        resources: Default::default(),
-        heartbeat_interval_ms: 2000,
-    });
     loop {
-        match client.register_worker(reg_request.clone()).await {
+        let reg_request = tonic::Request::new(WorkerRegistration {
+            worker_id: worker_id.to_string(),
+            address: addr.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            resources: Default::default(),
+            heartbeat_interval_ms: 2000,
+        });
+        match client.register_worker(reg_request).await {
             Ok(resp) => {
                 tracing::info!("Registered with master: {}", resp.into_inner().message);
                 break;
@@ -191,10 +191,7 @@ async fn run_worker(
                         worker_for_hb.cancel_jobs(&response.cancel_jobs).await;
                     }
                     if !response.pending_tasks.is_empty() {
-                        info!(
-                            "Received {} task(s) from master",
-                            response.pending_tasks.len()
-                        );
+                        tracing::info!("Received {} task(s) from master", response.pending_tasks.len());
                         for task in response.pending_tasks {
                             worker_for_hb.assign_task(task).await;
                         }

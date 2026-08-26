@@ -1353,16 +1353,23 @@ mod tests {
     #[tokio::test]
     async fn incremental_restore_skips_snapshot() {
         let mut reader = MySqlCdcReader::new(test_config(), None);
+        reader.add_splits(vec![MySqlCdcSplit::Snapshot(SnapshotSplit::new(
+            "db", "tbl", "id", "0", "100",
+        ))]);
+        assert!(!reader.splits.is_empty());
+
         let state = CdcState {
             phase: CdcPhase::Incremental,
             watermark: Watermark::Min,
             offset: BinlogOffset::new("binlog.000007", 4321).to_hashmap(),
         };
         reader.apply_cdc_state(state);
-        assert!(reader.splits.is_empty());
-
-        reader.open().await.unwrap();
         assert_eq!(reader.phase, CdcPhase::Incremental);
+        assert!(
+            reader.splits.is_empty(),
+            "incremental restore must skip snapshot splits"
+        );
+        assert_eq!(reader.offset.file, "binlog.000007");
     }
 
     #[test]
@@ -1399,12 +1406,12 @@ mod tests {
     #[test]
     fn table_pattern_matching() {
         let mut cfg = test_config();
-        assert!(cfg.table_matches(b"test_table"));
-        assert!(!cfg.table_matches(b"other"));
+        assert!(cfg.table_matches("test_table"));
+        assert!(!cfg.table_matches("other"));
         cfg.table_name = "events%".into();
-        assert!(cfg.table_matches(b"events_2026"));
-        assert!(!cfg.table_matches(b"orders"));
+        assert!(cfg.table_matches("events_2026"));
+        assert!(!cfg.table_matches("orders"));
         cfg.table_name = "mydb.users".into();
-        assert!(cfg.table_matches(b"users"));
+        assert!(cfg.table_matches("users"));
     }
 }
