@@ -46,6 +46,7 @@ message Error {
     Compatibility compatibility = 5;
     ClusterIDMismatch cluster_id_mismatch = 6;
     errorpb.ServerIsBusy server_is_busy = 7;
+    Congested congested = 8;
 }
 
 message TxnInfo {
@@ -58,6 +59,10 @@ message TxnStatus {
     uint64 min_commit_ts = 2;
     uint64 commit_ts = 3;
     bool is_rolled_back = 4;
+}
+
+message Congested {
+  uint64 region_id = 1;
 }
 
 message Event {
@@ -90,6 +95,7 @@ message Event {
         uint64 expire_ts_unix_secs = 8;
         // The source of this row.
         uint64 txn_source = 9;
+    uint64 generation = 10;
     }
 
     message Entries {
@@ -130,6 +136,12 @@ message ResolvedTs {
     repeated uint64 regions = 1;
     uint64 ts = 2;
     uint64 request_id = 3;
+}
+
+enum ScanPriority {
+  SCAN_PRIORITY_UNKNOWN = 0;
+  SCAN_PRIORITY_LOW = 1;
+  SCAN_PRIORITY_HIGH = 2;
 }
 
 message ChangeDataRequest {
@@ -178,6 +190,7 @@ message ChangeDataRequest {
 
     // Whether to filter out the value write by cdc itself.
     bool filter_loop = 12;
+  ScanPriority scan_priority = 14;
 }
 
 service ChangeData {

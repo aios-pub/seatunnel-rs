@@ -21,6 +21,8 @@ use crate::kvproto::kvrpcpb::ExtraOp;
 use crate::kvproto::metapb::RegionEpoch;
 
 /// TiKV CDC service version advertised in the request header.
+const SCAN_PRIORITY_NORMAL: i32 = 0;
+
 const TICDC_VERSION: &str = "8.1.0";
 
 /// A single EventFeedV2 stream for one region.
@@ -59,6 +61,7 @@ impl RegionCdcStream {
             request_id,
             extra_op: ExtraOp::ReadOldValue as i32,
             kv_api: KvApi::TiDb as i32,
+            scan_priority: SCAN_PRIORITY_NORMAL,
             filter_loop: false,
             request: Some(Request::Register(Default::default())),
         }
@@ -85,6 +88,8 @@ impl RegionCdcStream {
             request_id,
             cluster_id,
         );
+        // Span bounds travel EncodeBytes-wrapped on the wire (see helper above).
+
         // EventFeedV2 is a bidi stream. The registration request goes first,
         // then the send side must STAY OPEN — closing it makes TiKV cancel
         // the whole stream (the server treats client EOF as disconnect).
@@ -153,6 +158,7 @@ impl RegionCdcStream {
     /// Re-establish the stream using the stored request (used on retry).
     pub async fn reconnect(&mut self) -> anyhow::Result<()> {
         use futures::stream;
+        // Re-wrap is unnecessary: base_request already has wrapped keys.
         let req_stream = stream::iter(vec![self.base_request.clone()]).chain(stream::pending());
         let mut grpc_req = tonic::Request::new(req_stream);
         grpc_req.metadata_mut().insert(

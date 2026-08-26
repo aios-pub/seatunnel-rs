@@ -296,7 +296,7 @@ impl CdcEngine {
     /// Like [`poll`](Self::poll) but each region read waits at most
     /// `budget_ms` — used by snapshot-phase draining so table scans are not
     /// starved by idle streams.
-    pub async fn poll_with_budget(&mut self, budget_ms: u64) -> anyhow::Result<usize> {
+    pub async fn poll_with_budget(&mut self, _budget_ms: u64) -> anyhow::Result<usize> {
         // Periodically re-check PD for region split/merge (every 128 polls).
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_no = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -366,37 +366,21 @@ impl CdcEngine {
             }
 
             // Read one event batch from the region's stream (bounded wait).
+            // BLOCKING read like official TiCDC — no timeout wrapper.
+            // Dropping tonic's Streaming future mid-read corrupts h2 state.
             let res = {
                 let region = self.regions.get(&region_id).unwrap();
                 match &region.stream {
-                    Some(stream) => match tokio::time::timeout(
-                        Duration::from_millis(budget_ms.max(1)),
-                        stream.next_event(),
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => {
-                            tracing::trace!("TiKV CDC: region {} poll budget expired", region_id);
-                            // Budget exhausted for this round — not an error.
-                            continue;
-                        }
-                    },
-                    None => continue,
+                    Some(stream) => Some(stream.next_event().await),
+                    None => None,
                 }
             };
-            match &res {
-                Ok(Some(_)) => {
-                    tracing::debug!("TiKV CDC: region {} delivered an event", region_id);
-                    // count entries inside for diagnosis
-                    if let Some(r) = self.regions.get(&region_id) {
-                        if let Some(st) = &r.stream {
-                            let _ = st;
-                        }
-                    }
-                }
-                Ok(None) => tracing::debug!("TiKV CDC: region {} stream ended (None)", region_id),
-                Err(e) => tracing::debug!("TiKV CDC: region {} read error: {}", region_id, e),
+            if res.is_none() {
+                continue;
+            }
+            let res = res.unwrap();
+            if let Ok(Some(_)) = &res {
+                tracing::debug!("TiKV CDC: region {} delivered an event", region_id);
             }
             match res {
                 Ok(Some(change_event)) => {
