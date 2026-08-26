@@ -1,0 +1,39 @@
+# SeaTunnel-RS engine server configuration.
+#
+# Passed with `--config config/seatunnel.yaml` (master or worker).
+# Keys mirror the Java Zeta engine's seatunnel.yaml where the concepts
+# map onto this implementation; see docs/en/engine-config.md for the
+# full reference table.
+#
+# Precedence: --state-dir > SEATUNNEL_STATE_DIR > this file > defaults.
+
+seatunnel:
+  engine:
+    # Java key. Minutes a finished/cancelled job's local state survives
+    # (TTL sweep removes anything idle longer than this).
+    history-job-expire-minutes: 1440
+
+    checkpoint:
+      # Engine-wide default checkpoint interval (ms); a job's
+      # env.checkpoint.interval overrides it per job.
+      interval: 30000
+
+      # Java key. Checkpoint files retained per task (older ones are
+      # pruned automatically on every write).
+      keep-checkpoint-count: 3
+
+      storage:
+        # Java key. Only localfile exists in this implementation.
+        type: localfile
+
+        # Java plugin-config.namespace analogue: directory for the
+        # checkpoint files.
+        namespace: .seatunnel-state
+
+        # Auto-cleanup of terminal job state (this project):
+        #   - cancelled jobs are deleted clean-grace-minutes after cancel
+        #   - everything idle beyond history-job-expire-minutes is swept
+        #     every clean-interval-minutes (and once at startup)
+        auto-clean: true
+        clean-grace-minutes: 10
+        clean-interval-minutes: 60

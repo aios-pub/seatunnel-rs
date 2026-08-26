@@ -57,6 +57,8 @@ type SharedMasterClient = Arc<Mutex<Option<MasterServiceClient<tonic::transport:
 
 /// Worker node that executes chained pipeline tasks assigned by the master.
 pub struct WorkerNode {
+    /// Auto-cleanup settings (0/None disables the cleaner).
+    clean_config: Option<CleanConfig>,
     worker_id: String,
     #[allow(dead_code)] // reported to the master once registration is wired up
     address: String,
@@ -78,12 +80,23 @@ impl WorkerNode {
         address: impl Into<String>,
         state_store: Arc<LocalStateStore>,
     ) -> Self {
+        Self::new_with_clean(worker_id, address, state_store, None)
+    }
+
+    /// Construct with auto-cleanup enabled (engine `seatunnel.yaml`).
+    pub fn new_with_clean(
+        worker_id: impl Into<String>,
+        address: impl Into<String>,
+        state_store: Arc<LocalStateStore>,
+        clean_config: Option<CleanConfig>,
+    ) -> Self {
         WorkerNode {
             worker_id: worker_id.into(),
             address: address.into(),
             master_client: Arc::new(Mutex::new(None)),
             state_store,
             running_tasks: Mutex::new(HashMap::new()),
+            clean_config,
         }
     }
 
@@ -152,6 +165,17 @@ impl WorkerNode {
         if job_ids.is_empty() {
             return;
         }
+        // Auto-clean: drop the cancelled jobs' local state after the
+        // configured grace window.
+        if let Some(clean) = &self.clean_config {
+            for job_id in job_ids {
+                schedule_cancel_cleanup(
+                    Arc::clone(&self.state_store),
+                    job_id.clone(),
+                    clean.grace_secs,
+                );
+            }
+        }
         let mut tasks = self.running_tasks.lock().await;
         for (tid, handle) in tasks.iter_mut() {
             if job_ids.contains(&handle.job_id) && !handle.cancel.is_cancelled() {
@@ -198,6 +222,51 @@ async fn report_transition_raw(
     if let Err(e) = client.report_task_status(tonic::Request::new(report)).await {
         warn!("report_task_status failed for {}: {}", task_id, e);
     }
+}
+
+/// Background state-cleanup settings derived from the engine config.
+#[derive(Debug, Clone, Copy)]
+pub struct CleanConfig {
+    /// Seconds after a cancelled job's state is deleted.
+    pub grace_secs: u64,
+    /// Seconds between TTL sweeps.
+    pub interval_secs: u64,
+    /// Sweep TTL in seconds (history-job-expire-minutes).
+    pub ttl_secs: u64,
+}
+
+/// Spawn the background cleaner: periodic TTL sweep plus delayed cleanup
+/// of cancelled jobs (after the grace window).
+pub fn spawn_state_cleaner(worker: Arc<WorkerNode>, config: CleanConfig) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            config.interval_secs.max(1),
+        ));
+        // First tick fires immediately — sweep once at startup.
+        loop {
+            ticker.tick().await;
+            let removed = worker
+                .state_store()
+                .sweep_expired(std::time::Duration::from_secs(config.ttl_secs.max(1)));
+            if !removed.is_empty() {
+                tracing::info!("state cleaner: swept {} expired job(s)", removed.len());
+            }
+        }
+    })
+}
+
+/// Schedule deletion of a cancelled job's local state after the grace
+/// window (keeps a restore window for operator intervention).
+pub fn schedule_cancel_cleanup(
+    state_store: Arc<LocalStateStore>,
+    job_id: String,
+    grace_secs: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(grace_secs.max(1))).await;
+        state_store.drop_job(&job_id);
+        tracing::info!("state cleaner: removed cancelled job state '{}'", job_id);
+    });
 }
 
 /// Execution context handed to the spawned task future so it can report

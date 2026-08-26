@@ -5309,6 +5309,7 @@ dependencies = [
  "seatunnel-formats",
  "serde 1.0.229",
  "serde_json 1.0.151",
+ "serde_yaml",
  "tokio",
  "tokio-stream",
  "tokio-util",

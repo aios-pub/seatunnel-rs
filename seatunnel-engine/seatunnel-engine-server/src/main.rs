@@ -58,6 +58,11 @@ struct Args {
     /// Directory for durable checkpoint state (workers).
     #[arg(long, env = "SEATUNNEL_STATE_DIR", default_value = ".seatunnel-state")]
     state_dir: String,
+
+    /// Engine config file (Java `seatunnel.yaml` adapted); see
+    /// config/seatunnel.yaml for the reference layout.
+    #[arg(long, short = 'f')]
+    config: Option<String>,
 }
 
 #[tokio::main]
@@ -74,9 +79,34 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Precedence: --state-dir > SEATUNNEL_STATE_DIR > config file > default.
+    let explicit_state_dir = if args.state_dir == ".seatunnel-state" {
+        None
+    } else {
+        Some(args.state_dir.as_str())
+    };
+    let engine_config = seatunnel_engine_server::server_config::EngineServerConfig::load(
+        args.config.as_deref(),
+        explicit_state_dir,
+        std::env::var("SEATUNNEL_STATE_DIR").ok().as_deref(),
+    )?;
+    tracing::info!(
+        "Engine config: state_dir={} keep-checkpoint-count={} checkpoint-interval={}ms \
+         auto-clean={} grace={}min sweep-every={}min ttl={}min",
+        engine_config.state_dir,
+        engine_config.keep_checkpoint_count,
+        engine_config.checkpoint_interval,
+        engine_config.auto_clean,
+        engine_config.clean_grace_minutes,
+        engine_config.clean_interval_minutes,
+        engine_config.history_job_expire_minutes
+    );
+
     match args.role.as_str() {
         "master" => run_master(&args.addr).await?,
-        "worker" => run_worker(&args.addr, &args.master, &args.worker_id, &args.state_dir).await?,
+        "worker" => {
+            run_worker(&args.addr, &args.master, &args.worker_id, engine_config).await?
+        }
         other => {
             eprintln!("Unknown role: {}. Use 'master' or 'worker'.", other);
             std::process::exit(1);
@@ -118,26 +148,45 @@ async fn run_worker(
     addr: &str,
     master_addr: &Option<String>,
     worker_id: &str,
-    state_dir: &str,
+    engine_config: seatunnel_engine_server::server_config::EngineServerConfig,
 ) -> anyhow::Result<()> {
     let master = master_addr
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--master is required for worker role"))?;
 
-    let state_store = Arc::new(LocalStateStore::new(state_dir));
-    let worker = Arc::new(WorkerNode::new(
+    let state_dir = engine_config.state_dir.clone();
+    let state_store = Arc::new(LocalStateStore::with_retention(
+        &state_dir,
+        engine_config.keep_checkpoint_count,
+    ));
+    let clean = engine_config.auto_clean.then(|| {
+        seatunnel_engine_server::worker::CleanConfig {
+            grace_secs: engine_config.clean_grace_minutes * 60,
+            interval_secs: engine_config.clean_interval_minutes * 60,
+            ttl_secs: engine_config.history_job_expire_minutes * 60,
+        }
+    });
+    let worker = Arc::new(WorkerNode::new_with_clean(
         worker_id.to_string(),
         addr.to_string(),
         state_store,
+        clean,
     ));
 
     tracing::info!(
-        "Worker '{}' starting at {} → master {} (state dir: {})",
+        "Worker '{}' starting at {} → master {} (state dir: {}, retained={}, auto-clean={})",
         worker_id,
         addr,
         master,
-        state_dir
+        state_dir,
+        engine_config.keep_checkpoint_count,
+        engine_config.auto_clean
     );
+
+    // Background state cleaner (TTL sweep; cancel cleanup rides along).
+    if let Some(clean) = clean {
+        seatunnel_engine_server::worker::spawn_state_cleaner(Arc::clone(&worker), clean);
+    }
 
     // Connect (with retry so the master can be started first).
     let master_url = format!("http://{}", master);

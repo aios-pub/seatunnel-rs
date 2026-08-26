@@ -26,17 +26,27 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// How many recent snapshots per task to keep on disk.
-const RETAINED_SNAPSHOTS: usize = 3;
+/// Default snapshots kept per task (Java `keep-checkpoint-count`).
+pub const DEFAULT_RETAINED_SNAPSHOTS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct LocalStateStore {
     root: PathBuf,
+    retained_snapshots: usize,
 }
 
 impl LocalStateStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        LocalStateStore { root: root.into() }
+        LocalStateStore::with_retention(root, DEFAULT_RETAINED_SNAPSHOTS)
+    }
+
+    /// Store with a configurable per-task retention count
+    /// (`seatunnel.engine.checkpoint.keep-checkpoint-count`).
+    pub fn with_retention(root: impl Into<PathBuf>, retained_snapshots: usize) -> Self {
+        LocalStateStore {
+            root: root.into(),
+            retained_snapshots: retained_snapshots.max(1),
+        }
     }
 
     pub fn from_env_or_default() -> Self {
@@ -108,6 +118,54 @@ impl LocalStateStore {
         let _ = fs::remove_dir_all(self.root.join(sanitize(job_id)));
     }
 
+    /// Store root directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// All job directories currently under the store root.
+    pub fn job_dirs(&self) -> Vec<(String, PathBuf)> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+            .collect()
+    }
+
+    /// Remove job directories whose newest file is older than `ttl`
+    /// (Java `history-job-expire-minutes`). Returns the removed job ids.
+    pub fn sweep_expired(&self, ttl: std::time::Duration) -> Vec<String> {
+        let mut removed = Vec::new();
+        for (job, dir) in self.job_dirs() {
+            let newest = newest_mtime(&dir);
+            let Some(newest) = newest else {
+                // Empty job directory — remove immediately.
+                let _ = fs::remove_dir_all(&dir);
+                removed.push(job);
+                continue;
+            };
+            let age = std::time::SystemTime::now()
+                .duration_since(newest)
+                .unwrap_or_default();
+            if age >= ttl {
+                if let Err(e) = fs::remove_dir_all(&dir) {
+                    tracing::warn!("state sweep: cannot remove job '{}': {}", job, e);
+                } else {
+                    tracing::info!(
+                        "state sweep: removed expired job state '{}' (idle {:.0}h)",
+                        job,
+                        age.as_secs_f64() / 3600.0
+                    );
+                    removed.push(job);
+                }
+            }
+        }
+        removed
+    }
+
     fn prune(&self, dir: &Path) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -122,11 +180,11 @@ impl LocalStateStore {
                     .map(|id| (id, e.path()))
             })
             .collect();
-        if ids.len() <= RETAINED_SNAPSHOTS {
+        if ids.len() <= self.retained_snapshots {
             return;
         }
         ids.sort_by_key(|(id, _)| *id);
-        let excess = ids.len() - RETAINED_SNAPSHOTS;
+        let excess = ids.len() - self.retained_snapshots;
         for (_, path) in &ids[..excess] {
             let _ = fs::remove_file(path);
         }
@@ -164,6 +222,22 @@ impl seatunnel_engine_core::CheckpointListener for PersistAndReportListener {
             let _ = timestamp;
         })
     }
+}
+
+/// Newest file mtime under a directory (recursive, shallow).
+fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let mtime = if meta.is_dir() {
+            newest_mtime(&entry.path()).unwrap_or(std::time::UNIX_EPOCH)
+        } else {
+            meta.modified().unwrap_or(std::time::UNIX_EPOCH)
+        };
+        newest = newest.map_or(Some(mtime), |n| Some(n.max(mtime)));
+    }
+    newest.filter(|t| *t != std::time::UNIX_EPOCH)
 }
 
 fn sanitize(component: &str) -> String {
@@ -231,7 +305,55 @@ mod tests {
             .unwrap()
             .flatten()
             .count();
-        assert_eq!(count, RETAINED_SNAPSHOTS);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn configurable_retention() {
+        let store = LocalStateStore::with_retention(tmp_store("cret").root().to_path_buf(), 1);
+        assert_eq!(store.retained_snapshots, 1);
+        for id in 1..=4u64 {
+            store.save_checkpoint("j", "t", id, b"x").unwrap();
+        }
+        let count = fs::read_dir(store.task_dir("j", "t"))
+            .unwrap()
+            .flatten()
+            .count();
+        assert_eq!(count, 1);
+        let (latest, _) = store.load_latest_checkpoint("j", "t").unwrap().unwrap();
+        assert_eq!(latest, 4);
+    }
+
+    #[test]
+    fn sweep_removes_expired_and_keeps_fresh() {
+        let store = tmp_store("sweep");
+        store.save_checkpoint("old", "t", 1, b"x").unwrap();
+        store.save_checkpoint("fresh", "t", 1, b"x").unwrap();
+
+        // ttl 0: everything is "expired".
+        let removed = store.sweep_expired(std::time::Duration::ZERO);
+        assert!(removed.contains(&"old".to_string()));
+        assert!(removed.contains(&"fresh".to_string()));
+        assert!(store.job_dirs().is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_young_directories() {
+        let store = tmp_store("sweep2");
+        store.save_checkpoint("fresh", "t", 1, b"x").unwrap();
+        // A large ttl keeps a just-written directory.
+        let removed = store.sweep_expired(std::time::Duration::from_secs(3600));
+        assert!(removed.is_empty());
+        assert_eq!(store.job_dirs().len(), 1);
+    }
+
+    #[test]
+    fn sweep_removes_empty_job_dirs() {
+        let store = tmp_store("sweep3");
+        let dir = store.task_dir("ghost", "t");
+        fs::create_dir_all(&dir).unwrap();
+        let removed = store.sweep_expired(std::time::Duration::from_secs(3600));
+        assert!(removed.contains(&"ghost".to_string()));
     }
 
     #[test]
