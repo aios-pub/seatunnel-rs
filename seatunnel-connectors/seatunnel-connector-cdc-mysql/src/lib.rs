@@ -117,7 +117,6 @@ impl SourceSplit for MySqlCdcSplit {
 const MAX_BUFFERED_BINLOG_ROWS: usize = 65_536;
 
 /// Number of rows fetched per keyset-paginated snapshot query.
-const SNAPSHOT_BATCH_SIZE: i64 = 500;
 /// Events drained per poll during the timestamp warm-up skip.
 const TIMESTAMP_WARMUP_DRAIN_BUDGET: usize = 2000;
 
@@ -176,6 +175,20 @@ pub enum MySqlStartupMode {
     },
 }
 
+
+/// Stop condition for bounded capture (official `stop.mode`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MySqlStopMode {
+    /// Run until cancelled (default).
+    Never,
+    /// Stop after reaching the position captured at job start.
+    Latest,
+    /// Stop at an explicit binlog position.
+    Specific { file: String, position: u64 },
+    /// Stop at an explicit wall-clock time (ms).
+    Timestamp { timestamp: i64 },
+}
+
 /// MySQL CDC configuration.
 #[derive(Debug, Clone)]
 pub struct MySqlCdcConfig {
@@ -189,12 +202,30 @@ pub struct MySqlCdcConfig {
     pub parallelism: usize,
     pub server_timezone: String,
     pub server_id: u32,
+    /// Upper bound when `server-id` is given as a range ("5400-5408").
+    pub server_id_range: u32,
     /// Split key column (defaults to `id`).
     pub split_column: String,
     /// This reader's subtask index / total subtask count — snapshot ranges
     /// are partitioned so each subtask scans a disjoint id interval.
     pub subtask_index: usize,
     pub subtask_count: usize,
+    /// TCP connect timeout (official `connect.timeout.ms`, default 30 s).
+    pub connect_timeout_ms: u64,
+    /// Connection retries before failing (official `connect.max-retries`).
+    pub connect_max_retries: u32,
+    /// Pool max connections (official `connection.pool.size`, default 20).
+    pub connection_pool_size: u32,
+    /// Rows per snapshot split (official `snapshot.split.size`, 8096).
+    pub snapshot_split_size: i64,
+    /// Snapshot page size (official `snapshot.fetch.size`, 1024).
+    pub snapshot_fetch_size: i64,
+    /// Stop condition (official `stop.mode` + `stop.*` options).
+    pub stop_mode: MySqlStopMode,
+    /// Resolved database/table selection.
+    pub table_selector: TableSelector,
+    /// Warnings for official-but-unimplemented options (logged at open).
+    pub compat_warnings: Vec<String>,
     /// Schema-evolution settings (DDL-to-schema-change-event pipeline).
     pub schema_evolution: SchemaEvolutionConfig,
 }
@@ -212,23 +243,49 @@ impl Default for MySqlCdcConfig {
             parallelism: 4,
             server_timezone: "+00:00".to_string(),
             server_id: 0,
+            server_id_range: 0,
             split_column: "id".to_string(),
             subtask_index: 0,
             subtask_count: 1,
             schema_evolution: SchemaEvolutionConfig::default(),
+            connect_timeout_ms: 30_000,
+            connect_max_retries: 3,
+            connection_pool_size: 20,
+            snapshot_split_size: 8096,
+            snapshot_fetch_size: 1024,
+            stop_mode: MySqlStopMode::Never,
+            table_selector: TableSelector::from_legacy("seatunnel", "users"),
+            compat_warnings: Vec::new(),
         }
     }
 }
 
 impl MySqlCdcConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
+        // `url` (jdbc:mysql://host:port/db) is the official connection
+        // option; hostname/port stay as simpler alternatives.
+        let (url_host, url_port, url_db) = config
+            .get("url")
+            .and_then(|u| parse_mysql_jdbc_url(u))
+            .unwrap_or_default();
+        let database_name = {
+            let v = config.get_string("database-name", &url_db);
+            if v.is_empty() { "seatunnel".to_string() } else { v }
+        };
+        let table_name = config.get_string("table-name", "users");
         MySqlCdcConfig {
-            hostname: config.get_string("hostname", "localhost"),
-            port: config.get_int("port", 3306) as u16,
+            hostname: {
+                let v = config.get_string("hostname", &url_host);
+                if v.is_empty() { "localhost".to_string() } else { v }
+            },
+            port: {
+                let p = config.get_int("port", -1);
+                if p > 0 { p as u16 } else if url_port > 0 { url_port } else { 3306 }
+            },
             username: config.get_string("username", "root"),
             password: config.get_string("password", ""),
-            database_name: config.get_string("database-name", "seatunnel"),
-            table_name: config.get_string("table-name", "users"),
+            database_name: database_name.clone(),
+            table_name: table_name.clone(),
             parallelism: config.get_int("parallelism", 4) as usize,
             startup_mode: config
                 .get("startup.mode")
@@ -244,17 +301,29 @@ impl MySqlCdcConfig {
                         ),
                     },
                     "specific" | "specific-offset" => MySqlStartupMode::Specific {
-                        file: config.get_string("startup.specific.file", ""),
+                        // Official keys: startup.specific-offset.file/.pos
+                        // (+ .gtid-set); the shorter startup.specific.*
+                        // forms remain as aliases.
+                        file: config.get_string(
+                            "startup.specific-offset.file",
+                            &config.get_string("startup.specific.file", ""),
+                        ),
                         position: config
                             .get_int(
-                                "startup.specific.pos",
-                                config.get_int("startup.specific.position", 0),
+                                "startup.specific-offset.pos",
+                                config.get_int(
+                                    "startup.specific.pos",
+                                    config.get_int("startup.specific.position", 0),
+                                ),
                             )
                             .max(0) as u64,
                         gtid_set: {
                             let gtid = config.get_string(
-                                "startup.specific.gtid-set",
-                                &config.get_string("startup.specific.gtid_set", ""),
+                                "startup.specific-offset.gtid-set",
+                                &config.get_string(
+                                    "startup.specific.gtid-set",
+                                    &config.get_string("startup.specific.gtid_set", ""),
+                                ),
                             );
                             if gtid.is_empty() { None } else { Some(gtid) }
                         },
@@ -263,11 +332,49 @@ impl MySqlCdcConfig {
                 })
                 .unwrap_or(MySqlStartupMode::Initial),
             server_timezone: config.get_string("server-timezone", "+00:00"),
-            server_id: config.get_int("server-id", 0) as u32,
+            server_id: {
+                let raw = config.get_string("server-id", "0");
+                if let Some((lo, _)) = raw.split_once('-') {
+                    lo.trim().parse::<u32>().unwrap_or(0)
+                } else {
+                    raw.trim().parse::<u32>().unwrap_or(0)
+                }
+            },
+            server_id_range: {
+                let raw = config.get_string("server-id", "");
+                if let Some((_, hi)) = raw.split_once('-') {
+                    let lo: u32 = raw.split('-').next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let hi: u32 = hi.trim().parse().unwrap_or(lo);
+                    hi.saturating_sub(lo)
+                } else {
+                    0
+                }
+            },
             split_column: config.get_string("split.column", "id"),
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
             schema_evolution: SchemaEvolutionConfig::from_config(config),
+            connect_timeout_ms: config
+                .get_int("connect.timeout.ms", config.get_int("connect.timeout-ms", 30_000))
+                .max(100) as u64,
+            connect_max_retries: config
+                .get_int("connect.max-retries", config.get_int("connect.max_retries", 3))
+                .max(0) as u32,
+            connection_pool_size: config
+                .get_int(
+                    "connection.pool.size",
+                    config.get_int("connection-pool-size", 20),
+                )
+                .max(1) as u32,
+            snapshot_split_size: config
+                .get_int("snapshot.split.size", config.get_int("snapshot.split_size", 8096))
+                .max(1),
+            snapshot_fetch_size: config
+                .get_int("snapshot.fetch.size", config.get_int("snapshot_fetch_size", 1024))
+                .max(1),
+            stop_mode: parse_stop_mode(config),
+            table_selector: build_table_selector(config, &database_name, &table_name),
+            compat_warnings: seatunnel_connector_cdc_base::compatibility_warnings(config),
         }
     }
 
@@ -279,10 +386,15 @@ impl MySqlCdcConfig {
     fn effective_server_id(&self) -> u32 {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
-        if self.server_id != 0 {
+        if self.server_id != 0 && self.server_id_range == 0 {
             return self.server_id;
         }
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        if self.server_id != 0 && self.server_id_range > 0 {
+            // Explicit `server-id: "5400-5408"` range: assign unique ids
+            // inside the range (official cluster convention).
+            return self.server_id + (n % self.server_id_range);
+        }
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -295,25 +407,197 @@ impl MySqlCdcConfig {
         (mixed % 0x0FFF_FFF0) + 0x1000
     }
 
-    /// Extract the bare table name from a possibly `db.table` qualified value.
-    fn bare_table(&self) -> &str {
-        self.table_name
-            .rsplit('.')
-            .next()
-            .unwrap_or(&self.table_name)
+}
+
+
+// ---------------------------------------------------------------------------
+// Table selection (official option set)
+// ---------------------------------------------------------------------------
+
+/// Resolved database/table selection from the official option set:
+/// `database-names` + `database-pattern`, `table-names` (exact
+/// `db.table` refs) + `table-pattern` (regex over `db.table`), with the
+/// legacy single `database-name`/`table-name` (trailing `%` wildcard)
+/// folded in.
+#[derive(Debug, Clone, Default)]
+pub struct TableSelector {
+    split_columns: std::collections::HashMap<String, String>,
+    databases: Vec<String>,
+    database_pattern: Option<regex::Regex>,
+    tables: Vec<(String, String)>,
+    table_patterns: Vec<regex::Regex>,
+}
+
+impl TableSelector {
+    fn compile(pattern: &str) -> Option<regex::Regex> {
+        regex::Regex::new(pattern)
+            .map_err(|e| tracing::warn!("invalid table-selection regex '{}': {}", pattern, e))
+            .ok()
     }
 
-    /// Does this table-name pattern match the given table?
-    /// Supports a trailing `%` wildcard; otherwise exact match.
-    fn table_matches(&self, table: &str) -> bool {
-        let want = self.bare_table();
-        let got = table;
-        if let Some(prefix) = want.strip_suffix('%') {
-            got.starts_with(prefix)
+    /// Legacy single names with a trailing `%` wildcard become regexes;
+    /// empty strings produce an empty selector (official options replace
+    /// the legacy forms).
+    fn from_legacy(database: &str, table: &str) -> Self {
+        let mut selector = TableSelector::default();
+        if database.is_empty() && table.is_empty() {
+            return selector;
+        }
+        if let Some(prefix) = database.strip_suffix('%') {
+            selector.database_pattern = Self::compile(&format!("^{}.*$", regex::escape(prefix)));
         } else {
-            got == want
+            selector.databases.push(database.to_string());
+        }
+        if let Some(prefix) = table.strip_suffix('%') {
+            // Legacy wildcards name the bare table; official table regexes
+            // match the qualified `db.table`. Match only the table segment
+            // (the database gate applies separately).
+            selector.table_patterns.push(
+                Self::compile(&format!("^.*\\.{}.*$", regex::escape(prefix)))
+                    .expect("escaped regex"),
+            );
+        } else {
+            selector.tables.push((database.to_string(), table.to_string()));
+        }
+        selector
+    }
+
+    fn matches_database(&self, database: &str) -> bool {
+        self.databases.iter().any(|d| d == database)
+            || self
+                .database_pattern
+                .as_ref()
+                .is_some_and(|re| re.is_match(database))
+    }
+
+    /// Exact `db.table` refs match their own pair; regexes are matched
+    /// against the fully-qualified `db.table` string (official semantics).
+    pub fn matches(&self, database: &str, table: &str) -> bool {
+        if !self.matches_database(database) {
+            return false;
+        }
+        let qualified = format!("{}.{}", database, table);
+        self.tables.iter().any(|(d, t)| d == database && t == table)
+            || self
+                .table_patterns
+                .iter()
+                .any(|re| re.is_match(&qualified))
+    }
+
+    /// Database names in the selection (diagnostics).
+    pub fn databases(&self) -> &[String] {
+        &self.databases
+    }
+
+    /// True when at least one exact pair is registered.
+    pub fn has_exact(&self) -> bool {
+        !self.tables.is_empty()
+    }
+
+    /// Split column override for `db.table` (from `table-names-config`).
+    pub fn split_column_for(&self, _database: &str, _table: &str) -> Option<&str> {
+        self.split_columns
+            .get(&format!("{}.{}", _database, _table))
+            .map(String::as_str)
+    }
+}
+
+
+
+/// Parse `stop.mode` + `stop.*` options (official: never | latest |
+/// specific; `timestamp` additionally accepted for symmetry with Java).
+fn parse_stop_mode(config: &ConnectorConfig) -> MySqlStopMode {
+    match config.get_string("stop.mode", "never").to_lowercase().as_str() {
+        "latest" => MySqlStopMode::Latest,
+        "specific" | "specific-offset" => MySqlStopMode::Specific {
+            file: config.get_string("stop.specific-offset.file", ""),
+            position: config
+                .get_int(
+                    "stop.specific-offset.pos",
+                    config.get_int("stop.specific.pos", 0),
+                )
+                .max(0) as u64,
+        },
+        "timestamp" => MySqlStopMode::Timestamp {
+            timestamp: config.get_int("stop.timestamp", 0),
+        },
+        _ => MySqlStopMode::Never,
+    }
+}
+
+/// Assemble the [`TableSelector`] from the official option set, folding in
+/// the legacy single-name forms.
+fn build_table_selector(config: &ConnectorConfig, legacy_db: &str, legacy_table: &str) -> TableSelector {
+    // Official options REPLACE the legacy single-name forms; legacy
+    // selection only applies when its official counterpart is absent.
+    let has_official_databases = !config.get_string("database-names", &config.get_string("database_names", "")).is_empty()
+        || !config.get_string("database-pattern", &config.get_string("database_pattern", "")).is_empty();
+    let has_official_tables = !config.get_string("table-names", &config.get_string("table_names", "")).is_empty()
+        || !config.get_string("table-pattern", &config.get_string("table_pattern", "")).is_empty();
+    let mut selector = TableSelector::from_legacy(
+        if has_official_databases { "" } else { legacy_db },
+        if has_official_tables { "" } else { legacy_table },
+    );
+
+    // database-names: comma list of exact names (arrays arrive comma-joined).
+    let databases = config.get_string("database-names", &config.get_string("database_names", ""));
+    for db in databases.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        if !selector.databases.contains(&db.to_string()) {
+            selector.databases.push(db.to_string());
         }
     }
+    // database-pattern: regex.
+    let db_pattern = config.get_string("database-pattern", &config.get_string("database_pattern", ""));
+    if !db_pattern.is_empty() {
+        if let Some(re) = TableSelector::compile(&format!("^(?:{})$", db_pattern)) {
+            selector.database_pattern = Some(re);
+        }
+    }
+    // table-names: exact `db.table` entries (comma list).
+    let tables = config.get_string("table-names", &config.get_string("table_names", ""));
+    for qualified in tables.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some((db, table)) = qualified.rsplit_once('.') {
+            selector.tables.push((db.to_string(), table.to_string()));
+        }
+    }
+    // table-pattern: regex over `db.table`.
+    let table_pattern = config.get_string("table-pattern", &config.get_string("table_pattern", ""));
+    if !table_pattern.is_empty() {
+        if let Some(re) = TableSelector::compile(&table_pattern) {
+            selector.table_patterns.push(re);
+        }
+    }
+    // table-names-config: per-table primaryKeys / snapshotSplitColumn.
+    let config_list = config.get_string("table-names-config", &config.get_string("table_names_config", ""));
+    if !config_list.is_empty() {
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&config_list)
+            .unwrap_or_default();
+        for entry in parsed {
+            let Some(table) = entry.get("table").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            if let Some(split_col) = entry.get("snapshotSplitColumn").and_then(|c| c.as_str()) {
+                selector.split_columns.insert(table.to_string(), split_col.to_string());
+            }
+        }
+    }
+    selector
+}
+
+/// Parse `jdbc:mysql://host:port/db?...` (or `mysql://`) into
+/// (host, port, database). Returns `None` when the value is not a URL.
+fn parse_mysql_jdbc_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("jdbc:mysql://").or_else(|| url.strip_prefix("mysql://"))?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let database = path.split('?').next().unwrap_or("").to_string();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(3306)),
+        None => (authority.to_string(), 3306),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, database))
 }
 
 /// MySQL CDC Source.
@@ -350,12 +634,18 @@ impl MySqlCdcSource {
     }
 
     fn build_pool_for(config: &MySqlCdcConfig) -> Pool {
+        let constraints = mysql_async::PoolConstraints::new(
+            1,
+            config.connection_pool_size.max(1) as usize,
+        )
+        .expect("valid pool constraints");
         let opts = OptsBuilder::default()
             .ip_or_hostname(&config.hostname)
             .tcp_port(config.port)
             .user(Some(&config.username))
             .pass(Some(&config.password))
-            .db_name(Some(&config.database_name));
+            .db_name(Some(&config.database_name))
+            .pool_opts(mysql_async::PoolOpts::new().with_constraints(constraints));
         Pool::new(opts)
     }
 }
@@ -431,75 +721,104 @@ async fn enumerate_snapshot_splits(
             e
         )
     })?;
-    let table_ref = format!("`{}`.`{}`", config.database_name, config.table_name);
 
-    let min_max: Option<(Option<i64>, Option<i64>)> = conn
-        .query_first(format!(
-            "SELECT MIN(`{}`), MAX(`{}`) FROM {}",
-            config.split_column, config.split_column, table_ref
-        ))
-        .await?;
-
-    let (Some(min_id), Some(max_id)) = (min_max.and_then(|(a, _)| a), min_max.and_then(|(_, b)| b))
-    else {
-        tracing::info!(
-            "MySQL CDC: table {} is empty; a single empty snapshot split is created",
-            table_ref
+    // Resolve every table matched by the selection (exact names, patterns,
+    // legacy wildcards) via information_schema.
+    let tables = resolve_captured_tables(&mut conn, config).await?;
+    if tables.is_empty() {
+        anyhow::bail!(
+            "MySQL CDC: no tables matched the configured selection (database-name: {:?}, table-name: {:?}, selector databases: {:?})",
+            config.database_name,
+            config.table_name,
+            config.table_selector.databases()
         );
-        return Ok(vec![SnapshotSplit::new(
-            &config.database_name,
-            &config.table_name,
-            &config.split_column,
-            "0",
-            "1",
-        )]);
-    };
+    }
 
     let parallelism = config.subtask_count.max(1);
-    let span = (max_id - min_id + 1).max(1);
-    let chunk = (span + (parallelism as i64) - 1) / (parallelism as i64);
-    // Each subtask scans a disjoint interval of the id space so parallel
-    // readers never duplicate snapshot rows.
     let idx = (config.subtask_index.min(parallelism - 1)) as i64;
-    let range_start = min_id + idx * chunk;
-    let range_end = range_start.saturating_add(chunk).min(max_id + 1);
-    if range_start > max_id {
-        tracing::info!(
-            "MySQL CDC: subtask {}/{} has an empty snapshot range",
-            config.subtask_index,
-            parallelism
-        );
-        return Ok(vec![SnapshotSplit::new(
-            &config.database_name,
-            &config.table_name,
-            &config.split_column,
-            "0",
-            "1",
-        )]);
-    }
     let mut splits = Vec::new();
-    let mut cursor = range_start;
-    while cursor < range_end {
-        let end = cursor.saturating_add(chunk).min(range_end);
-        splits.push(SnapshotSplit::new(
-            &config.database_name,
-            &config.table_name,
-            &config.split_column,
-            &cursor.to_string(),
-            &end.to_string(),
-        ));
-        cursor = end;
+
+    for (db, table) in &tables {
+        let table_ref = format!("`{}`.`{}`", db, table);
+        let split_column = config
+            .table_selector
+            .split_column_for(db, table)
+            .map(str::to_string)
+            .unwrap_or_else(|| config.split_column.clone());
+
+        let min_max: Option<(Option<i64>, Option<i64>)> = conn
+            .query_first(format!(
+                "SELECT MIN(`{}`), MAX(`{}`) FROM {}",
+                split_column, split_column, table_ref
+            ))
+            .await?;
+        let (Some(min_id), Some(max_id)) =
+            (min_max.and_then(|(a, _)| a), min_max.and_then(|(_, b)| b))
+        else {
+            tracing::info!("MySQL CDC: table {} is empty; skipped", table_ref);
+            continue;
+        };
+
+        // Rows-per-chunk: honor snapshot.split.size, but never larger than
+        // the per-subtask span so parallel readers keep disjoint ranges.
+        let span = (max_id - min_id + 1).max(1);
+        let by_parallelism = (span + parallelism as i64 - 1) / parallelism as i64;
+        let chunk = by_parallelism.min(config.snapshot_split_size.max(1)).max(1);
+
+        // Round-robin chunk→subtask assignment: subtask i owns chunks
+        // i, i+parallelism, ... of the id space.
+        let mut chunk_start = min_id;
+        let mut chunk_idx = 0i64;
+        let mut owned = 0i64;
+        while chunk_start <= max_id {
+            let chunk_end = chunk_start.saturating_add(chunk).min(max_id + 1);
+            if chunk_idx % parallelism as i64 == idx {
+                splits.push(SnapshotSplit::new(
+                    db,
+                    table,
+                    &split_column,
+                    &chunk_start.to_string(),
+                    &chunk_end.to_string(),
+                ));
+                owned += 1;
+            }
+            chunk_start = chunk_end;
+            chunk_idx += 1;
+        }
+        tracing::info!(
+            "MySQL CDC: subtask {}/{} owns {} chunk(s) of {} [ids {}..{}] (chunk size {})",
+            config.subtask_index,
+            parallelism,
+            owned,
+            table_ref,
+            min_id,
+            max_id,
+            chunk
+        );
     }
-    tracing::info!(
-        "MySQL CDC: subtask {}/{} enumerated {} split(s) for {} covering ids [{}, {})",
-        config.subtask_index,
-        parallelism,
-        splits.len(),
-        table_ref,
-        range_start,
-        range_end
-    );
     Ok(splits)
+}
+
+/// Resolve concrete `(database, table)` pairs for the configured selection.
+async fn resolve_captured_tables(
+    conn: &mut mysql_async::Conn,
+    config: &MySqlCdcConfig,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let rows: Vec<mysql_async::Row> = conn
+        .query("SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.tables WHERE TABLE_TYPE = 'BASE TABLE'")
+        .await?;
+    let mut matched = Vec::new();
+    for row in rows {
+        let schema: Option<String> = row.get(0).unwrap_or(None);
+        let table: Option<String> = row.get(1).unwrap_or(None);
+        let (Some(schema), Some(table)) = (schema, table) else {
+            continue;
+        };
+        if config.table_selector.matches(&schema, &table) {
+            matched.push((schema, table));
+        }
+    }
+    Ok(matched)
 }
 
 /// Run an async block even outside a tokio runtime (best-effort).
@@ -541,8 +860,12 @@ pub struct MySqlCdcReader {
     table_maps: HashMap<u64, TableMapEvent<'static>>,
     /// True when the binlog stream hit a fatal error and needs re-establishing.
     stream_broken: bool,
-    /// Schema-evolution watcher fed by binlog query (DDL) events.
-    schema_watcher: Option<SchemaWatcher>,
+    /// Schema-evolution watchers, one per captured table.
+    schema_watchers: Vec<SchemaWatcher>,
+    /// Resolved stop boundary (file, position) for stop.mode=latest/specific.
+    stop_boundary: Option<(String, u64)>,
+    /// Set when the stream passed the stop boundary; EOF after drain.
+    stop_reached: bool,
     /// Timestamp warm-up (milliseconds): discard binlog events older than
     /// this before starting to emit (startup.mode = timestamp).
     skip_until_ts_ms: Option<i64>,
@@ -568,7 +891,9 @@ impl MySqlCdcReader {
             snapshot_buffer: VecDeque::new(),
             table_maps: HashMap::new(),
             stream_broken: false,
-            schema_watcher: None,
+            schema_watchers: Vec::new(),
+            stop_boundary: None,
+            stop_reached: false,
             skip_until_ts_ms: None,
             pool: None,
         }
@@ -582,36 +907,44 @@ impl MySqlCdcReader {
         self.pool.clone().expect("pool just built")
     }
 
-    /// Fetch the current column list for the captured table and prime the
-    /// schema watcher's baseline.
-    async fn prime_schema_watcher(&mut self) -> anyhow::Result<()> {
+    /// Create and prime one schema watcher per captured table.
+    async fn prime_schema_watchers(&mut self) -> anyhow::Result<()> {
         let pool = self.build_pool();
         let mut conn = pool.get_conn().await?;
-        let rows: Vec<(String, u32)> = conn
-            .exec(
-                "SELECT COLUMN_NAME, ORDINAL_POSITION FROM information_schema.columns \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-                (&self.config.database_name, &self.config.table_name),
-            )
-            .await?;
-        let columns: Vec<seatunnel_api::ColumnDef> = rows
-            .into_iter()
-            .map(|(name, _)| {
-                seatunnel_api::ColumnDef::new(name, seatunnel_api::ColumnType::String)
-            })
-            .collect();
-        if let Some(watcher) = &mut self.schema_watcher {
+        let tables = resolve_captured_tables(&mut conn, &self.config).await?;
+        for (db, table) in tables {
+            let rows: Vec<(String, u32)> = conn
+                .exec(
+                    "SELECT COLUMN_NAME, ORDINAL_POSITION FROM information_schema.columns \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    (&db, &table),
+                )
+                .await?;
+            let columns: Vec<seatunnel_api::ColumnDef> = rows
+                .into_iter()
+                .map(|(name, _)| {
+                    seatunnel_api::ColumnDef::new(name, seatunnel_api::ColumnType::String)
+                })
+                .collect();
+            let mut watcher =
+                SchemaWatcher::new(format!("{}.{}", db, table), &self.config.schema_evolution);
             watcher.prime(columns);
+            self.schema_watchers.push(watcher);
         }
+        tracing::info!(
+            "MySQL CDC: {} schema watcher(s) primed",
+            self.schema_watchers.len()
+        );
         Ok(())
     }
 
-    /// Emit a pending schema-change event, if any.
+    /// Emit a pending schema-change event from any table's watcher.
     fn take_schema_change(&mut self) -> Option<PollResult<MySqlCdcOutput>> {
-        self.schema_watcher
-            .as_mut()
-            .and_then(|w| w.take_pending())
-            .map(|event| PollResult::SchemaChange(Box::new(event)))
+        let event = self
+            .schema_watchers
+            .iter_mut()
+            .find_map(|w| w.take_pending())?;
+        Some(PollResult::SchemaChange(Box::new(event)))
     }
 
     /// Apply previously snapshotted state (checkpoint restore path).
@@ -856,6 +1189,40 @@ impl MySqlCdcReader {
             );
         }
 
+        // Stop boundary (stop.mode = latest | specific | timestamp): events
+        // beyond it are not absorbed; the reader EOFs once drained.
+        if !self.stop_reached {
+            let beyond = match (&self.config.stop_mode, &self.stop_boundary) {
+                (MySqlStopMode::Never, _) => false,
+                (MySqlStopMode::Latest, _) | (MySqlStopMode::Specific { .. }, _) => {
+                    match &self.stop_boundary {
+                        Some((file, pos)) => {
+                            let cur_file = self.offset.file.as_str();
+                            cur_file > file.as_str()
+                                || (cur_file == file.as_str()
+                                    && (event.header().log_pos() as u64) > *pos)
+                        }
+                        None => false,
+                    }
+                }
+                (MySqlStopMode::Timestamp { timestamp }, _) => {
+                    i64::from(event.header().timestamp()) * 1000 > *timestamp
+                }
+            };
+            if beyond {
+                tracing::info!(
+                    "MySQL CDC reader: stop boundary reached (mode={:?}) at {}/{}",
+                    self.config.stop_mode,
+                    self.offset.file,
+                    event.header().log_pos()
+                );
+                self.stop_reached = true;
+                return;
+            }
+        } else {
+            return;
+        }
+
         let data = match event.read_data() {
             Ok(Some(d)) => d,
             _ => return,
@@ -886,27 +1253,28 @@ impl MySqlCdcReader {
     /// Fast-path schema evolution: feed captured `ALTER TABLE` statements
     /// from the binlog into the watcher.
     fn observe_query_event(&mut self, qe: &mysql_async::binlog::events::QueryEvent<'_>) {
-        if self.schema_watcher.is_none() {
+        if self.schema_watchers.is_empty() {
             return;
         }
         let schema = String::from_utf8_lossy(qe.schema_raw()).to_string();
-        if schema != self.config.database_name {
-            return;
-        }
         let query = qe.query().to_string();
         if !query.to_lowercase().trim_start().starts_with("alter table") {
             return;
         }
-        match alter_table_target(&query) {
-            Some(table) if self.config.table_matches(&table) => {
-                if let Some(watcher) = &mut self.schema_watcher {
-                    watcher.observe_ddl(&query);
-                }
-            }
-            _ => tracing::debug!(
-                "MySQL CDC: ALTER on non-captured table ignored: {}",
-                query
-            ),
+        let Some(table) = alter_table_target(&query) else {
+            return;
+        };
+        if !self.config.table_selector.matches(&schema, &table) {
+            tracing::debug!("MySQL CDC: ALTER on non-captured table ignored: {}", query);
+            return;
+        }
+        let watcher_id = format!("{}.{}", schema, table);
+        if let Some(watcher) = self
+            .schema_watchers
+            .iter_mut()
+            .find(|w| w.table_id == watcher_id)
+        {
+            watcher.observe_ddl(&query);
         }
     }
 
@@ -916,9 +1284,12 @@ impl MySqlCdcReader {
         let Some(tme) = self.table_maps.get(&table_id) else {
             return;
         };
-        // Only capture events belonging to the configured table.
-        if !(tme.database_name().as_bytes() == self.config.database_name.as_bytes()
-            && self.config.table_matches(tme.table_name().as_ref()))
+        // Only capture events belonging to the selected tables
+        // (exact db.table refs, regex patterns, legacy wildcards).
+        if !self
+            .config
+            .table_selector
+            .matches(tme.database_name().as_ref(), tme.table_name().as_ref())
         {
             return;
         }
@@ -1047,15 +1418,30 @@ impl SourceReader for MySqlCdcReader {
 
             self.connect_and_prepare().await?;
 
+            // Log official-but-unimplemented options once per reader.
+
+            // Resolve stop.mode: `latest` stops at the position captured
+            // right now; `specific` uses the configured offset.
+            match self.config.stop_mode.clone() {
+                MySqlStopMode::Latest => {
+                    self.stop_boundary =
+                        Some((self.offset.file.clone(), self.offset.position));
+                }
+                MySqlStopMode::Specific { file, position } => {
+                    if file.is_empty() {
+                        anyhow::bail!(
+                            "stop.mode=specific requires stop.specific-offset.file"
+                        );
+                    }
+                    self.stop_boundary = Some((file, position));
+                }
+                _ => {}
+            }
+
             // Schema evolution: subtask 0 owns the binlog stream and the
             // DDL watcher; snapshot-only subtasks finish too quickly to care.
             if self.config.schema_evolution.enabled && self.config.subtask_index == 0 {
-                let watcher = SchemaWatcher::new(
-                    format!("{}.{}", self.config.database_name, self.config.table_name),
-                    &self.config.schema_evolution,
-                );
-                self.schema_watcher = Some(watcher);
-                if let Err(e) = self.prime_schema_watcher().await {
+                if let Err(e) = self.prime_schema_watchers().await {
                     tracing::warn!("MySQL CDC: schema watcher priming failed: {}", e);
                 }
             }
@@ -1329,6 +1715,12 @@ impl SourceReader for MySqlCdcReader {
 impl MySqlCdcReader {
     /// Incremental phase pump: replay buffer → live stream → Empty.
     async fn poll_incremental(&mut self) -> anyhow::Result<PollResult<MySqlCdcOutput>> {
+        // 0. Drained after crossing the stop boundary → bounded capture ends.
+        if self.stop_reached {
+            tracing::info!("MySQL CDC reader: bounded capture complete (stop.mode={:?})", self.config.stop_mode);
+            return Ok(PollResult::EOF);
+        }
+
         // 1. Anything already decoded?
         if let Some(row) = self.next_buffered_change() {
             return Ok(PollResult::Record(MySqlCdcOutput(row)));
@@ -1406,7 +1798,7 @@ async fn query_snapshot_batch(
         split.split_column,
         last_pk,
         split.split_column,
-        SNAPSHOT_BATCH_SIZE,
+        config.snapshot_fetch_size,
     );
     // `exec` uses the binary protocol so numeric/temporal columns arrive
     // fully typed instead of as raw byte strings.
@@ -1623,6 +2015,8 @@ mod tests {
             subtask_index: 0,
             subtask_count: 1,
             schema_evolution: SchemaEvolutionConfig::default(),
+            table_selector: TableSelector::from_legacy("testdb", "test_table"),
+            ..Default::default()
         }
     }
 
@@ -1819,14 +2213,152 @@ mod tests {
     }
 
     #[test]
+    fn multi_table_selection_from_official_options() {
+        let props: HashMap<String, String> = [
+            ("url", "jdbc:mysql://127.0.0.1:13306/seatunnel"),
+            ("username", "root"),
+            ("password", "root"),
+            ("database-names", "seatunnel"),
+            ("table-names", "seatunnel.users_a,seatunnel.users_b"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let cfg = MySqlCdcConfig::from_config(&ConnectorConfig::new(props));
+        assert!(cfg.table_selector.matches("seatunnel", "users_a"), "selector={:?}", cfg.table_selector.databases);
+    }
+
+    #[test]
     fn table_pattern_matching() {
-        let mut cfg = test_config();
-        assert!(cfg.table_matches("test_table"));
-        assert!(!cfg.table_matches("other"));
-        cfg.table_name = "events%".into();
-        assert!(cfg.table_matches("events_2026"));
-        assert!(!cfg.table_matches("orders"));
-        cfg.table_name = "mydb.users".into();
-        assert!(cfg.table_matches("users"));
+        // Legacy single-name selection.
+        let cfg = test_config();
+        assert!(cfg.table_selector.matches("testdb", "test_table"));
+        assert!(!cfg.table_selector.matches("testdb", "other"));
+
+        // Legacy trailing % wildcard.
+        let mk = |pairs: &[(&str, &str)]| {
+            let props: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            MySqlCdcConfig::from_config(&ConnectorConfig::new(props))
+        };
+        let cfg = mk(&[("table-name", "events%")]);
+        assert!(cfg.table_selector.matches("seatunnel", "events_2026"));
+        assert!(!cfg.table_selector.matches("seatunnel", "orders"));
+
+        // Official list selection: table-names entries are db.table pairs.
+        let cfg = mk(&[
+            ("database-names", "seatunnel,analytics"),
+            ("table-names", "seatunnel.users,analytics.orders"),
+        ]);
+        assert!(cfg.table_selector.matches("seatunnel", "users"));
+        assert!(cfg.table_selector.matches("analytics", "orders"));
+        assert!(!cfg.table_selector.matches("seatunnel", "orders"));
+
+        // Official regex patterns over db and db.table.
+        let cfg = mk(&[
+            ("database-pattern", "seatunnel.*"),
+            ("table-pattern", "seatunnel.*\\.events_.*"),
+        ]);
+        assert!(cfg.table_selector.matches("seatunnel", "events_2026"));
+        assert!(cfg.table_selector.matches("seatunnel_shard", "events_2026"));
+        assert!(!cfg.table_selector.matches("seatunnel", "users"));
+
+        // table-names-config per-table split column override.
+        let cfg = mk(&[(
+            "table-names-config",
+            "[{\"table\": \"seatunnel.users\",\"snapshotSplitColumn\": \"created_at\"}]",
+        )]);
+        assert_eq!(
+            cfg.table_selector.split_column_for("seatunnel", "users"),
+            Some("created_at")
+        );
+    }
+
+    #[test]
+    fn url_and_connection_options() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let props: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            MySqlCdcConfig::from_config(&ConnectorConfig::new(props))
+        };
+        let cfg = mk(&[("url", "jdbc:mysql://db.host:3307/inventory")]);
+        assert_eq!(cfg.hostname, "db.host");
+        assert_eq!(cfg.port, 3307);
+        assert_eq!(cfg.database_name, "inventory");
+        // database-name overrides the URL path when both are set.
+        let cfg = mk(&[
+            ("url", "jdbc:mysql://db.host:3307/inventory"),
+            ("database-name", "other"),
+        ]);
+        assert_eq!(cfg.database_name, "other");
+
+        // server-id range.
+        let cfg = mk(&[("server-id", "5400-5408")]);
+        assert_eq!(cfg.server_id, 5400);
+        assert_eq!(cfg.server_id_range, 8);
+
+        // snapshot sizing + pool.
+        let cfg = mk(&[
+            ("snapshot.split.size", "4096"),
+            ("snapshot.fetch.size", "256"),
+            ("connection.pool.size", "8"),
+        ]);
+        assert_eq!(cfg.snapshot_split_size, 4096);
+        assert_eq!(cfg.snapshot_fetch_size, 256);
+        assert_eq!(cfg.connection_pool_size, 8);
+    }
+
+    #[test]
+    fn official_startup_and_stop_options() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let props: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            MySqlCdcConfig::from_config(&ConnectorConfig::new(props))
+        };
+        // Official startup.specific-offset.* keys.
+        let cfg = mk(&[
+            ("startup.mode", "specific"),
+            ("startup.specific-offset.file", "binlog.000004"),
+            ("startup.specific-offset.pos", "1234"),
+            ("startup.specific-offset.gtid-set", "aaa:1-9"),
+        ]);
+        assert_eq!(
+            cfg.startup_mode,
+            MySqlStartupMode::Specific {
+                file: "binlog.000004".to_string(),
+                position: 1234,
+                gtid_set: Some("aaa:1-9".to_string()),
+            }
+        );
+        // Stop modes.
+        let cfg = mk(&[("stop.mode", "never")]);
+        assert_eq!(cfg.stop_mode, MySqlStopMode::Never);
+        let cfg = mk(&[("stop.mode", "latest")]);
+        assert_eq!(cfg.stop_mode, MySqlStopMode::Latest);
+        let cfg = mk(&[
+            ("stop.mode", "specific"),
+            ("stop.specific-offset.file", "binlog.000009"),
+            ("stop.specific-offset.pos", "99"),
+        ]);
+        assert_eq!(
+            cfg.stop_mode,
+            MySqlStopMode::Specific {
+                file: "binlog.000009".to_string(),
+                position: 99,
+            }
+        );
+        let cfg = mk(&[("stop.mode", "timestamp"), ("stop.timestamp", "1667232000000")]);
+        assert_eq!(
+            cfg.stop_mode,
+            MySqlStopMode::Timestamp {
+                timestamp: 1_667_232_000_000
+            }
+        );
     }
 }

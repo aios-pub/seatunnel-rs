@@ -15,13 +15,13 @@ mysql_async.workspace = true
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 bigdecimal = { workspace = true }
-regex = "1"
 futures = { workspace = true }
 # mysql-binlog-connector: async MySQL binlog parser
 # TODO: Pin to specific version when available on crates.io

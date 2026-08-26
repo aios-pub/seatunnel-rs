@@ -113,6 +113,7 @@ testcontainers-modules = { version = "0.11", features = ["mysql", "postgres", "k
 prost-derive = "0.13"
 
 # Utilities
+regex = "1"
 bytes = "1"
 hex = "0.4"
 once_cell = "1"

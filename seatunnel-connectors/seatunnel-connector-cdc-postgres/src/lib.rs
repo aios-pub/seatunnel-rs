@@ -77,9 +77,6 @@ use tokio_postgres::{Client, NoTls};
 /// Maximum change rows buffered while the snapshot phase runs.
 const MAX_BUFFERED_STREAM_ROWS: usize = 65_536;
 
-/// Number of rows fetched per keyset-paginated snapshot query.
-const SNAPSHOT_BATCH_SIZE: i64 = 500;
-
 /// Consecutive stream errors tolerated before the task fails.
 const STREAM_ERROR_TOLERANCE: u32 = 5;
 
@@ -225,6 +222,77 @@ pub enum PostgresStartupMode {
     },
 }
 
+
+// ---------------------------------------------------------------------------
+// Table selection (official option set)
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL table matcher for the official `table-names` /
+/// `table-pattern` options. Entries are `db.table` (or `schema.table`,
+/// or `db.schema.table`) — the last component is the table, earlier
+/// components match either the connected database or the schema.
+#[derive(Debug, Clone, Default)]
+pub struct PgTableMatcher {
+    /// (qualifier, table): qualifier matches schema or database when set.
+    exact: Vec<(Option<String>, String)>,
+    patterns: Vec<regex::Regex>,
+    /// Legacy single-table fallback (schema + table).
+    legacy: Option<(String, String)>,
+}
+
+impl PgTableMatcher {
+    /// Legacy single-table matcher (schema + table).
+    pub fn legacy(schema: &str, table: &str) -> Self {
+        PgTableMatcher {
+            legacy: Some((schema.to_string(), table.to_string())),
+            ..Default::default()
+        }
+    }
+
+    pub fn matches(&self, database: &str, schema: &str, table: &str) -> bool {
+        if let Some((legacy_schema, legacy_table)) = &self.legacy {
+            if schema == legacy_schema && table == legacy_table {
+                return true;
+            }
+        }
+        if self.exact.iter().any(|(q, t)| {
+            t == table
+                && q.as_ref().is_none_or(|q| q == schema || q == database)
+        }) {
+            return true;
+        }
+        let qualified = [
+            format!("{}.{}", schema, table),
+            format!("{}.{}", database, table),
+        ];
+        self.patterns.iter().any(|re| qualified.iter().any(|q| re.is_match(q)))
+    }
+
+    pub fn is_multi(&self) -> bool {
+        self.exact.len() + self.patterns.len() > 1
+    }
+}
+
+/// Parse `jdbc:postgresql://host:port/db` (or `postgres://`) into
+/// (host, port, database).
+fn parse_pg_jdbc_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url
+        .strip_prefix("jdbc:postgresql://")
+        .or_else(|| url.strip_prefix("jdbc:postgres://"))
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .or_else(|| url.strip_prefix("postgres://"))?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let database = path.split('?').next().unwrap_or("").to_string();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(5432)),
+        None => (authority.to_string(), 5432),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, database))
+}
+
 /// PostgreSQL CDC configuration.
 #[derive(Debug, Clone)]
 pub struct PostgresCdcConfig {
@@ -251,6 +319,17 @@ pub struct PostgresCdcConfig {
     /// Schema-evolution settings (PG DDL detected by catalog polling;
     /// pgoutput does not expose parsed DDL through this stack).
     pub schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig,
+    /// Logical decoding plugin (official `decoding.plugin.name`; only
+    /// `pgoutput` is supported — others are warned about).
+    pub decoding_plugin: String,
+    /// Rows per snapshot split (official `snapshot.split.size`, 8096).
+    pub snapshot_split_size: i64,
+    /// Snapshot page size (official `snapshot.fetch.size`, 1024).
+    pub snapshot_fetch_size: i64,
+    /// Resolved table selection from `table-names` / `table-pattern`.
+    pub table_matcher: PgTableMatcher,
+    /// Warnings for official-but-unimplemented options (logged at open).
+    pub compat_warnings: Vec<String>,
 }
 
 impl Default for PostgresCdcConfig {
@@ -272,23 +351,108 @@ impl Default for PostgresCdcConfig {
             subtask_index: 0,
             subtask_count: 1,
             schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::default(),
+            decoding_plugin: "pgoutput".to_string(),
+            snapshot_split_size: 8096,
+            snapshot_fetch_size: 1024,
+            table_matcher: PgTableMatcher::legacy("public", "users"),
+            compat_warnings: Vec::new(),
         }
     }
 }
 
 impl PostgresCdcConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
+        // `url` (jdbc:postgresql://host:port/db) is the official connection
+        // option; hostname/port remain simpler alternatives.
+        let (url_host, url_port, url_db) = config
+            .get("url")
+            .and_then(|u| parse_pg_jdbc_url(u))
+            .unwrap_or_default();
+
+        let decoding_plugin = config.get_string(
+            "decoding.plugin.name",
+            &config.get_string("decoding_plugin_name", "pgoutput"),
+        );
+        if decoding_plugin != "pgoutput" {
+            tracing::warn!(
+                "PostgreSQL CDC: decoding.plugin.name='{}' is not supported; \
+                 this implementation uses pgoutput exclusively",
+                decoding_plugin
+            );
+        }
+
+        // database-names: the reader connects to a single database; extra
+        // entries are validated against it.
+        let database_names = config.get_string("database-names", &config.get_string("database_names", ""));
+        for name in database_names.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            if name != config.get_string("database-name", &url_db) {
+                tracing::warn!(
+                    "PostgreSQL CDC: database-names entry '{}' ignored — this reader \
+                     captures a single database per job ('{}')",
+                    name,
+                    config.get_string("database-name", &url_db)
+                );
+            }
+        }
+
+        let mut matcher = PgTableMatcher::default();
+        // table-names: db.table / schema.table / db.schema.table entries.
+        let table_names = config.get_string("table-names", &config.get_string("table_names", ""));
+        for qualified in table_names.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let parts: Vec<&str> = qualified.split('.').collect();
+            match parts.as_slice() {
+                [table] => matcher.exact.push((None, table.to_string())),
+                [qualifier, table] => {
+                    matcher
+                        .exact
+                        .push((Some(qualifier.to_string()), table.to_string()))
+                }
+                [_, schema, table] => {
+                    matcher
+                        .exact
+                        .push((Some(schema.to_string()), table.to_string()))
+                }
+                _ => tracing::warn!("PostgreSQL CDC: unparseable table-names entry '{}'", qualified),
+            }
+        }
+        // table-pattern: regex over schema.table / database.table.
+        let table_pattern = config.get_string("table-pattern", &config.get_string("table_pattern", ""));
+        if !table_pattern.is_empty() {
+            match regex::Regex::new(&table_pattern) {
+                Ok(re) => matcher.patterns.push(re),
+                Err(e) => tracing::warn!("invalid table-pattern '{}': {}", table_pattern, e),
+            }
+        }
+        if matcher.exact.is_empty() && matcher.patterns.is_empty() {
+            matcher.legacy = Some((
+                config.get_string("schema-name", "public"),
+                config.get_string("table-name", "users"),
+            ));
+        }
+
         PostgresCdcConfig {
-            hostname: config.get_string("hostname", "localhost"),
-            port: config.get_int("port", 5432) as u16,
+            hostname: {
+                let v = config.get_string("hostname", &url_host);
+                if v.is_empty() { "localhost".to_string() } else { v }
+            },
+            port: {
+                let p = config.get_int("port", -1);
+                if p > 0 { p as u16 } else if url_port > 0 { url_port } else { 5432 }
+            },
             username: config.get_string("username", "postgres"),
             password: config.get_string("password", ""),
-            database_name: config.get_string("database-name", "seatunnel"),
+            database_name: {
+                let v = config.get_string("database-name", &url_db);
+                if v.is_empty() { "seatunnel".to_string() } else { v }
+            },
             schema_name: config.get_string("schema-name", "public"),
             table_name: config.get_string("table-name", "users"),
             split_column: config.get_string("split.column", "id"),
             publication_name: config.get_string("publication-name", "seatunnel_pub"),
-            slot_name: config.get_string("slot-name", "seatunnel_slot"),
+            slot_name: config.get_string(
+                "slot.name",
+                &config.get_string("slot-name", &config.get_string("slot_name", "seatunnel_slot")),
+            ),
             auto_create_slot: config.get_bool("auto-create-slot", true),
             startup_mode: config
                 .get("startup.mode")
@@ -304,6 +468,15 @@ impl PostgresCdcConfig {
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
             schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::from_config(config),
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
+            decoding_plugin,
+            snapshot_split_size: config
+                .get_int("snapshot.split.size", config.get_int("snapshot_split_size", 8096))
+                .max(1),
+            snapshot_fetch_size: config
+                .get_int("snapshot.fetch.size", config.get_int("snapshot_fetch_size", 1024))
+                .max(1),
+            table_matcher: matcher,
+            compat_warnings: seatunnel_connector_cdc_base::compatibility_warnings(config),
         }
     }
 
@@ -453,7 +626,11 @@ impl Source for PostgresCdcSource {
         // runtime (or a temporary one outside tokio).
         let ranges = {
             let config = self.config.clone();
-            tokio_block_on(async move { enumerate_snapshot_ranges(&config).await })?
+            let schema = self.config.schema_name.clone();
+            let table = self.config.table_name.clone();
+            tokio_block_on(async move {
+                enumerate_snapshot_ranges(&config, &schema, &table).await
+            })?
         };
         Ok(ranges
             .into_iter()
@@ -501,14 +678,19 @@ impl Source for PostgresCdcSource {
 /// Compute this subtask's disjoint snapshot ranges from the live table:
 /// `[MIN(split_col), MAX(split_col)]` sliced into `subtask_count` intervals,
 /// of which only `subtask_index`'s slice is returned (as [start,end) pairs
-/// further chunked into ≤ SNAPSHOT_BATCH_SIZE spans).
-async fn enumerate_snapshot_ranges(config: &PostgresCdcConfig) -> anyhow::Result<Vec<(i64, i64)>> {
+/// further chunked into ≤ snapshot.fetch.size spans).
+async fn enumerate_snapshot_ranges(
+    config: &PostgresCdcConfig,
+    schema: &str,
+    table: &str,
+) -> anyhow::Result<Vec<(i64, i64)>> {
     let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::debug!("postgres enumeration connection closed: {}", e);
         }
     });
+    let table_ref = format!("\"{}\".\"{}\"", schema, table);
 
     let sql = format!(
         // Cast to bigint: MIN/MAX over an int4 column would otherwise return
@@ -516,7 +698,7 @@ async fn enumerate_snapshot_ranges(config: &PostgresCdcConfig) -> anyhow::Result
         "SELECT MIN(\"{}\")::bigint, MAX(\"{}\")::bigint FROM {}",
         config.split_column,
         config.split_column,
-        config.qualified_table()
+        table_ref
     );
     let row = client
         .query_one(&sql, &[])
@@ -528,14 +710,16 @@ async fn enumerate_snapshot_ranges(config: &PostgresCdcConfig) -> anyhow::Result
     let (Some(min_id), Some(max_id)) = (min_id, max_id) else {
         tracing::info!(
             "PostgreSQL CDC: table {} is empty; a single empty snapshot split is created",
-            config.qualified_table()
+            table_ref
         );
         return Ok(vec![(0, 1)]);
     };
 
     let count = config.subtask_count.max(1);
     let span = (max_id - min_id + 1).max(1);
-    let chunk = (span + count as i64 - 1) / count as i64;
+    let by_parallelism = (span + count as i64 - 1) / count as i64;
+    // snapshot.split.size caps the per-subtask span, mirroring MySQL.
+    let chunk = by_parallelism.min(config.snapshot_split_size.max(1)).max(1);
     let idx = config.subtask_index.min(count - 1) as i64;
     let range_start = min_id + idx * chunk;
     let range_end = (range_start + chunk).min(max_id + 1);
@@ -551,20 +735,52 @@ async fn enumerate_snapshot_ranges(config: &PostgresCdcConfig) -> anyhow::Result
     let mut splits = Vec::new();
     let mut cursor = range_start;
     while cursor < range_end {
-        let end = (cursor + SNAPSHOT_BATCH_SIZE).min(range_end);
+        let end = (cursor + config.snapshot_fetch_size).min(range_end);
         splits.push((cursor, end));
         cursor = end;
     }
     tracing::info!(
-        "PostgreSQL CDC: subtask {}/{} enumerated {} split(s) for {} covering ids [{}, {})",
+        "PostgreSQL CDC: subtask {}/{} enumerated {} split(s) for {} covering ids [{}, {}]",
         config.subtask_index,
         count,
         splits.len(),
-        config.qualified_table(),
+        table_ref,
         range_start,
         range_end
     );
     Ok(splits)
+}
+
+/// Resolve concrete (schema, table) pairs matching the configured
+/// selection via the catalog.
+async fn resolve_pg_tables(
+    config: &PostgresCdcConfig,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!("postgres table-resolution connection closed: {}", e);
+        }
+    });
+    let rows = client
+        .query(
+            "SELECT table_schema, table_name FROM information_schema.tables \\
+             WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')",
+            &[],
+        )
+        .await?;
+    let mut matched = Vec::new();
+    for row in rows {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        if config
+            .table_matcher
+            .matches(&config.database_name, &schema, &table)
+        {
+            matched.push((schema, table));
+        }
+    }
+    Ok(matched)
 }
 
 /// Run an async block even outside a tokio runtime (best-effort).
@@ -591,6 +807,14 @@ pub struct PostgresCdcReader {
     phase: CdcPhase,
     /// Remaining snapshot ranges `[start, end)` with keyset cursors.
     pending_ranges: VecDeque<(i64, i64)>,
+    /// Multi-table capture: remaining tables to snapshot after the current
+    /// one (qualified `schema.table`), consumed sequentially.
+    pending_tables: VecDeque<String>,
+    /// (schema, table) currently being snapshotted.
+    current_table: (String, String),
+    /// Per-table cached layouts for streaming decode (schema.table →
+    /// (column names, types)).
+    layouts: HashMap<String, (Vec<String>, Vec<Type>)>,
     last_pk: i64,
     current_idx: Cell<usize>,
     lsn: Lsn,
@@ -620,6 +844,9 @@ impl PostgresCdcReader {
             schema,
             phase: CdcPhase::Snapshot,
             pending_ranges: VecDeque::new(),
+            pending_tables: VecDeque::new(),
+            current_table: (String::new(), String::new()),
+            layouts: HashMap::new(),
             last_pk: 0,
             current_idx: Cell::new(0),
             lsn: Lsn::zero(),
@@ -663,6 +890,18 @@ impl PostgresCdcReader {
                 .into_iter()
                 .map(|(a, b)| (a.parse::<i64>().unwrap_or(0), b.parse::<i64>().unwrap_or(0)))
                 .collect();
+        }
+        if let Some(Ok(tables)) = state
+            .offset
+            .get("pending_tables")
+            .map(|s| serde_json::from_str::<Vec<String>>(s))
+        {
+            self.pending_tables = tables.into_iter().collect();
+        }
+        if let Some(current) = state.offset.get("current_table") {
+            if let Some((schema, table)) = current.rsplit_once('.') {
+                self.current_table = (schema.to_string(), table.to_string());
+            }
         }
         if self.phase == CdcPhase::Incremental {
             self.pending_ranges.clear();
@@ -786,6 +1025,22 @@ impl PostgresCdcReader {
         Ok(())
     }
 
+    /// Switch the snapshot target: refresh the cached layout and load this
+    /// subtask's ranges for the new table.
+    async fn switch_snapshot_table(
+        &mut self,
+        client: &Arc<Client>,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<()> {
+        tracing::info!("PostgreSQL CDC: snapshot advancing to {}.{}", schema, table);
+        self.current_table = (schema.to_string(), table.to_string());
+        self.cache_columns_for(client, schema, table).await?;
+        let ranges = enumerate_snapshot_ranges(&self.config, schema, table).await?;
+        self.pending_ranges = ranges.into_iter().collect();
+        Ok(())
+    }
+
     /// Prime the schema watcher baseline (subtask 0 only).
     async fn prime_schema_watcher(&mut self) {
         if !self.config.schema_evolution.enabled || self.config.subtask_index != 0 {
@@ -845,6 +1100,28 @@ impl PostgresCdcReader {
             }
         }
         Some(event)
+    }
+
+    /// Cache the layout of an arbitrary table (multi-table capture).
+    async fn cache_columns_for(
+        &mut self,
+        client: &Arc<Client>,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<()> {
+        let sql = format!("SELECT * FROM \"{}\".\"{}\" LIMIT 0", schema, table);
+        let stmt = client.prepare(&sql).await?;
+        let names: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+        let types: Vec<Type> = stmt.columns().iter().map(|c| c.type_().clone()).collect();
+        if names.is_empty() {
+            anyhow::bail!("table {}.{} has no columns", schema, table);
+        }
+        if self.current_table == (schema.to_string(), table.to_string()) {
+            self.columns = names.clone();
+            self.column_types = types.clone();
+        }
+        self.layouts.insert(format!("{}.{}", schema, table), (names, types));
+        Ok(())
     }
 
     /// Cache column names/types so snapshot and streamed rows share layout.
@@ -933,13 +1210,30 @@ impl PostgresCdcReader {
         let Some((kind, data)) = image else {
             return;
         };
+        // Multi-table capture: filter by the configured selection.
+        let schema = event.schema.clone().unwrap_or_else(|| self.config.schema_name.clone());
+        let table = event.table.clone();
+        if !self
+            .config
+            .table_matcher
+            .matches(&self.config.database_name, &schema, &table)
+        {
+            return;
+        }
+        // Layout per table (falls back to the primary table's cache).
+        let layout_key = format!("{}.{}", schema, table);
+        let (columns, _types) = self
+            .layouts
+            .get(&layout_key)
+            .cloned()
+            .unwrap_or_else(|| (self.columns.clone(), self.column_types.clone()));
         let Some(obj) = data.as_object() else {
             return;
         };
         // Layout identical to snapshot rows: cached column order.
-        let width = self.columns.len().max(obj.len());
+        let width = columns.len().max(obj.len());
         let mut row = Row::new(kind, width);
-        for (i, col) in self.columns.iter().enumerate() {
+        for (i, col) in columns.iter().enumerate() {
             row.set(
                 i,
                 obj.get(col).map(json_val_to_field).unwrap_or(Field::Null),
@@ -947,8 +1241,8 @@ impl PostgresCdcReader {
         }
         // Columns unknown at cache time (schema drift) are appended.
         for (i, (key, val)) in obj.iter().enumerate() {
-            if !self.columns.iter().any(|c| c == key) {
-                let idx = self.columns.len() + i;
+            if !columns.iter().any(|c| c == key) {
+                let idx = columns.len() + i;
                 if idx < width {
                     row.set(idx, json_val_to_field(val));
                 }
@@ -1029,6 +1323,10 @@ impl SourceReader for PostgresCdcReader {
             let resuming_incremental =
                 self.phase == CdcPhase::Incremental && self.lsn != Lsn::zero();
 
+            for warning in &self.config.compat_warnings {
+                tracing::warn!("PostgreSQL CDC: {}", warning);
+            }
+
             // Admin/snapshot connection — fail loudly when unreachable.
             let client = self.connect_admin().await?;
 
@@ -1085,10 +1383,33 @@ impl SourceReader for PostgresCdcReader {
             }
 
             // Seed snapshot splits unless a checkpoint supplied them or we
-            // are streaming-only.
+            // are streaming-only. Multi-table selections are snapshotted
+            // table by table.
             if self.phase == CdcPhase::Snapshot && self.pending_ranges.is_empty() {
-                let ranges = enumerate_snapshot_ranges(&self.config).await?;
-                self.pending_ranges.extend(ranges);
+                let matched = resolve_pg_tables(&self.config).await?;
+                let (first, rest): (Vec<_>, Vec<_>) = if matched.is_empty() {
+                    (vec![(self.config.schema_name.clone(), self.config.table_name.clone())], vec![])
+                } else {
+                    (vec![matched[0].clone()], matched[1..].to_vec())
+                };
+                if !rest.is_empty() {
+                    tracing::info!(
+                        "PostgreSQL CDC: {} table(s) selected for snapshot",
+                        matched.len()
+                    );
+                }
+                for (schema, table) in &rest {
+                    self.pending_tables.push_back(format!("{}.{}", schema, table));
+                }
+                if let Some((schema, table)) = first.first() {
+                    self.current_table = (schema.clone(), table.clone());
+                    if !self.layouts.contains_key(&format!("{}.{}", schema, table)) {
+                        self.cache_columns_for(&client, schema, table).await?;
+                    }
+                    let ranges =
+                        enumerate_snapshot_ranges(&self.config, schema, table).await?;
+                    self.pending_ranges.extend(ranges);
+                }
             }
 
             Ok(())
@@ -1116,10 +1437,14 @@ impl SourceReader for PostgresCdcReader {
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
                 let client = self.connect_admin().await?;
+                let table_ref = format!(
+                    "\"{}\".\"{}\"",
+                    self.current_table.0, self.current_table.1
+                );
                 let sql = format!(
                     "SELECT * FROM {} WHERE \"{}\" >= {} AND \"{}\" < {} AND \"{}\" > {} \
                      ORDER BY \"{}\" ASC LIMIT {}",
-                    self.config.qualified_table(),
+                    table_ref,
                     self.config.split_column,
                     start,
                     self.config.split_column,
@@ -1127,13 +1452,21 @@ impl SourceReader for PostgresCdcReader {
                     self.config.split_column,
                     self.last_pk,
                     self.config.split_column,
-                    SNAPSHOT_BATCH_SIZE,
+                    self.config.snapshot_fetch_size,
                 );
                 let rows = client.query(&sql, &[]).await?;
                 if rows.is_empty() {
                     self.pending_ranges.pop_front();
                     self.last_pk = 0;
                     self.current_idx.set(self.current_idx.get() + 1);
+                    if self.pending_ranges.is_empty() {
+                        // Multi-table capture: advance to the next table.
+                        if let Some(next) = self.pending_tables.pop_front() {
+                            if let Some((schema, table)) = next.rsplit_once('.') {
+                                self.switch_snapshot_table(&client, schema, table).await?;
+                            }
+                        }
+                    }
                     return Ok(PollResult::Empty);
                 }
                 let types: Vec<Type> = rows[0]
@@ -1203,6 +1536,18 @@ impl SourceReader for PostgresCdcReader {
             if let Ok(json) = serde_json::to_string(&ranges) {
                 offset.insert("ranges".to_string(), json);
             }
+        }
+        if !self.pending_tables.is_empty() {
+            let tables: Vec<String> = self.pending_tables.iter().cloned().collect();
+            if let Ok(json) = serde_json::to_string(&tables) {
+                offset.insert("pending_tables".to_string(), json);
+            }
+        }
+        if !self.current_table.0.is_empty() {
+            offset.insert(
+                "current_table".to_string(),
+                format!("{}.{}", self.current_table.0, self.current_table.1),
+            );
         }
         let state = PostgresCdcState {
             phase: self.phase,
@@ -1356,6 +1701,11 @@ mod tests {
             subtask_index: 0,
             subtask_count: 1,
             schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::default(),
+            decoding_plugin: "pgoutput".to_string(),
+            snapshot_split_size: 8096,
+            snapshot_fetch_size: 1024,
+            table_matcher: PgTableMatcher::legacy("public", "users"),
+            compat_warnings: Vec::new(),
         }
     }
 
@@ -1463,6 +1813,44 @@ mod tests {
         assert_eq!(restored.last_pk, 150);
         assert_eq!(restored.pending_ranges.front(), Some(&(100, 200)));
         assert_eq!(restored.columns, vec!["id".to_string(), "name".to_string()]);
+    }
+
+    #[test]
+    fn pg_official_options_parsing() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let props: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            PostgresCdcConfig::from_config(&ConnectorConfig::new(props))
+        };
+        // url connection form.
+        let cfg = mk(&[("url", "jdbc:postgresql://pg.host:5433/inventory")]);
+        assert_eq!(cfg.hostname, "pg.host");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.database_name, "inventory");
+
+        // slot.name alias + decoding plugin + snapshot sizes.
+        let cfg = mk(&[
+            ("slot.name", "my_slot"),
+            ("snapshot.split.size", "4096"),
+            ("snapshot.fetch.size", "128"),
+        ]);
+        assert_eq!(cfg.slot_name, "my_slot");
+        assert_eq!(cfg.snapshot_split_size, 4096);
+        assert_eq!(cfg.snapshot_fetch_size, 128);
+
+        // table-names entries (db.table / db.schema.table) + pattern.
+        let cfg = mk(&[("table-names", "inventory.public.orders,analytics.events")]);
+        assert!(cfg
+            .table_matcher
+            .matches("inventory", "public", "orders"));
+        assert!(cfg.table_matcher.matches("analytics", "public", "events"));
+        assert!(!cfg.table_matcher.matches("inventory", "public", "users"));
+
+        let cfg = mk(&[("table-pattern", ".*\\.events_.*")]);
+        assert!(cfg.table_matcher.matches("inventory", "public", "events_2026"));
+        assert!(!cfg.table_matcher.matches("inventory", "public", "orders"));
     }
 
     #[test]

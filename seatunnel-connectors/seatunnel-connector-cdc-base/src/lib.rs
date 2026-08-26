@@ -731,6 +731,42 @@ pub fn parse_type_spec(ty: &str) -> (String, Option<u32>, Option<i8>) {
     }
 }
 
+
+/// Official SeaTunnel options that are accepted for configuration
+/// compatibility but not implemented by this Rust engine; each present
+/// option is logged once with an honest behavior note.
+pub fn compatibility_warnings(config: &seatunnel_connector_common::ConnectorConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    const UNIMPLEMENTED: &[(&str, &str)] = &[
+        ("exactly_once", "delivery stays at-least-once"),
+        ("format", "positional row encoding is used"),
+        ("debeziumConfig", "Debezium is not embedded in this engine"),
+        ("debezium", "Debezium is not embedded in this engine"),
+        (
+            "chunk-key.even-distribution.factor.upper-bound",
+            "fixed-range chunking is used",
+        ),
+        (
+            "chunk-key.even-distribution.factor.lower-bound",
+            "fixed-range chunking is used",
+        ),
+        ("sample-sharding.threshold", "sampling sharding is not used"),
+        ("inverse-sampling.rate", "sampling sharding is not used"),
+        ("int_type_narrowing", "binlog values decode positionally"),
+        ("connect.timeout.ms", "handled by the driver pool defaults"),
+        ("connect.max-retries", "handled by the reconnect loop"),
+    ];
+    for (key, note) in UNIMPLEMENTED {
+        if config.get(key).is_some() {
+            warnings.push(format!(
+                "option '{}' accepted for compatibility but ignored ({})",
+                key, note
+            ));
+        }
+    }
+    warnings
+}
+
 /// Common CDC configuration.
 #[derive(Debug, Clone)]
 pub struct CdcConfig {

@@ -191,6 +191,22 @@ pub struct TiDBCdcConfig {
     /// TiKV run an incremental scan from the last resolved_ts — the reliably
     /// delivered change path. Default 10 000.
     pub resubscribe_interval_ms: u64,
+    /// Snapshot page size (official `batch-size-per-scan`, default 1000).
+    pub batch_size_per_scan: i64,
+    /// TiKV gRPC timeout (official `timeout` / `tikv.grpc.timeout_in_ms`,
+    /// ms) applied to change-stream polling.
+    pub tikv_timeout_ms: u64,
+    /// TiKV scan timeout (official `tikv.grpc.scan_timeout_in_ms`, ms)
+    /// bounding each snapshot poll cycle.
+    pub tikv_scan_timeout_ms: u64,
+    /// Accepted for config compatibility (concurrency is governed by the
+    /// per-region stream model).
+    pub tikv_batch_get_concurrency: i64,
+    pub tikv_batch_scan_concurrency: i64,
+    /// Startup TSO for startup.mode = specific (official option).
+    pub startup_specific_tso: u64,
+    /// Warnings for official-but-unimplemented options (logged at open).
+    pub compat_warnings: Vec<String>,
     /// MySQL-compatible connection info for reading table metadata/data.
     pub conn: TiDBCdcConnConfig,
     /// Schema-evolution settings (TiDB DDL detected by metadata polling).
@@ -214,6 +230,13 @@ impl Default for TiDBCdcConfig {
             capture_timeout: 300_000,
             store_address_rewrite: Vec::new(),
             resubscribe_interval_ms: 0,
+            batch_size_per_scan: 1000,
+            tikv_timeout_ms: 0,
+            tikv_scan_timeout_ms: 0,
+            tikv_batch_get_concurrency: 0,
+            tikv_batch_scan_concurrency: 0,
+            startup_specific_tso: 0,
+            compat_warnings: Vec::new(),
             schema_evolution: SchemaEvolutionConfig::default(),
             conn: TiDBCdcConnConfig::new("127.0.0.1", 4000, "root", "", "seatunnel"),
         }
@@ -222,12 +245,29 @@ impl Default for TiDBCdcConfig {
 
 impl TiDBCdcConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
-        let pd = config
-            .get_string("pd-addrs", "127.0.0.1:2379")
+        let pd = config.get_string(
+            "pd-addresses",
+            &config.get_string("pd_addrs", &config.get_string("pd-addrs", "127.0.0.1:2379")),
+        )
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        // `url` (jdbc:mysql://host:port/db) is the official connection form.
+        let (url_host, url_port, url_db) = config
+            .get("url")
+            .and_then(|u| {
+                let rest = u.strip_prefix("jdbc:mysql://").or_else(|| u.strip_prefix("mysql://"))?;
+                let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+                let database = path.split('?').next().unwrap_or("").to_string();
+                let (host, port) = match authority.rsplit_once(':') {
+                    Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(4000)),
+                    None => (authority.to_string(), 4000),
+                };
+                if host.is_empty() { None } else { Some((host, port, database)) }
+            })
+            .unwrap_or_default();
+
         TiDBCdcConfig {
             pd_addrs: pd,
             cluster_id: {
@@ -239,7 +279,10 @@ impl TiDBCdcConfig {
                 }
             },
             namespace: config.get_string("namespace", "seatunnel"),
-            database_name: config.get_string("database-name", "seatunnel"),
+            database_name: {
+                let v = config.get_string("database-name", &url_db);
+                if v.is_empty() { "seatunnel".to_string() } else { v }
+            },
             table_name: config.get_string("table-name", "users"),
             split_column: config.get_string("split.column", "id"),
             startup_mode: config.get_string("startup.mode", "initial"),
@@ -263,13 +306,53 @@ impl TiDBCdcConfig {
             // correctly-encoded spans, and periodic re-registration adds
             // churn against TiKV's observe-handle lifecycle.
             resubscribe_interval_ms: config.get_int("resubscribe-interval-ms", 0).max(0) as u64,
+            batch_size_per_scan: config
+                .get_int("batch-size-per-scan", config.get_int("batch_size_per_scan", 1000))
+                .max(1),
+            tikv_timeout_ms: config
+                .get_int(
+                    "tikv.grpc.timeout_in_ms",
+                    config.get_int(
+                        "timeout",
+                        config.get_int("tikv.grpc.timeout-in-ms", 0),
+                    ),
+                )
+                .max(0) as u64,
+            tikv_scan_timeout_ms: config
+                .get_int(
+                    "tikv.grpc.scan_timeout_in_ms",
+                    config.get_int("tikv.grpc.scan-timeout-in-ms", 0),
+                )
+                .max(0) as u64,
+            tikv_batch_get_concurrency: config
+                .get_int("tikv.batch_get_concurrency", config.get_int("tikv.batch-get-concurrency", 0)),
+            tikv_batch_scan_concurrency: config
+                .get_int("tikv.batch_scan_concurrency", config.get_int("tikv.batch-scan-concurrency", 0)),
+            startup_specific_tso: config
+                .get_int(
+                    "startup.specific-offset.pos",
+                    config.get_int("startup.specific.pos", 0),
+                )
+                .max(0) as u64,
+            compat_warnings: seatunnel_connector_cdc_base::compatibility_warnings(config),
             schema_evolution: SchemaEvolutionConfig::from_config(config),
             conn: TiDBCdcConnConfig::new(
-                config.get_string("conn-host", "127.0.0.1").as_str(),
-                config.get_int("conn-port", 4000) as u16,
+                {
+                    let v = config.get_string("conn-host", &url_host);
+                    if v.is_empty() { "127.0.0.1".to_string() } else { v }
+                }
+                .as_str(),
+                {
+                    let p = config.get_int("conn-port", -1);
+                    if p > 0 { p as u16 } else if url_port > 0 { url_port } else { 4000 }
+                },
                 config.get_string("conn-user", "root").as_str(),
                 config.get_string("conn-password", "").as_str(),
-                config.get_string("conn-database", "seatunnel").as_str(),
+                {
+                    let v = config.get_string("conn-database", &url_db);
+                    if v.is_empty() { "seatunnel".to_string() } else { v }
+                }
+                .as_str(),
             ),
         }
     }
@@ -471,6 +554,8 @@ pub struct TiDBCdcReader {
     resolved_ts: ResolvedTs,
     watermark: Watermark,
     batch_size: i64,
+    /// Change-stream poll budget (tikv timeout option, ms; 0 = default 250).
+    stream_poll_budget_ms: u64,
     /// TiKV CDC engine for real-time streaming (incremental phase).
     cdc_engine: Option<crate::cdc_engine::CdcEngine>,
     /// Schema-evolution watcher (metadata polling; TiKV streams no DDL).
@@ -484,6 +569,8 @@ pub struct TiDBCdcReader {
 
 impl TiDBCdcReader {
     pub fn new(config: TiDBCdcConfig, schema: Option<TableSchema>) -> Self {
+        let batch_size = SNAPSHOT_BATCH_SIZE.max(config.batch_size_per_scan);
+        let stream_poll_budget_ms = config.tikv_timeout_ms;
         TiDBCdcReader {
             config,
             schema,
@@ -493,7 +580,8 @@ impl TiDBCdcReader {
             last_pk: 0,
             resolved_ts: ResolvedTs::default(),
             watermark: Watermark::Min,
-            batch_size: SNAPSHOT_BATCH_SIZE,
+            batch_size,
+            stream_poll_budget_ms,
             cdc_engine: None,
             schema_watcher: None,
             sql_pool: None,
@@ -761,6 +849,10 @@ impl SourceReader for TiDBCdcReader {
                 self.config.startup_mode
             );
 
+            for warning in &self.config.compat_warnings {
+                tracing::warn!("TiDB CDC: {}", warning);
+            }
+
             // Fail loudly when unreachable — silent fallbacks produce wrong data.
             let mut conn = new_connection(&self.config.conn).await?;
 
@@ -805,6 +897,22 @@ impl SourceReader for TiDBCdcReader {
                             "TiDB CDC reader: timestamp startup — checkpoint_ts={} (from {} ms)",
                             tso,
                             self.config.startup_timestamp_ms
+                        );
+                    }
+                    "specific" | "specific-offset" => {
+                        if self.config.startup_specific_tso == 0 {
+                            anyhow::bail!(
+                                "startup.mode=specific requires startup.specific-offset.pos (a TSO)"
+                            );
+                        }
+                        // TiKV has no binlog-file offsets; the specific
+                        // offset is a TSO (checkpoint_ts).
+                        self.resolved_ts = ResolvedTs(self.config.startup_specific_tso);
+                        self.phase = CdcPhase::Incremental;
+                        self.pending_ranges.clear();
+                        tracing::info!(
+                            "TiDB CDC reader: specific startup — checkpoint_ts={}",
+                            self.config.startup_specific_tso
                         );
                     }
                     _ => {}
@@ -853,8 +961,15 @@ impl SourceReader for TiDBCdcReader {
     > {
         Box::pin(async move {
             if self.phase == CdcPhase::Incremental {
-                // Live changes first, then anything still queued.
-                self.drain_engine(250).await;
+                // Live changes first, then anything still queued. The
+                // official `timeout` / `tikv.grpc.timeout_in_ms` option
+                // bounds each poll cycle when set.
+                let budget = if self.stream_poll_budget_ms > 0 {
+                    self.stream_poll_budget_ms.min(2_000)
+                } else {
+                    250
+                };
+                self.drain_engine(budget).await;
                 if self.engine_errors >= ENGINE_ERROR_TOLERANCE {
                     anyhow::bail!(
                         "TiKV CDC engine failed {} times consecutively",
@@ -875,7 +990,13 @@ impl SourceReader for TiDBCdcReader {
             // ---- Snapshot phase ---------------------------------------
             // Keep the change streams drained while scanning (no emission yet:
             // buffered WAL rows are replayed after the snapshot completes).
-            self.drain_engine(10).await;
+            // `tikv.grpc.scan_timeout_in_ms` bounds each scan-side poll.
+            let scan_budget = if self.config.tikv_scan_timeout_ms > 0 {
+                self.config.tikv_scan_timeout_ms.min(1_000)
+            } else {
+                10
+            };
+            self.drain_engine(scan_budget).await;
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
                 let pool = self.sql_pool.get_or_insert_with(|| self.config.conn.to_pool());
