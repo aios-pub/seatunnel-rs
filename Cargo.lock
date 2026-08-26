@@ -4964,6 +4964,7 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "parking_lot",
+ "regex 1.13.1",
  "seatunnel-api",
  "seatunnel-connector-common",
  "seatunnel-formats",

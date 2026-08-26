@@ -273,6 +273,163 @@ pub fn diff_columns(
 
 
 // ---------------------------------------------------------------------------
+// Table selection (official option set)
+// ---------------------------------------------------------------------------
+
+/// Resolved database/table selection from the official option set:
+/// `database-names` + `database-pattern`, `table-names` (exact
+/// `db.table` refs) + `table-pattern` (regex over `db.table`), with the
+/// legacy single `database-name`/`table-name` (trailing `%` wildcard)
+/// folded in.
+#[derive(Debug, Clone, Default)]
+pub struct TableSelector {
+    split_columns: std::collections::HashMap<String, String>,
+    databases: Vec<String>,
+    database_pattern: Option<regex::Regex>,
+    tables: Vec<(String, String)>,
+    table_patterns: Vec<regex::Regex>,
+}
+
+impl TableSelector {
+    fn compile(pattern: &str) -> Option<regex::Regex> {
+        regex::Regex::new(pattern)
+            .map_err(|e| tracing::warn!("invalid table-selection regex '{}': {}", pattern, e))
+            .ok()
+    }
+
+    /// Legacy single names with a trailing `%` wildcard become regexes;
+    /// empty strings produce an empty selector (official options replace
+    /// the legacy forms).
+    pub fn from_legacy(database: &str, table: &str) -> Self {
+        let mut selector = TableSelector::default();
+        if database.is_empty() && table.is_empty() {
+            return selector;
+        }
+        if let Some(prefix) = database.strip_suffix('%') {
+            selector.database_pattern = Self::compile(&format!("^{}.*$", regex::escape(prefix)));
+        } else {
+            selector.databases.push(database.to_string());
+        }
+        if let Some(prefix) = table.strip_suffix('%') {
+            // Legacy wildcards name the bare table; official table regexes
+            // match the qualified `db.table`. Match only the table segment
+            // (the database gate applies separately).
+            selector.table_patterns.push(
+                Self::compile(&format!("^.*\\.{}.*$", regex::escape(prefix)))
+                    .expect("escaped regex"),
+            );
+        } else {
+            selector.tables.push((database.to_string(), table.to_string()));
+        }
+        selector
+    }
+
+    fn matches_database(&self, database: &str) -> bool {
+        self.databases.iter().any(|d| d == database)
+            || self
+                .database_pattern
+                .as_ref()
+                .is_some_and(|re| re.is_match(database))
+    }
+
+    /// Exact `db.table` refs match their own pair; regexes are matched
+    /// against the fully-qualified `db.table` string (official semantics).
+    pub fn matches(&self, database: &str, table: &str) -> bool {
+        if !self.matches_database(database) {
+            return false;
+        }
+        let qualified = format!("{}.{}", database, table);
+        self.tables.iter().any(|(d, t)| d == database && t == table)
+            || self
+                .table_patterns
+                .iter()
+                .any(|re| re.is_match(&qualified))
+    }
+
+    /// Database names in the selection (diagnostics).
+    pub fn databases(&self) -> &[String] {
+        &self.databases
+    }
+
+    /// True when at least one exact pair is registered.
+    pub fn has_exact(&self) -> bool {
+        !self.tables.is_empty()
+    }
+
+    /// Split column override for `db.table` (from `table-names-config`).
+    pub fn split_column_for(&self, _database: &str, _table: &str) -> Option<&str> {
+        self.split_columns
+            .get(&format!("{}.{}", _database, _table))
+            .map(String::as_str)
+    }
+}
+
+
+
+/// Assemble the [`TableSelector`] from the official option set, folding in
+/// the legacy single-name forms.
+pub fn build_table_selector(
+    config: &seatunnel_connector_common::ConnectorConfig,
+    legacy_db: &str,
+    legacy_table: &str,
+) -> TableSelector {
+    // Official options REPLACE the legacy single-name forms; legacy
+    // selection only applies when its official counterpart is absent.
+    let has_official_databases = !config.get_string("database-names", &config.get_string("database_names", "")).is_empty()
+        || !config.get_string("database-pattern", &config.get_string("database_pattern", "")).is_empty();
+    let has_official_tables = !config.get_string("table-names", &config.get_string("table_names", "")).is_empty()
+        || !config.get_string("table-pattern", &config.get_string("table_pattern", "")).is_empty();
+    let mut selector = TableSelector::from_legacy(
+        if has_official_databases { "" } else { legacy_db },
+        if has_official_tables { "" } else { legacy_table },
+    );
+
+    // database-names: comma list of exact names (arrays arrive comma-joined).
+    let databases = config.get_string("database-names", &config.get_string("database_names", ""));
+    for db in databases.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        if !selector.databases.contains(&db.to_string()) {
+            selector.databases.push(db.to_string());
+        }
+    }
+    // database-pattern: regex.
+    let db_pattern = config.get_string("database-pattern", &config.get_string("database_pattern", ""));
+    if !db_pattern.is_empty() {
+        if let Some(re) = TableSelector::compile(&format!("^(?:{})$", db_pattern)) {
+            selector.database_pattern = Some(re);
+        }
+    }
+    // table-names: exact `db.table` entries (comma list).
+    let tables = config.get_string("table-names", &config.get_string("table_names", ""));
+    for qualified in tables.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some((db, table)) = qualified.rsplit_once('.') {
+            selector.tables.push((db.to_string(), table.to_string()));
+        }
+    }
+    // table-pattern: regex over `db.table`.
+    let table_pattern = config.get_string("table-pattern", &config.get_string("table_pattern", ""));
+    if !table_pattern.is_empty() {
+        if let Some(re) = TableSelector::compile(&table_pattern) {
+            selector.table_patterns.push(re);
+        }
+    }
+    // table-names-config: per-table primaryKeys / snapshotSplitColumn.
+    let config_list = config.get_string("table-names-config", &config.get_string("table_names_config", ""));
+    if !config_list.is_empty() {
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&config_list)
+            .unwrap_or_default();
+        for entry in parsed {
+            let Some(table) = entry.get("table").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            if let Some(split_col) = entry.get("snapshotSplitColumn").and_then(|c| c.as_str()) {
+                selector.split_columns.insert(table.to_string(), split_col.to_string());
+            }
+        }
+    }
+    selector
+}
+
+// ---------------------------------------------------------------------------
 // Schema evolution machinery
 // ---------------------------------------------------------------------------
 

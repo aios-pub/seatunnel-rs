@@ -207,6 +207,9 @@ pub struct TiDBCdcConfig {
     pub startup_specific_tso: u64,
     /// Warnings for official-but-unimplemented options (logged at open).
     pub compat_warnings: Vec<String>,
+    /// Resolved database/table selection (database-names/database-pattern,
+    /// table-names/table-pattern; legacy single names otherwise).
+    pub table_selector: seatunnel_connector_cdc_base::TableSelector,
     /// MySQL-compatible connection info for reading table metadata/data.
     pub conn: TiDBCdcConnConfig,
     /// Schema-evolution settings (TiDB DDL detected by metadata polling).
@@ -237,6 +240,7 @@ impl Default for TiDBCdcConfig {
             tikv_batch_scan_concurrency: 0,
             startup_specific_tso: 0,
             compat_warnings: Vec::new(),
+            table_selector: seatunnel_connector_cdc_base::TableSelector::from_legacy("seatunnel", "users"),
             schema_evolution: SchemaEvolutionConfig::default(),
             conn: TiDBCdcConnConfig::new("127.0.0.1", 4000, "root", "", "seatunnel"),
         }
@@ -335,6 +339,11 @@ impl TiDBCdcConfig {
                 )
                 .max(0) as u64,
             compat_warnings: seatunnel_connector_cdc_base::compatibility_warnings(config),
+            table_selector: seatunnel_connector_cdc_base::build_table_selector(
+                config,
+                &config.get_string("database-name", "seatunnel"),
+                &config.get_string("table-name", "users"),
+            ),
             schema_evolution: SchemaEvolutionConfig::from_config(config),
             conn: TiDBCdcConnConfig::new(
                 {
@@ -383,45 +392,71 @@ async fn new_connection(conn: &TiDBCdcConnConfig) -> anyhow::Result<mysql_async:
 
 /// Resolve the TiDB-internal table id (`TIDB_TABLE_ID`) required to build
 /// TiKV key ranges.
-async fn resolve_table_id(
-    conn: &mut mysql_async::Conn,
-    database: &str,
-    table: &str,
-) -> anyhow::Result<i64> {
-    let row: Option<(i64,)> = conn
-        .query_first(format!(
-            "SELECT TIDB_TABLE_ID FROM information_schema.tables \
-             WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' LIMIT 1",
-            database.replace('\'', "''"),
-            table.replace('\'', "''")
-        ))
-        .await?;
-    row.map(|(id,)| id).ok_or_else(|| {
-        anyhow::anyhow!(
-            "table {}.{} not found in information_schema",
-            database,
-            table
-        )
-    })
+/// A captured table with its resolved TiDB table id.
+#[derive(Debug, Clone)]
+pub struct TableTarget {
+    pub database: String,
+    pub table: String,
+    pub table_id: i64,
 }
+
+/// Resolve every table matched by the selection (official lists/patterns
+/// or the legacy single pair) into [`TableTarget`]s via information_schema.
+async fn resolve_captured_tables(
+    conn: &mut mysql_async::Conn,
+    config: &TiDBCdcConfig,
+) -> anyhow::Result<Vec<TableTarget>> {
+    let rows: Vec<mysql_async::Row> = conn
+        .query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TIDB_TABLE_ID FROM information_schema.tables \
+             WHERE TABLE_TYPE = 'BASE TABLE'",
+        )
+        .await?;
+    let mut targets = Vec::new();
+    for row in rows {
+        let schema: Option<String> = row.get(0).unwrap_or(None);
+        let table: Option<String> = row.get(1).unwrap_or(None);
+        let tid: Option<i64> = row.get(2).unwrap_or(None);
+        let (Some(schema), Some(table), Some(tid)) = (schema, table, tid) else {
+            continue;
+        };
+        if config.table_selector.matches(&schema, &table) {
+            targets.push(TableTarget {
+                database: schema,
+                table,
+                table_id: tid,
+            });
+        }
+    }
+    if targets.is_empty() {
+        anyhow::bail!(
+            "TiDB CDC: no tables matched the configured selection (database-name: {:?}, table-name: {:?})",
+            config.database_name,
+            config.table_name
+        );
+    }
+    Ok(targets)
+}
+
 
 /// Compute this subtask's disjoint snapshot ranges `[start,end)` over the
 /// split column, chunked into ≤ SNAPSHOT_BATCH_SIZE spans.
 async fn enumerate_snapshot_ranges(
     conn: &mut mysql_async::Conn,
     config: &TiDBCdcConfig,
+    target: &TableTarget,
 ) -> anyhow::Result<Vec<(i64, i64)>> {
     let col = config.split_column.replace('`', "``");
     let sql = format!(
         "SELECT MIN(`{}`), MAX(`{}`) FROM `{}`.`{}`",
-        col, col, config.database_name, config.table_name
+        col, col, target.database, target.table
     );
     let row: Option<(Option<i64>, Option<i64>)> = conn.query_first(sql).await?;
     let (Some(min_id), Some(max_id)) = (row.and_then(|(a, _)| a), row.and_then(|(_, b)| b)) else {
         tracing::info!(
             "TiDB CDC: table {}.{} is empty; a single empty snapshot split is created",
-            config.database_name,
-            config.table_name
+            target.database,
+            target.table
         );
         return Ok(vec![(0, 1)]);
     };
@@ -453,8 +488,8 @@ async fn enumerate_snapshot_ranges(
         config.subtask_index,
         count,
         splits.len(),
-        config.database_name,
-        config.table_name,
+        target.database,
+        target.table,
         range_start,
         range_end
     );
@@ -493,9 +528,14 @@ impl Source for TiDBCdcSource {
     ) -> anyhow::Result<Vec<Self::Split>> {
         let ranges = {
             let config = self.config.clone();
+            let target = TableTarget {
+                database: config.database_name.clone(),
+                table: config.table_name.clone(),
+                table_id: 0,
+            };
             tokio_block_on(async move {
                 let mut conn = new_connection(&config.conn).await?;
-                enumerate_snapshot_ranges(&mut conn, &config).await
+                enumerate_snapshot_ranges(&mut conn, &config, &target).await
             })?
         };
         Ok(ranges
@@ -556,10 +596,20 @@ pub struct TiDBCdcReader {
     batch_size: i64,
     /// Change-stream poll budget (tikv timeout option, ms; 0 = default 250).
     stream_poll_budget_ms: u64,
-    /// TiKV CDC engine for real-time streaming (incremental phase).
-    cdc_engine: Option<crate::cdc_engine::CdcEngine>,
-    /// Schema-evolution watcher (metadata polling; TiKV streams no DDL).
-    schema_watcher: Option<SchemaWatcher>,
+    /// TiKV CDC engines, one per captured table (incremental phase).
+    cdc_engines: Vec<crate::cdc_engine::CdcEngine>,
+    /// Captured tables, index-aligned with the engines and watchers.
+    tables: Vec<TableTarget>,
+    /// Remaining snapshot tables (indices into `tables`) after the current one.
+    pending_tables: VecDeque<usize>,
+    /// Checkpoint-stashed table names pending resolution against `tables`.
+    pending_table_names: Vec<String>,
+    current_table_name: Option<String>,
+    /// Index into `tables` currently being snapshotted.
+    current_table_idx: usize,
+    /// Schema-evolution watchers (metadata polling; TiKV streams no DDL),
+    /// index-aligned with `tables`.
+    schema_watchers: Vec<SchemaWatcher>,
     /// Persistent SQL-endpoint pool reused across snapshot batches.
     sql_pool: Option<mysql_async::Pool>,
     /// Decoded rows awaiting emission (stream events + drained transactions).
@@ -582,8 +632,13 @@ impl TiDBCdcReader {
             watermark: Watermark::Min,
             batch_size,
             stream_poll_budget_ms,
-            cdc_engine: None,
-            schema_watcher: None,
+            cdc_engines: Vec::new(),
+            tables: Vec::new(),
+            pending_tables: VecDeque::new(),
+            pending_table_names: Vec::new(),
+            current_table_name: None,
+            current_table_idx: 0,
+            schema_watchers: Vec::new(),
             sql_pool: None,
             pending_rows: VecDeque::new(),
             engine_errors: 0,
@@ -603,6 +658,18 @@ impl TiDBCdcReader {
             if let Ok(v) = tid.parse::<i64>() {
                 self.table_id = Cell::new(v);
             }
+        }
+        if let Some(Ok(pending)) = state
+            .offset
+            .get("pending_tables")
+            .map(|s| serde_json::from_str::<Vec<String>>(s))
+        {
+            // Table indices are resolved in open() once the captured
+            // tables are known; stash the raw names meanwhile.
+            self.pending_table_names = pending;
+        }
+        if let Some(current) = state.offset.get("current_table") {
+            self.current_table_name = Some(current.clone());
         }
         if let Some(pk) = state.offset.get("last_pk") {
             if let Ok(v) = pk.parse::<i64>() {
@@ -638,11 +705,8 @@ impl TiDBCdcReader {
         Ok(())
     }
 
-    async fn start_engine(&mut self) -> anyhow::Result<()> {
-        if self.cdc_engine.is_some() {
-            return Ok(());
-        }
-        let table_id = self.table_id.get();
+    async fn start_engine_for(&mut self, target: &TableTarget) -> anyhow::Result<()> {
+        let table_id = target.table_id;
         if table_id < 0 {
             anyhow::bail!("table id unresolved; cannot build TiKV key range");
         }
@@ -658,8 +722,8 @@ impl TiDBCdcReader {
         let sql = format!(
             "SELECT ORDINAL_POSITION, COLUMN_TYPE, COLUMN_KEY FROM information_schema.columns \
              WHERE TABLE_SCHEMA='{}' AND TABLE_NAME='{}' ORDER BY ORDINAL_POSITION",
-            self.config.database_name.replace('\'', "''"),
-            self.config.table_name.replace('\'', "''"),
+            target.database.replace('\'', "''"),
+            target.table.replace('\'', "''"),
         );
         let rows: Vec<mysql_async::Row> = conn.query(sql).await?;
         let mut column_types = Vec::with_capacity(rows.len());
@@ -678,8 +742,8 @@ impl TiDBCdcReader {
         if column_types.is_empty() {
             anyhow::bail!(
                 "table {}.{} has no columns in information_schema",
-                self.config.database_name,
-                self.config.table_name
+                target.database,
+                target.table
             );
         }
         let engine_config = crate::cdc_engine::CdcEngineConfig {
@@ -704,19 +768,23 @@ impl TiDBCdcReader {
             )
         })?;
         tracing::info!(
-            "TiDB CDC reader: TiKV CDC engine started for table {} (checkpoint_ts={})",
+            "TiDB CDC reader: TiKV CDC engine started for {}.{} (table {} , checkpoint_ts={})",
+            target.database,
+            target.table,
             table_id,
             engine.resolved_ts()
         );
-        self.cdc_engine = Some(engine);
+        self.cdc_engines.push(engine);
         Ok(())
     }
 
 
     /// Fetch the table's column metadata as (ColumnDef list, engine column
     /// types, pk ordinal). Used to prime and refresh the schema watcher.
-    async fn fetch_column_metadata(
+    async fn fetch_column_metadata_for(
         config: &TiDBCdcConfig,
+        database: &str,
+        table: &str,
     ) -> anyhow::Result<(Vec<seatunnel_api::ColumnDef>, Vec<crate::decoder::RowColType>, Option<usize>)> {
         let pool = config.conn.to_pool();
         let mut conn = pool.get_conn().await?;
@@ -724,8 +792,8 @@ impl TiDBCdcReader {
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE, COLUMN_KEY, IS_NULLABLE \
              FROM information_schema.columns \
              WHERE TABLE_SCHEMA='{}' AND TABLE_NAME='{}' ORDER BY ORDINAL_POSITION",
-            config.database_name.replace('\'', "''"),
-            config.table_name.replace('\'', "''"),
+            database.replace('\'', "''"),
+            table.replace('\'', "''"),
         );
         let rows: Vec<mysql_async::Row> = conn.query(sql).await?;
         let dialect = seatunnel_api::schema::MySqlDialect;
@@ -759,56 +827,85 @@ impl TiDBCdcReader {
         Ok((defs, col_types, pk_ordinal))
     }
 
-    /// Poll the schema watcher and emit a schema-change event when the
-    /// table's columns drifted; also refreshes the engine's decode schema.
+    /// Poll the schema watchers; on change, refresh the matching engine's
+    /// decode schema and return the event for downstream.
     async fn poll_schema_watcher(&mut self) -> Option<seatunnel_api::SchemaChangeEvent> {
-        let config = self.config.clone();
-        let watcher = self.schema_watcher.as_mut()?;
-        watcher
-            .poll(|| async move {
-                let (defs, _, _) = Self::fetch_column_metadata(&config).await?;
-                Ok(defs)
-            })
-            .await
-            .ok()?;
-        let event = watcher.take_pending()?;
-        // Refresh the engine's decode schema to the new column layout.
-        if let Some(engine) = self.cdc_engine.as_mut() {
-            match Self::fetch_column_metadata(&self.config).await {
-                Ok((_, col_types, pk_ordinal)) => {
-                    engine.update_column_types(col_types, pk_ordinal);
-                }
-                Err(e) => tracing::warn!("TiDB CDC: schema refresh failed: {}", e),
+        let mut pending_event = None;
+        for (idx, watcher) in self.schema_watchers.iter_mut().enumerate() {
+            let config = self.config.clone();
+            let (db, table) = {
+                let target = self.tables.get(idx)?;
+                (target.database.clone(), target.table.clone())
+            };
+            let fetch_db = db.clone();
+            let fetch_table = table.clone();
+            let result = watcher
+                .poll(|| async move {
+                    let (defs, _, _) =
+                        Self::fetch_column_metadata_for(&config, &fetch_db, &fetch_table).await?;
+                    Ok(defs)
+                })
+                .await;
+            if let Err(e) = result {
+                tracing::debug!("TiDB CDC: schema poll failed: {}", e);
+                continue;
             }
+            let Some(event) = watcher.take_pending() else {
+                continue;
+            };
+            // Refresh this table's engine decode schema.
+            if let Some(engine) = self.cdc_engines.get_mut(idx) {
+                match Self::fetch_column_metadata_for(&self.config, &db, &table).await {
+                    Ok((_, col_types, pk_ordinal)) => {
+                        engine.update_column_types(col_types, pk_ordinal);
+                    }
+                    Err(e) => tracing::warn!("TiDB CDC: schema refresh failed: {}", e),
+                }
+            }
+            pending_event = Some(event);
+            break;
         }
-        Some(event)
+        pending_event
     }
 
     /// Drain decoded engine rows into the local buffer (bounded wait so
     /// snapshot scans are not starved by idle streams).
     async fn drain_engine(&mut self, budget_ms: u64) {
-        let Some(engine) = self.cdc_engine.as_mut() else {
+        if self.cdc_engines.is_empty() {
             return;
-        };
-        match engine.poll_with_budget(budget_ms).await {
-            Ok(_consumed) => {
-                self.engine_errors = 0;
-                while let Some(row_event) = engine.next_row() {
-                    if let Some(row) = build_row_from_event(&row_event) {
-                        self.pending_rows.push_back(row);
+        }
+        // Share the budget across engines; the resolved_ts watermark is the
+        // MINIMUM across tables so a checkpoint never advances past a
+        // lagging engine (restore would then skip its rows).
+        for engine in &mut self.cdc_engines {
+            match engine.poll_with_budget(budget_ms).await {
+                Ok(_consumed) => {
+                    self.engine_errors = 0;
+                    while let Some(row_event) = engine.next_row() {
+                        if let Some(row) = build_row_from_event(&row_event) {
+                            self.pending_rows.push_back(row);
+                        }
                     }
-                    self.resolved_ts = ResolvedTs(self.resolved_ts.0.max(row_event.resolved_ts));
+                }
+                Err(e) => {
+                    self.engine_errors += 1;
+                    tracing::warn!(
+                        "TiDB CDC engine poll error ({}/{}): {}",
+                        self.engine_errors,
+                        ENGINE_ERROR_TOLERANCE,
+                        e
+                    );
                 }
             }
-            Err(e) => {
-                self.engine_errors += 1;
-                tracing::warn!(
-                    "TiDB CDC engine poll error ({}/{}): {}",
-                    self.engine_errors,
-                    ENGINE_ERROR_TOLERANCE,
-                    e
-                );
-            }
+        }
+        let min_ts = self
+            .cdc_engines
+            .iter()
+            .map(|e| e.resolved_ts())
+            .min()
+            .unwrap_or(0);
+        if min_ts > self.resolved_ts.0 {
+            self.resolved_ts = ResolvedTs(min_ts);
         }
     }
 }
@@ -856,17 +953,51 @@ impl SourceReader for TiDBCdcReader {
             // Fail loudly when unreachable — silent fallbacks produce wrong data.
             let mut conn = new_connection(&self.config.conn).await?;
 
-            // Resolve the internal table id needed for TiKV key ranges.
-            if self.table_id.get() < 0 {
-                let tid = resolve_table_id(
-                    &mut conn,
-                    &self.config.database_name,
-                    &self.config.table_name,
-                )
-                .await?;
-                self.table_id = Cell::new(tid);
-                tracing::info!("TiDB CDC reader: table id = {}", tid);
+            // Resolve every captured table (official lists/patterns or the
+            // legacy single pair) with its TiDB table id.
+            if self.tables.is_empty() {
+                let targets = resolve_captured_tables(&mut conn, &self.config).await?;
+                tracing::info!(
+                    "TiDB CDC reader: {} table(s) selected: {:?}",
+                    targets.len(),
+                    targets
+                        .iter()
+                        .map(|t| format!("{}.{}#{}", t.database, t.table, t.table_id))
+                        .collect::<Vec<_>>()
+                );
+                self.current_table_idx = 0;
+                self.pending_tables = (1..targets.len()).collect();
+                self.tables = targets;
             }
+            // Resolve checkpoint-stashed table references now that the
+            // target list exists.
+            if !self.pending_table_names.is_empty() {
+                let names = std::mem::take(&mut self.pending_table_names);
+                self.pending_tables = names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let (db, table) = name.rsplit_once('.')?;
+                        self.tables
+                            .iter()
+                            .position(|t| t.database == db && t.table == table)
+                    })
+                    .collect();
+            }
+            if let Some(current) = self.current_table_name.take() {
+                if let Some((db, table)) = current.rsplit_once('.') {
+                    if let Some(idx) = self
+                        .tables
+                        .iter()
+                        .position(|t| t.database == db && t.table == table)
+                    {
+                        self.current_table_idx = idx;
+                    }
+                }
+            }
+            let Some(first) = self.tables.first().cloned() else {
+                anyhow::bail!("TiDB CDC: no captured tables");
+            };
+            self.table_id = Cell::new(first.table_id);
 
             // Startup shortcuts: streaming-only readers skip the snapshot.
             let resuming_incremental =
@@ -925,28 +1056,42 @@ impl SourceReader for TiDBCdcReader {
             let streams_changes =
                 self.config.startup_mode != "snapshot-only" && self.config.subtask_index == 0;
 
-            // Start the change stream BEFORE scanning so commits racing the
-            // snapshot are captured and replayed afterwards (no-loss window).
-            if streams_changes {
-                self.start_engine().await?;
-                if self.config.schema_evolution.enabled {
+            // Start the change streams (one engine per table) BEFORE
+            // scanning so commits racing the snapshot are captured and
+            // replayed afterwards (no-loss window).
+            if streams_changes && self.cdc_engines.is_empty() {
+                for target in self.tables.clone() {
+                    self.start_engine_for(&target).await?;
+                }
+            }
+            if streams_changes && self.config.schema_evolution.enabled && self.schema_watchers.is_empty() {
+                for target in &self.tables {
                     let mut watcher = SchemaWatcher::new(
-                        format!("{}.{}", self.config.database_name, self.config.table_name),
+                        format!("{}.{}", target.database, target.table),
                         &self.config.schema_evolution,
                     );
-                    match Self::fetch_column_metadata(&self.config).await {
+                    match Self::fetch_column_metadata_for(&self.config, &target.database, &target.table)
+                        .await
+                    {
                         Ok((defs, _, _)) => watcher.prime(defs),
                         Err(e) => {
                             tracing::warn!("TiDB CDC: schema watcher priming failed: {}", e)
                         }
                     }
-                    self.schema_watcher = Some(watcher);
+                    self.schema_watchers.push(watcher);
                 }
             }
 
             // Seed snapshot splits unless restored or streaming-only.
+            // Multi-table selections snapshot table by table.
             if self.phase == CdcPhase::Snapshot && self.pending_ranges.is_empty() {
-                let ranges = enumerate_snapshot_ranges(&mut conn, &self.config).await?;
+                let target = self
+                    .tables
+                    .get(self.current_table_idx)
+                    .cloned()
+                    .unwrap_or(first);
+                let ranges =
+                    enumerate_snapshot_ranges(&mut conn, &self.config, &target).await?;
                 self.pending_ranges.extend(ranges);
             }
 
@@ -1001,12 +1146,16 @@ impl SourceReader for TiDBCdcReader {
             if let Some((start, end)) = self.pending_ranges.front().copied() {
                 let pool = self.sql_pool.get_or_insert_with(|| self.config.conn.to_pool());
                 let mut conn = pool.get_conn().await?;
+                let (cur_db, cur_table) = {
+                    let target = &self.tables[self.current_table_idx.min(self.tables.len() - 1)];
+                    (target.database.clone(), target.table.clone())
+                };
                 let col = self.config.split_column.replace('`', "``");
                 let sql = format!(
                     "SELECT * FROM `{}`.`{}` WHERE `{}` >= {} AND `{}` < {} AND `{}` > {} \
                      ORDER BY `{}` ASC LIMIT {}",
-                    self.config.database_name,
-                    self.config.table_name,
+                    cur_db,
+                    cur_table,
                     col,
                     start,
                     col,
@@ -1020,6 +1169,18 @@ impl SourceReader for TiDBCdcReader {
                 if rows.is_empty() {
                     self.pending_ranges.pop_front();
                     self.last_pk = 0;
+                    // Multi-table capture: advance to the next table once
+                    // this one's ranges are exhausted.
+                    if self.pending_ranges.is_empty() {
+                        if let Some(next_idx) = self.pending_tables.pop_front() {
+                            let target = self.tables[next_idx].clone();
+                            self.current_table_idx = next_idx;
+                            let ranges =
+                                enumerate_snapshot_ranges(&mut conn, &self.config, &target)
+                                    .await?;
+                            self.pending_ranges = ranges.into_iter().collect();
+                        }
+                    }
                     return Ok(PollResult::Empty);
                 }
                 let field_count = rows[0].len();
@@ -1063,13 +1224,34 @@ impl SourceReader for TiDBCdcReader {
         &mut self,
     ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let mut offset = HashMap::new();
+        // The watermark is the minimum across engines (see drain_engine).
         let resolved_ts = self
-            .cdc_engine
-            .as_ref()
+            .cdc_engines
+            .iter()
             .map(|e| e.resolved_ts())
-            .unwrap_or(self.resolved_ts.0)
-            .max(self.resolved_ts.0);
+            .min()
+            .unwrap_or(self.resolved_ts.0);
+        self.resolved_ts = ResolvedTs(resolved_ts.max(self.resolved_ts.0).min(resolved_ts.max(self.resolved_ts.0)));
         offset.insert("resolved_ts".to_string(), resolved_ts.to_string());
+        if self.tables.len() > 1 {
+            offset.insert(
+                "current_table".to_string(),
+                format!(
+                    "{}.{}",
+                    self.tables[self.current_table_idx].database,
+                    self.tables[self.current_table_idx].table
+                ),
+            );
+            let pending: Vec<String> = self
+                .pending_tables
+                .iter()
+                .filter_map(|i| self.tables.get(*i))
+                .map(|t| format!("{}.{}", t.database, t.table))
+                .collect();
+            if let Ok(json) = serde_json::to_string(&pending) {
+                offset.insert("pending_tables".to_string(), json);
+            }
+        }
         offset.insert("table_id".to_string(), self.table_id.get().to_string());
         offset.insert("last_pk".to_string(), self.last_pk.to_string());
         let ranges: Vec<(String, String)> = self
@@ -1115,10 +1297,10 @@ impl SourceReader for TiDBCdcReader {
         &mut self,
     ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
-            if let Some(engine) = self.cdc_engine.as_mut() {
+            for engine in &mut self.cdc_engines {
                 engine.close().await;
             }
-            self.cdc_engine = None;
+            self.cdc_engines.clear();
             tracing::info!("TiDB CDC reader closed");
             Ok(())
         })

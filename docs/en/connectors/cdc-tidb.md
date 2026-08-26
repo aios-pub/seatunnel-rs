@@ -15,8 +15,10 @@ source:
     username: root
     password: ""
     pd-addresses: "127.0.0.1:2379"                 # official key (pd-addrs alias)
-    database-name: seatunnel
-    table-name: users
+    database-names: seatunnel
+    # Single table (legacy) or official multi-table / regex selection:
+    table-names: seatunnel.users,seatunnel.orders
+    # table-pattern: "seatunnel\\.events_.*"
     startup.mode: initial
     batch-size-per-scan: 1000
     timeout: 30000
@@ -29,7 +31,18 @@ source:
 | `url` | — | `jdbc:mysql://host:port/db` for the SQL endpoint; conn-host/conn-port remain as alternatives |
 | `username` / `password` | — | SQL endpoint credentials |
 | `pd-addresses` | 127.0.0.1:2379 | PD endpoints (comma list; `pd-addrs` alias) |
-| `database-name` / `table-name` | — | single captured table |
+| `database-name` / `database-names` | — | single name or comma list (exact) |
+| `database-pattern` | — | regex over the database name |
+| `table-name` / `table-names` | — | single name (trailing `%` wildcard) or comma list of `db.table` refs |
+| `table-pattern` | — | regex over the qualified `db.table` |
+
+**Multi-table capture**: matched tables are resolved via
+`information_schema` (with their TiDB table ids); each table gets its own
+TiKV EventFeedV2 engine (parallel incremental streams, per-table decode
+schemas and schema-evolution watchers), snapshots run table by table, and
+the checkpoint watermark is the **minimum** resolved_ts across engines so
+a restart never skips a lagging table's rows. Official options replace
+the legacy single-name forms when present.
 | `startup.mode` | initial | `initial` \| `earliest` \| `latest` \| `timestamp` \| `specific` |
 | `startup.timestamp` | — | ms since epoch; converted to a TSO (`ms << 18`) MVCC scan point (must be inside the GC lifetime) |
 | `startup.specific-offset.pos` | — | a TSO used directly as `checkpoint_ts` for `startup.mode = specific` |
