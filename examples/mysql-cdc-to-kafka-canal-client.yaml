@@ -37,13 +37,17 @@ sink:
     canal-client.database-name: seatunnel
     canal-client.table-name: users
     # Positional → db column names (CDC rows arrive positionally).
-    canal-client.columns: "id,name,score"
+    canal-client.columns: "id,name,score,created_at"
     # Java subTableFieldsJson shape: camel table → {key, must, update}.
+    # Naive datetime strings are interpreted in this zone (default:
+    # `local`, the server's system timezone — Java behavior). Accepts
+    # UTC / fixed offsets (+08:00) / IANA names (Asia/Shanghai).
+    canal-client.server-time-zone: local
     canal-client.sub-table-fields: >-
       {
         "users": {
           "key": "id",
-          "must": { "id": "id", "name": "name" },
+          "must": { "id": "id", "name": "name", "created_at": "created_at" },
           "update": { "score": "score" }
         }
       }

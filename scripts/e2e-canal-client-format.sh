@@ -56,8 +56,8 @@ mysql_exec "
 CREATE DATABASE IF NOT EXISTS seatunnel;
 USE seatunnel;
 DROP TABLE IF EXISTS users;
-CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(64), score INT);
-INSERT INTO users(name, score) VALUES ('alice', 90);"
+CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(64), score INT, created_at DATETIME);
+INSERT INTO users(name, score, created_at) VALUES ('alice', 90, '2024-05-06 07:08:09');"
 
 echo "== Start master + worker =="
 RUST_LOG=info $BIN_DIR/seatunnel-engine-server --role master --addr 127.0.0.1:5800 \
@@ -76,6 +76,12 @@ echo "== Submit canal-client job =="
 JOB_ID=$($BIN_DIR/seatunnel job submit -c examples/mysql-cdc-to-kafka-canal-client.yaml -a 127.0.0.1:5800 | awk '{print $3}')
 echo "job: $JOB_ID"
 
+# The engine machine interprets naive datetimes in ITS local zone; the
+# broker consumer runs inside the kafka container (UTC), so compute the
+# expected epoch from the same local interpretation.
+EXPECTED_MS=$(python3 -c 'import time; print(int(time.mktime(time.strptime("2024-05-06 07:08:09", "%Y-%m-%d %H:%M:%S"))*1000))')
+echo "expected created_at millis (local zone): $EXPECTED_MS"
+
 echo "== Wait for the INSERT snapshot message =="
 for _ in $(seq 1 30); do
   consume | grep -q '"eventType":"insert"' && break
@@ -86,8 +92,9 @@ echo "insert: $INSERT_MSG"
 [[ -n "$INSERT_MSG" ]] || { echo "FAIL: no insert message"; exit 1; }
 echo "$INSERT_MSG" | grep -q '"dbName":"seatunnel"' || { echo "FAIL: dbName"; exit 1; }
 echo "$INSERT_MSG" | grep -q '"tableName":"users"' || { echo "FAIL: tableName"; exit 1; }
-# must fields mapped; id/score are numbers.
-echo "$INSERT_MSG" | grep -q '"data":{"id":1,"name":"alice","score":90}' || { echo "FAIL: data mapping"; exit 1; }
+# must fields mapped; id/score are numbers; datetime → local-zone millis.
+# Keys are alphabetically ordered (serde_json); created_at first.
+echo "$INSERT_MSG" | grep -q "\"data\":{\"created_at\":$EXPECTED_MS,\"id\":1,\"name\":\"alice\",\"score\":90}" || { echo "FAIL: data mapping"; exit 1; }
 echo "$INSERT_MSG" | grep -Eq '"requestId":"[0-9a-f]{32}"' || { echo "FAIL: requestId"; exit 1; }
 
 echo "== UPDATE with a configured column change → one message with oldData =="
@@ -99,8 +106,8 @@ done
 UPDATE_MSG=$(consume | grep '"eventType":"update"' | head -1)
 echo "update: $UPDATE_MSG"
 [[ -n "$UPDATE_MSG" ]] || { echo "FAIL: no update message"; exit 1; }
-echo "$UPDATE_MSG" | grep -q '"data":{"id":1,"name":"alice","score":99}' || { echo "FAIL: update data"; exit 1; }
-echo "$UPDATE_MSG" | grep -q '"oldData":{"id":1,"name":"alice","score":90}' || { echo "FAIL: oldData"; exit 1; }
+echo "$UPDATE_MSG" | grep -q "\"data\":{\"created_at\":$EXPECTED_MS,\"id\":1,\"name\":\"alice\",\"score\":99}" || { echo "FAIL: update data"; exit 1; }
+echo "$UPDATE_MSG" | grep -q "\"oldData\":{\"created_at\":$EXPECTED_MS,\"id\":1,\"name\":\"alice\",\"score\":90}" || { echo "FAIL: oldData"; exit 1; }
 
 echo "== UPDATE touching no configured column → filtered =="
 # Baseline AFTER the configured update above.
@@ -122,7 +129,7 @@ done
 DELETE_MSG=$(consume | grep '"eventType":"delete"' | tail -1)
 echo "delete: $DELETE_MSG"
 [[ -n "$DELETE_MSG" ]] || { echo "FAIL: no delete message"; exit 1; }
-echo "$DELETE_MSG" | grep -q '"data":{"id":1,"name":"alice"}' || { echo "FAIL: delete data"; exit 1; }
+echo "$DELETE_MSG" | grep -q "\"data\":{\"created_at\":$EXPECTED_MS,\"id\":1,\"name\":\"alice\"}" || { echo "FAIL: delete data"; exit 1; }
 
 echo "== Partition key is the primary key =="
 KEY_DUMP=$(docker exec "$KAFKA_CONTAINER" kafka-run-class \

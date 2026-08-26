@@ -38,7 +38,11 @@ Transformation rules (faithful to the Java implementation):
 - `must` fields always map; `update` fields only when the column changed;
   updates where no configured column changed are **filtered** (no message);
 - deletes are never filtered and carry the must-fields of the before image;
-- values: strict `yyyy-MM-dd HH:mm:ss` dates → epoch-millis numbers;
+- values: strict `yyyy-MM-dd HH:mm:ss` dates → epoch-millis numbers,
+  interpreted in the **server's local timezone by default** (matching
+  Java's `SimpleDateFormat` default); override with
+  `canal-client.server-time-zone` (`local` | `UTC` | `+08:00` |
+  `Asia/Shanghai` | …);
   `"0"` / zero-leading-free digit strings → longs (leading zeros preserved
   as strings); everything else stays a string;
 - the Kafka partition key is the configured primary-key value;

@@ -1697,8 +1697,16 @@ fn mysql_value_to_field(row: &Row, col_idx: usize) -> Field {
         Some(Value::Float(v)) => Field::Float32(v),
         Some(Value::Double(v)) => Field::Float64(v),
         Some(Value::Bytes(v)) => bytes_to_field(v),
-        Some(Value::Date(y, m, d, _, _, _, _)) => {
-            Field::String(format!("{:04}-{:02}-{:02}", y, m, d))
+        Some(Value::Date(y, m, d, h, min, s, _)) => {
+            // DATETIME keeps its time part; pure DATEs render date-only.
+            if (h, min, s) == (0, 0, 0) {
+                Field::String(format!("{:04}-{:02}-{:02}", y, m, d))
+            } else {
+                Field::String(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    y, m, d, h, min, s
+                ))
+            }
         }
         Some(Value::Time(_, _, h, m, s, _)) => Field::String(format!("{:02}:{:02}:{:02}", h, m, s)),
     }
@@ -1784,7 +1792,16 @@ fn value_to_field(v: &Value) -> Field {
         Value::Float(f) => Field::Float32(*f),
         Value::Double(d) => Field::Float64(*d),
         Value::Bytes(b) => bytes_to_field(b.clone()),
-        Value::Date(y, m, d, _, _, _, _) => Field::String(format!("{:04}-{:02}-{:02}", y, m, d)),
+        Value::Date(y, m, d, h, min, s, _) => {
+            if (*h, *min, *s) == (0, 0, 0) {
+                Field::String(format!("{:04}-{:02}-{:02}", y, m, d))
+            } else {
+                Field::String(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    y, m, d, h, min, s
+                ))
+            }
+        }
         Value::Time(_, _, h, m, s, _) => Field::String(format!("{:02}:{:02}:{:02}", h, m, s)),
     }
 }

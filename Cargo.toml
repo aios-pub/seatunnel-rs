@@ -97,6 +97,7 @@ protobuf = "2.28"
 # Schema / Type
 bigdecimal = { version = "0.4", features = ["serde"] }
 chrono = { version = ">=0.4.31, <0.4.40", features = ["serde"] }
+chrono-tz = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 

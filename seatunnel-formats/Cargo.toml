@@ -17,4 +17,5 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 uuid = { workspace = true }

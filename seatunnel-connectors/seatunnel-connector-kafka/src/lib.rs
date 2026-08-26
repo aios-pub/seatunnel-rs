@@ -780,6 +780,13 @@ impl KafkaSinkConfig {
                             &config.get_string("canal-client.sub_table_fields", "{}"),
                         ))
                         .unwrap_or_default(),
+                        server_time_zone: config.get_string(
+                            "canal-client.server-time-zone",
+                            &config.get_string(
+                                "server-time-zone",
+                                &config.get_string("server_time_zone", "local"),
+                            ),
+                        ),
                     })
                 })
                 .flatten(),
@@ -1477,6 +1484,7 @@ mod tests {
         let canal = config.canal_client.expect("canal config present");
         assert_eq!(canal.database_name, "MyDb");
         assert_eq!(canal.columns, vec!["id", "name", "status"]);
+        assert_eq!(canal.server_time_zone, "local"); // default: server zone
         assert!(canal.tables.contains_key("lClassStudent"));
         // Encoder builds and finds the mapping.
         assert!(seatunnel_formats::canal_client_json::CanalClientEncoder::new(canal).is_ok());

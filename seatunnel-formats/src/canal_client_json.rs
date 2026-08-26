@@ -72,6 +72,95 @@ pub struct TableFields {
     pub update: HashMap<String, String>,
 }
 
+
+/// Timezone used to interpret naive datetime strings (`yyyy-MM-dd
+/// HH:mm:ss`), mirroring Java `SimpleDateFormat` with the JVM default
+/// timezone: the default is the SERVER's local timezone.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ServerTz {
+    /// System local timezone (default, matches Java behavior).
+    #[default]
+    Local,
+    Utc,
+    Fixed(chrono::FixedOffset),
+    Named(chrono_tz::Tz),
+}
+
+impl ServerTz {
+    /// Accepts `local`/empty (default), `UTC`/`GMT`/`Z`, fixed offsets
+    /// (`+08:00`, `-05:30`) and IANA names (`Asia/Shanghai`).
+    pub fn parse(value: &str) -> ServerTz {
+        let t = value.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("local") || t.eq_ignore_ascii_case("system") {
+            return ServerTz::Local;
+        }
+        if t.eq_ignore_ascii_case("utc") || t.eq_ignore_ascii_case("gmt") || t == "Z" {
+            return ServerTz::Utc;
+        }
+        if let Some(offset) = parse_fixed_offset(t) {
+            return ServerTz::Fixed(offset);
+        }
+        if let Ok(tz) = t.parse::<chrono_tz::Tz>() {
+            return ServerTz::Named(tz);
+        }
+        tracing::warn!(
+            "canal-client: unrecognized server time zone '{}', using the system local zone",
+            t
+        );
+        ServerTz::Local
+    }
+
+    /// Epoch millis of a naive datetime interpreted in this zone. DST
+    /// gaps fall back to the earliest instant (Java lenient-adjacent).
+    pub fn naive_to_millis(&self, dt: NaiveDateTime) -> Option<i64> {
+        match self {
+            ServerTz::Utc => Some(dt.and_utc().timestamp_millis()),
+            // DST gaps fall back to the earliest instant.
+            ServerTz::Local => dt
+                .and_local_timezone(chrono::Local)
+                .earliest()
+                .map(|aware| aware.timestamp_millis()),
+            ServerTz::Fixed(offset) => dt
+                .and_local_timezone(*offset)
+                .earliest()
+                .map(|aware| aware.timestamp_millis()),
+            ServerTz::Named(tz) => dt
+                .and_local_timezone(*tz)
+                .earliest()
+                .map(|aware| aware.timestamp_millis()),
+        }
+    }
+}
+
+/// Parse `+HH:MM` / `-HH:MM` (also `+HHMM` / `+HH`).
+fn parse_fixed_offset(value: &str) -> Option<chrono::FixedOffset> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 || (bytes[0] != b'+' && bytes[0] != b'-') {
+        return None;
+    }
+    let (h, m) = match bytes.len() {
+        // +HH
+        3 => (value[1..3].parse::<i32>().ok()?, 0),
+        // +HHMM
+        5 => (
+            value[1..3].parse::<i32>().ok()?,
+            value[3..5].parse::<i32>().ok()?,
+        ),
+        // +HH:MM
+        6 => (
+            value[1..3].parse::<i32>().ok()?,
+            value[4..6].parse::<i32>().ok()?,
+        ),
+        _ => return None,
+    };
+    let seconds = h * 3600 + m * 60;
+    if bytes[0] == b'-' {
+        chrono::FixedOffset::east_opt(-seconds)
+    } else {
+        chrono::FixedOffset::east_opt(seconds)
+    }
+}
+
 /// Full canal-client format configuration.
 #[derive(Debug, Clone)]
 pub struct CanalClientConfig {
@@ -84,6 +173,9 @@ pub struct CanalClientConfig {
     pub columns: Vec<String>,
     /// camelCase(table) → field config.
     pub tables: HashMap<String, TableFields>,
+    /// Timezone for naive datetime interpretation (default: the server's
+    /// local zone, mirroring Java's SimpleDateFormat default).
+    pub server_time_zone: String,
 }
 
 /// snake_case → camelCase with the FIRST letter left untouched
@@ -116,15 +208,17 @@ pub fn is_java_number(value: &str) -> bool {
 }
 
 /// Java `isValidDate` + conversion: strict `yyyy-MM-dd HH:mm:ss` parse
-/// (lenient=false) → epoch millis string; anything else → unchanged.
-fn valid_date_to_millis(value: &str) -> Option<i64> {
+/// (lenient=false) → epoch millis interpreted in `tz`; anything else →
+/// unchanged.
+fn valid_date_to_millis(tz: &ServerTz, value: &str) -> Option<i64> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         .ok()
-        .and_then(|dt| dt.and_utc().timestamp_millis().checked_add(0))
+        .and_then(|dt| tz.naive_to_millis(dt))
 }
 
-/// Convert one field through the Java value rules.
-pub fn convert_field(field: &Field) -> Value {
+/// Convert one field through the Java value rules with the server
+/// timezone applied to naive datetime strings.
+pub fn convert_field(tz: &ServerTz, field: &Field) -> Value {
     match field {
         Field::Null => Value::Null,
         Field::Bool(b) => Value::Bool(*b),
@@ -139,33 +233,37 @@ pub fn convert_field(field: &Field) -> Value {
         Field::Float32(v) => Number::from_f64(*v as f64).map(Value::Number).unwrap_or(Value::Null),
         Field::Float64(v) => Number::from_f64(*v).map(Value::Number).unwrap_or(Value::Null),
         Field::Decimal(d) => Value::String(d.to_string()),
-        Field::String(s) => convert_string(s),
-        Field::Date(d) => date_to_millis(
-            NaiveDateTime::parse_from_str(&format!("{} 00:00:00", d.format("%Y-%m-%d")), "%Y-%m-%d %H:%M:%S")
-                .unwrap_or_default(),
-        ),
-        Field::DateTime(dt) => date_to_millis(*dt),
+        Field::String(s) => convert_string(tz, s),
+        Field::Date(d) => NaiveDateTime::parse_from_str(
+            &format!("{} 00:00:00", d.format("%Y-%m-%d")),
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .ok()
+        .and_then(|dt| tz.naive_to_millis(dt))
+        .map(|millis| Value::Number(Number::from(millis)))
+        .unwrap_or(Value::String(d.to_string())),
+        Field::DateTime(dt) => tz
+            .naive_to_millis(*dt)
+            .map(|millis| Value::Number(Number::from(millis)))
+            .unwrap_or(Value::String(dt.format("%Y-%m-%d %H:%M:%S").to_string())),
         Field::TimestampTz(ts) => Value::Number(Number::from(ts.timestamp_millis())),
         Field::Time(t) => Value::String(t.format("%H:%M:%S").to_string()),
         Field::Duration(ns) => (*ns).into(),
         Field::Bytes(b) => Value::String(hex::encode(b)),
         Field::Json(j) => j.clone(),
-        Field::Array(items) => Value::Array(items.iter().map(convert_field).collect()),
-        Field::Row(fields) => Value::Array(fields.iter().map(convert_field).collect()),
+        Field::Array(items) => Value::Array(
+            items.iter().map(|f| convert_field(tz, f)).collect(),
+        ),
+        Field::Row(fields) => Value::Array(
+            fields.iter().map(|f| convert_field(tz, f)).collect(),
+        ),
     }
 }
 
 use serde_json::Number;
 
-fn date_to_millis(dt: NaiveDateTime) -> Value {
-    match dt.and_utc().timestamp_millis().checked_add(0) {
-        Some(millis) => Value::Number(Number::from(millis)),
-        None => Value::String(dt.format("%Y-%m-%d %H:%M:%S").to_string()),
-    }
-}
-
-fn convert_string(s: &str) -> Value {
-    if let Some(millis) = valid_date_to_millis(s) {
+fn convert_string(tz: &ServerTz, s: &str) -> Value {
+    if let Some(millis) = valid_date_to_millis(tz, s) {
         return Value::Number(Number::from(millis));
     }
     if is_java_number(s) {
@@ -196,6 +294,7 @@ pub const PAIRING_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 pub struct CanalClientEncoder {
     config: CanalClientConfig,
     fields: TableFields,
+    tz: ServerTz,
     column_positions: HashMap<String, usize>,
     /// Adjacent before-image awaiting its after-image (or flush).
     pending: Option<PendingDelete>,
@@ -203,6 +302,7 @@ pub struct CanalClientEncoder {
 
 impl CanalClientEncoder {
     pub fn new(config: CanalClientConfig) -> anyhow::Result<Self> {
+        let tz_string = config.server_time_zone.clone();
         let camel = camel_case_name(&config.table_name);
         let fields = config
             .tables
@@ -229,9 +329,15 @@ impl CanalClientEncoder {
         Ok(CanalClientEncoder {
             config,
             fields,
+            tz: ServerTz::parse(&tz_string),
             column_positions,
             pending: None,
         })
+    }
+
+    /// The resolved server timezone (diagnostics).
+    pub fn server_tz(&self) -> &ServerTz {
+        &self.tz
     }
 
     fn get<'r>(&self, row: &'r Row, column: &str) -> Option<&'r Field> {
@@ -256,9 +362,9 @@ impl CanalClientEncoder {
         let mut is_update = false;
         for (col, target) in &self.fields.must {
             if let Some(field) = self.get(row, col) {
-                let value = convert_field(field);
+                let value = convert_field(&self.tz, field);
                 if old.is_some_and(|o| {
-                    self.get(o, col).map(convert_field) != Some(value.clone())
+                    self.get(o, col).map(|f| convert_field(&self.tz, f)) != Some(value.clone())
                 }) {
                     is_update = true;
                 }
@@ -267,11 +373,11 @@ impl CanalClientEncoder {
         }
         for (col, target) in &self.fields.update {
             let changed = old.is_some_and(|o| {
-                self.get(o, col).map(convert_field) != self.get(row, col).map(convert_field)
+                self.get(o, col).map(|f| convert_field(&self.tz, f)) != self.get(row, col).map(|f| convert_field(&self.tz, f))
             });
             if old.is_none() || changed {
                 if let Some(field) = self.get(row, col) {
-                    out.insert(target.clone(), convert_field(field));
+                    out.insert(target.clone(), convert_field(&self.tz, field));
                 }
             }
             if changed {
@@ -287,7 +393,7 @@ impl CanalClientEncoder {
         let mut out = Map::new();
         for (col, target) in self.fields.must.iter().chain(self.fields.update.iter()) {
             if let Some(field) = self.get(old, col) {
-                out.insert(target.clone(), convert_field(field));
+                out.insert(target.clone(), convert_field(&self.tz, field));
             }
         }
         out
@@ -328,7 +434,7 @@ impl CanalClientEncoder {
             let mut out = Map::new();
             for (col, target) in &self.fields.must {
                 if let Some(field) = self.get(row, col) {
-                    out.insert(target.clone(), convert_field(field));
+                    out.insert(target.clone(), convert_field(&self.tz, field));
                 }
             }
             (out, ())
@@ -497,7 +603,10 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
     message.insert("eventType".to_string(), Value::String(event_type.to_string()));
     let mut data = Map::new();
     for (i, col) in schema.columns.iter().enumerate() {
-        data.insert(col.name.clone(), convert_field(row.fields.get(i).unwrap_or(&Field::Null)));
+        data.insert(
+            col.name.clone(),
+            convert_field(&ServerTz::default(), row.fields.get(i).unwrap_or(&Field::Null)),
+        );
     }
     message.insert("data".to_string(), Value::Object(data));
     Ok(serde_json::to_vec(&Value::Object(message))?)
@@ -526,16 +635,57 @@ mod tests {
     }
 
     #[test]
-    fn test_string_conversion() {
+    fn test_string_conversion_utc() {
+        let tz = ServerTz::Utc;
         // Strict date → epoch millis (2024-05-06 07:08:09 UTC).
-        let v = convert_string("2024-05-06 07:08:09");
+        let v = convert_string(&tz, "2024-05-06 07:08:09");
         assert_eq!(v, Value::Number(Number::from(1714979289000i64)));
         // Non-strict date stays a string.
-        assert_eq!(convert_string("2024-05-06"), Value::String("2024-05-06".into()));
-        assert_eq!(convert_string("2024-13-40 00:00:00"), Value::String("2024-13-40 00:00:00".into()));
+        assert_eq!(convert_string(&tz, "2024-05-06"), Value::String("2024-05-06".into()));
+        assert_eq!(convert_string(&tz, "2024-13-40 00:00:00"), Value::String("2024-13-40 00:00:00".into()));
         // Numbers.
-        assert_eq!(convert_string("1001"), Value::Number(Number::from(1001i64)));
-        assert_eq!(convert_string("0123"), Value::String("0123".into()));
+        assert_eq!(convert_string(&tz, "1001"), Value::Number(Number::from(1001i64)));
+        assert_eq!(convert_string(&tz, "0123"), Value::String("0123".into()));
+    }
+
+    #[test]
+    fn test_string_conversion_respects_server_time_zone() {
+        // Same wall-clock time, different zones → different millis.
+        let utc = convert_string(&ServerTz::Utc, "2024-05-06 07:08:09");
+        let utc_millis = utc.as_i64().expect("number");
+        // +08:00: 8 hours earlier in absolute time.
+        let cst = convert_string(&ServerTz::parse("+08:00"), "2024-05-06 07:08:09");
+        assert_eq!(cst.as_i64().unwrap(), utc_millis - 8 * 3600 * 1000);
+        // IANA name agrees with the fixed offset.
+        let shanghai = convert_string(&ServerTz::parse("Asia/Shanghai"), "2024-05-06 07:08:09");
+        assert_eq!(shanghai.as_i64().unwrap(), utc_millis - 8 * 3600 * 1000);
+        // Negative offset: -05:00 → 5 hours later in absolute time.
+        let ny = convert_string(&ServerTz::parse("-05:00"), "2024-05-06 07:08:09");
+        assert_eq!(ny.as_i64().unwrap(), utc_millis + 5 * 3600 * 1000);
+    }
+
+    #[test]
+    fn test_server_tz_parse_forms() {
+        assert!(matches!(ServerTz::parse(""), ServerTz::Local));
+        assert!(matches!(ServerTz::parse("local"), ServerTz::Local));
+        assert!(matches!(ServerTz::parse("UTC"), ServerTz::Utc));
+        assert!(matches!(ServerTz::parse("+08:00"), ServerTz::Fixed(_)));
+        assert!(matches!(ServerTz::parse("Asia/Shanghai"), ServerTz::Named(_)));
+        // Bogus values fall back to the local zone.
+        assert!(matches!(ServerTz::parse("not-a-zone"), ServerTz::Local));
+        // Default is the server-local zone (Java behavior).
+        assert!(matches!(ServerTz::default(), ServerTz::Local));
+    }
+
+    #[test]
+    fn test_datetime_field_uses_configured_zone() {
+        let dt = NaiveDateTime::parse_from_str("2024-05-06 07:08:09", "%Y-%m-%d %H:%M:%S").unwrap();
+        let utc = convert_field(&ServerTz::Utc, &Field::DateTime(dt));
+        let cst = convert_field(&ServerTz::parse("+08:00"), &Field::DateTime(dt));
+        assert_eq!(
+            cst.as_i64().unwrap(),
+            utc.as_i64().unwrap() - 8 * 3600 * 1000
+        );
     }
 
     fn fields_config() -> CanalClientConfig {
@@ -551,6 +701,7 @@ mod tests {
             table_name: "l_class_student".into(),
             columns: vec!["id".into(), "name".into(), "status".into(), "other".into()],
             tables,
+            server_time_zone: "UTC".to_string(),
         }
     }
 
