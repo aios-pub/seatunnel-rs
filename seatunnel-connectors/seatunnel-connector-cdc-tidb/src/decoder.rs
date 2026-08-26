@@ -53,6 +53,196 @@ pub enum ColumnValue {
     Json(String),
 }
 
+/// Column type classification used to decode `rowcodec` v2 values (which
+/// are untyped byte spans and need the table schema to interpret).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowColType {
+    /// Integer family (tinyint..bigint); `unsigned` widens the domain.
+    Int { unsigned: bool },
+    /// Float/double.
+    Float,
+    /// Character strings — stored verbatim in the row.
+    String,
+    /// Everything else (decimal, temporal, json, bit, enum, ...) — passed
+    /// through as raw bytes for now.
+    Other,
+}
+
+/// Classify a `COLUMN_TYPE` string from information_schema.
+pub fn parse_column_type(column_type: &str) -> RowColType {
+    let ct = column_type.trim().to_lowercase();
+    let unsigned = ct.ends_with("unsigned");
+    if ct.starts_with("tinyint")
+        || ct.starts_with("smallint")
+        || ct.starts_with("mediumint")
+        || ct.starts_with("int")
+        || ct.starts_with("bigint")
+    {
+        RowColType::Int { unsigned }
+    } else if ct.starts_with("float") || ct.starts_with("double") {
+        RowColType::Float
+    } else if ct.starts_with("char") || ct.starts_with("varchar") || ct.starts_with("text") {
+        RowColType::String
+    } else {
+        RowColType::Other
+    }
+}
+
+/// Decode a TiDB row value using the table's column types (ordered by
+/// ordinal position). Handles both the legacy "chunk" format (v1/v2 marker
+/// byte 0x00/0x01, self-describing) and the `rowcodec` v2 format (marker
+/// 0x80, the default since TiDB row_format_version=2).
+///
+/// For rowcodec v2 the clustered-table primary key column (absent from the
+/// value) is filled from `handle` when it is an integer column at
+/// `pk_ordinal`.
+pub fn decode_row_value_with_schema(
+    value: &[u8],
+    columns: &[RowColType],
+    pk_ordinal: Option<usize>,
+    handle: i64,
+) -> Result<Vec<ColumnValue>, String> {
+    if value.first() == Some(&0x80) {
+        decode_rowcodec_v2(value, columns, pk_ordinal, handle)
+    } else {
+        // Legacy chunk format is self-describing; positional output.
+        decode_row_value(value)
+    }
+}
+
+/// TiDB `rowcodec` v2 layout (pkg/util/rowcodec/row.go):
+/// `VER(0x80) | flags | num_not_null(u16 LE) | num_null(u16 LE)
+///  | col_ids (large? u32 LE : u8) x (num_not_null+num_null)
+///  | offsets (large? u32 LE : u16 LE) x num_not_null   // cumulative ends
+///  | data (offsets.last bytes)
+///  | optional checksum (flags & 0x02)`
+/// flags & 0x01 = large (col id > 255 or row data > 64KB).
+fn decode_rowcodec_v2(
+    value: &[u8],
+    columns: &[RowColType],
+    pk_ordinal: Option<usize>,
+    handle: i64,
+) -> Result<Vec<ColumnValue>, String> {
+    if value.len() < 6 {
+        return Err("rowcodec v2 header truncated".into());
+    }
+    let flags = value[1];
+    let large = flags & 0x01 != 0;
+    let num_not_null = u16::from_le_bytes([value[2], value[3]]) as usize;
+    let num_null = u16::from_le_bytes([value[4], value[5]]) as usize;
+    let id_width = if large { 4 } else { 1 };
+    let off_width = if large { 4 } else { 2 };
+
+    let need = 6 + (num_not_null + num_null) * id_width + num_not_null * off_width;
+    if value.len() < need {
+        return Err("rowcodec v2 column metadata truncated".into());
+    }
+    let mut cursor = 6;
+    let read_id = |cursor: &mut usize| -> u64 {
+        let id = if large {
+            u32::from_le_bytes(value[*cursor..*cursor + 4].try_into().unwrap()) as u64
+        } else {
+            value[*cursor] as u64
+        };
+        *cursor += id_width;
+        id
+    };
+    let mut not_null_ids = Vec::with_capacity(num_not_null);
+    for _ in 0..num_not_null {
+        not_null_ids.push(read_id(&mut cursor));
+    }
+    let mut null_ids = Vec::with_capacity(num_null);
+    for _ in 0..num_null {
+        null_ids.push(read_id(&mut cursor));
+    }
+    let mut offsets = Vec::with_capacity(num_not_null);
+    for _ in 0..num_not_null {
+        let off = if large {
+            u32::from_le_bytes(value[cursor..cursor + 4].try_into().unwrap()) as usize
+        } else {
+            u16::from_le_bytes([value[cursor], value[cursor + 1]]) as usize
+        };
+        cursor += off_width;
+        offsets.push(off);
+    }
+    let data_len = offsets.last().copied().unwrap_or(0);
+    if value.len() < cursor + data_len {
+        return Err("rowcodec v2 data truncated".into());
+    }
+    let data = &value[cursor..cursor + data_len];
+
+    // rowcodec column ids are the TiDB column offsets; for tables created
+    // without dropped columns they equal the 1-based ordinal position.
+    let mut out = vec![ColumnValue::Null; columns.len()];
+    let mut prev_end = 0usize;
+    for (i, id) in not_null_ids.iter().enumerate() {
+        let end = offsets[i];
+        let idx = usize::try_from(*id).ok().and_then(|v| v.checked_sub(1));
+        let col = idx
+            .and_then(|i| columns.get(i))
+            .copied()
+            .unwrap_or(RowColType::Other);
+        if let Some(i) = idx.filter(|i| *i < out.len()) {
+            out[i] = decode_typed_value(&data[prev_end..end], col);
+        }
+        prev_end = end;
+    }
+    for id in &null_ids {
+        if let Some(i) = usize::try_from(*id).ok().and_then(|v| v.checked_sub(1)).filter(|i| *i < out.len()) {
+            out[i] = ColumnValue::Null;
+        }
+    }
+    // Clustered int primary key lives in the record key, not the value.
+    if let Some(pk) = pk_ordinal {
+        if pk >= 1
+            && pk <= out.len()
+            && matches!(out[pk - 1], ColumnValue::Null)
+            && matches!(columns[pk - 1], RowColType::Int { .. })
+        {
+            out[pk - 1] = ColumnValue::Int(handle);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode one rowcodec v2 column payload. Integer columns use TiDB's
+/// compact encoding: minimum-width (1/2/4/8 byte) two's-complement
+/// little-endian.
+fn decode_typed_value(data: &[u8], col: RowColType) -> ColumnValue {
+    match col {
+        RowColType::Int { unsigned } => {
+            let v = decode_compact_int(data);
+            if unsigned {
+                ColumnValue::UInt(v as u64)
+            } else {
+                ColumnValue::Int(v)
+            }
+        }
+        RowColType::Float => {
+            if data.len() == 8 {
+                ColumnValue::Float(f64::from_be_bytes(data.try_into().unwrap()))
+            } else {
+                ColumnValue::Bytes(data.to_vec())
+            }
+        }
+        RowColType::String => match std::str::from_utf8(data) {
+            Ok(s) => ColumnValue::Text(s.to_string()),
+            Err(_) => ColumnValue::Bytes(data.to_vec()),
+        },
+        RowColType::Other => ColumnValue::Bytes(data.to_vec()),
+    }
+}
+
+fn decode_compact_int(data: &[u8]) -> i64 {
+    match data.len() {
+        1 => data[0] as i8 as i64,
+        2 => i16::from_le_bytes(data.try_into().unwrap()) as i64,
+        4 => i32::from_le_bytes(data.try_into().unwrap()) as i64,
+        8 => i64::from_le_bytes(data.try_into().unwrap()),
+        _ => 0,
+    }
+}
+
 /// Decode a TiKV record key into (table_id, handle).
 ///
 /// Format: `t<8-byte table_id>_r<handle>` where handle is either an int64
@@ -73,6 +263,28 @@ pub fn decode_record_key(key: &[u8]) -> Option<(i64, i64)> {
     let table_id = (u64::from_be_bytes(key[1..9].try_into().ok()?) ^ (1 << 63)) as i64;
     let handle = decode_handle(&key[11..])?;
     Some((table_id, handle))
+}
+
+/// Encode a raw key into the memcomparable "chunked" form used by PD region
+/// boundaries and CDC span keys (what official TiCDC's
+/// `spanz.ToComparableKey` sends). Every 8-byte chunk is emitted verbatim,
+/// padded with zeros to 8 bytes and terminated with `0xFF - pad_count`, so a
+/// key with more real bytes in its last chunk sorts higher.
+///
+/// Spans sent to TiKV `ChangeDataRequest` — and region-range queries sent to
+/// PD — MUST use this form: PD region boundaries are stored encoded, so raw
+/// keys compare against them incorrectly and resolve to the wrong regions
+/// (e.g. a raw table span matches the wide meta region instead of the actual
+/// data regions, and no PREWRITE/COMMIT delta ever arrives).
+pub fn encode_comparable(key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() / 8 * 9 + 9);
+    for chunk in key.chunks(8) {
+        let pad = 8 - chunk.len();
+        out.extend_from_slice(chunk);
+        out.extend(std::iter::repeat_n(0u8, pad));
+        out.push(0xFF - pad as u8);
+    }
+    out
 }
 
 /// Decode an int64 handle from the tail of a record key.
@@ -279,14 +491,23 @@ pub struct PendingRow {
 
 /// Percolator prewrite/commit correlation engine.
 ///
-/// Mirrors Java's TiDBSourceReader: track prewrites and commits keyed by
-/// (row, ts), then flush rows whose commit_ts <= resolved_ts.
+/// Mirrors official TiCDC's `txn_matcher` semantics: track prewrites and
+/// commits keyed by (row, ts), then flush rows whose commit_ts <= resolved_ts.
+/// Before a region's INITIALIZED marker, commits/rollbacks without a seen
+/// prewrite are cached (prewrites can be delivered out of order during the
+/// scan phase) and replayed once the marker arrives.
 #[derive(Debug, Default)]
 pub struct TransactionTracker {
     /// (handle, start_ts) -> prewrite row.
     prewrites: HashMap<RowKeyWithTs, PendingRow>,
     /// (handle, commit_ts) -> committed row (awaiting flush).
     commits: HashMap<RowKeyWithTs, PendingRow>,
+    /// Regions whose INITIALIZED marker (Row.LogType = 5) has been seen.
+    initialized_regions: std::collections::HashSet<u64>,
+    /// Commits that arrived before INITIALIZED without a matching prewrite.
+    cached_commits: HashMap<u64, Vec<PendingRow>>,
+    /// Rollbacks that arrived before INITIALIZED without a seen prewrite.
+    cached_rollbacks: HashMap<u64, Vec<(i64, u64)>>,
 }
 
 impl TransactionTracker {
@@ -295,14 +516,21 @@ impl TransactionTracker {
     }
 
     /// Feed a CDC row event from the EventFeed stream.
-    pub fn on_row(&mut self, row: &CdcRow) {
+    pub fn on_row(&mut self, region_id: u64, row: &CdcRow) {
         tracing::debug!(
-            "TiKV CDC tracker: on_row type={} key_len={} start_ts={} commit_ts={}",
+            "TiKV CDC tracker: on_row region={} type={} key_len={} start_ts={} commit_ts={}",
+            region_id,
             row.r#type,
             row.key.len(),
             row.start_ts,
             row.commit_ts
         );
+        // LogType: PREWRITE=1, COMMIT=2, ROLLBACK=3, COMMITTED=4,
+        // INITIALIZED=5.
+        if row.r#type == 5 {
+            self.mark_initialized(region_id);
+            return;
+        }
         let Some((_table_id, handle)) = decode_record_key(&row.key) else {
             tracing::debug!(
                 "TiKV CDC tracker: failed to decode record key: {}",
@@ -313,7 +541,6 @@ impl TransactionTracker {
             );
             return;
         };
-        // LogType: PREWRITE=1, COMMIT=2, ROLLBACK=3, COMMITTED=4
         let pending = PendingRow {
             handle,
             start_ts: row.start_ts,
@@ -322,24 +549,61 @@ impl TransactionTracker {
             old_value: row.old_value.clone(),
             op_type: row.op_type,
         };
+        let initialized = self.initialized_regions.contains(&region_id);
         match row.r#type {
             1 => {
-                // PREWRITE
-                self.prewrites
-                    .insert(RowKeyWithTs::of_start(handle, row.start_ts), pending);
+                // PREWRITE. TiKV may send a fake prewrite with an empty value
+                // (txn heartbeat); never let it overwrite a real prewrite.
+                let key = RowKeyWithTs::of_start(handle, row.start_ts);
+                let overwrite = match self.prewrites.get(&key) {
+                    Some(existing) => existing.value.is_empty(),
+                    None => true,
+                };
+                if overwrite {
+                    self.prewrites.insert(key, pending);
+                }
             }
             2 => {
-                // COMMIT
-                self.commits
-                    .insert(RowKeyWithTs::of_commit(handle, row.commit_ts), pending);
+                // COMMIT carries key + timestamps; the value comes from the
+                // matched prewrite. Before INITIALIZED a missing prewrite is
+                // expected (scan-phase reordering) — cache and replay later.
+                let start_key = RowKeyWithTs::of_start(handle, row.start_ts);
+                // Pipelined-DML (generation > 0) commits only match after
+                // INITIALIZED, mirroring official TiCDC.
+                let matched = self.prewrites.contains_key(&start_key)
+                    && (initialized || row.generation == 0);
+                if matched {
+                    self.commits
+                        .insert(RowKeyWithTs::of_commit(handle, row.commit_ts), pending);
+                } else if !initialized {
+                    self.cached_commits.entry(region_id).or_default().push(pending);
+                } else {
+                    tracing::warn!(
+                        "TiKV CDC tracker: commit without prewrite after initialized \
+                         (region {}, handle {}, start_ts {}) — dropped",
+                        region_id,
+                        handle,
+                        row.start_ts
+                    );
+                }
             }
             3 => {
-                // ROLLBACK — drop the prewrite
-                self.prewrites
-                    .remove(&RowKeyWithTs::of_start(handle, row.start_ts));
+                // ROLLBACK — drop the prewrite (cache it before INITIALIZED
+                // because the prewrite may still be in flight).
+                if self
+                    .prewrites
+                    .remove(&RowKeyWithTs::of_start(handle, row.start_ts))
+                    .is_none()
+                    && !initialized
+                {
+                    self.cached_rollbacks
+                        .entry(region_id)
+                        .or_default()
+                        .push((handle, row.start_ts));
+                }
             }
             4 => {
-                // COMMITTED — carries full row; register both prewrite and commit
+                // COMMITTED — carries the full row; register both sides.
                 self.prewrites.insert(
                     RowKeyWithTs::of_start(handle, row.start_ts),
                     pending.clone(),
@@ -350,6 +614,37 @@ impl TransactionTracker {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// Latch a region's INITIALIZED marker and replay events that were
+    /// cached while the region's scan was still converging.
+    fn mark_initialized(&mut self, region_id: u64) {
+        if !self.initialized_regions.insert(region_id) {
+            return;
+        }
+        let cached_commits = self.cached_commits.remove(&region_id).unwrap_or_default();
+        let cached_rollbacks = self.cached_rollbacks.remove(&region_id).unwrap_or_default();
+        let mut unmatched = 0usize;
+        for commit in cached_commits {
+            let start_key = RowKeyWithTs::of_start(commit.handle, commit.start_ts);
+            if self.prewrites.contains_key(&start_key) {
+                self.commits
+                    .insert(RowKeyWithTs::of_commit(commit.handle, commit.commit_ts), commit);
+            } else {
+                unmatched += 1;
+            }
+        }
+        for (handle, start_ts) in cached_rollbacks {
+            self.prewrites
+                .remove(&RowKeyWithTs::of_start(handle, start_ts));
+        }
+        if unmatched > 0 {
+            tracing::debug!(
+                "TiKV CDC tracker: region {} initialized, {} cached commit(s) had no prewrite",
+                region_id,
+                unmatched
+            );
         }
     }
 
@@ -448,6 +743,99 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_comparable_matches_pd_region_boundaries() {
+        // Vectors captured from a real TiDB v8.1 cluster: table 164 span
+        // `t164_r..t164_s` raw vs the encoded form PD region boundaries and
+        // official TiCDC subscriptions use.
+        let (raw_start, raw_end) = (
+            [0x74u8, 0x80, 0, 0, 0, 0, 0, 0, 0xA4, b'_', b'r'].as_slice(),
+            [0x74u8, 0x80, 0, 0, 0, 0, 0, 0, 0xA4, b'_', b's'].as_slice(),
+        );
+        let enc_start = encode_comparable(raw_start);
+        assert_eq!(
+            hex_of(&enc_start),
+            "7480000000000000ffa45f720000000000fa"
+        );
+        assert_eq!(hex_of(&encode_comparable(raw_end)), "7480000000000000ffa45f730000000000fa");
+
+        // A 9-byte key (table prefix only) pads with 7 zeros -> 0xF8 marker,
+        // matching the split boundary between table regions.
+        let table_prefix = [0x74u8, 0x80, 0, 0, 0, 0, 0, 0, 0xA4].as_slice();
+        assert_eq!(
+            hex_of(&encode_comparable(table_prefix)),
+            "7480000000000000ffa400000000000000f8"
+        );
+
+        // Exact 8-byte chunk gets a 0xFF marker with no padding.
+        assert_eq!(
+            hex_of(&encode_comparable(&[0x72u8, 0, 0, 1, 0, 0, 0, 0])),
+            "7200000100000000ff"
+        );
+        // 4-byte meta key boundary observed in PD (`72000001...` region).
+        assert_eq!(
+            hex_of(&encode_comparable(&[0x72u8, 0, 0, 1])),
+            "7200000100000000fb"
+        );
+        // Ordering property: longer real data in the final chunk sorts higher.
+        assert!(encode_comparable(raw_start) < encode_comparable(raw_end));
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Build a record key for `handle` in table 1.
+    fn record_key(handle: i64) -> Vec<u8> {
+        let mut k = Vec::new();
+        k.push(b't');
+        k.extend_from_slice(&encode_cmp_u64_for_test(1));
+        k.push(b'_');
+        k.push(b'r');
+        k.extend_from_slice(&encode_cmp_u64_for_test(handle));
+        k
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        let cleaned: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..cleaned.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_decode_rowcodec_v2_captured_vectors() {
+        // users(id int PK, name varchar, score int) — hex captured from
+        // live TiDB v8.1 EventFeed COMMITTED rows.
+        let columns = [
+            RowColType::Int { unsigned: false },
+            RowColType::String,
+            RowColType::Int { unsigned: false },
+        ];
+        let decode = |hex: &str, handle: i64| {
+            decode_row_value_with_schema(&from_hex(hex), &columns, Some(1), handle).unwrap()
+        };
+
+        // ('fmt_probe2', 88), handle 17 — clustered PK absent from value.
+        let row = decode("8000020000000203 0a00 0b00 666d745f70726f626532 58", 17);
+        assert_eq!(row[0], ColumnValue::Int(17));
+        assert_eq!(row[1], ColumnValue::Text("fmt_probe2".into()));
+        assert_eq!(row[2], ColumnValue::Int(88));
+
+        // Compact integers: 63 inline i8, 250/1000 i16 LE, 100000 i32 LE, -5 i8.
+        assert_eq!(decode("8000020000000203 0300 0400 6e3633 3f", 18)[2], ColumnValue::Int(63));
+        assert_eq!(decode("8000020000000203 0400 0600 6e323530 fa00", 20)[2], ColumnValue::Int(250));
+        assert_eq!(decode("8000020000000203 0500 0700 6e31303030 e803", 23)[2], ColumnValue::Int(1000));
+        assert_eq!(decode("8000020000000203 0700 0b00 6e313030303030 a0860100", 24)[2], ColumnValue::Int(100000));
+        assert_eq!(decode("8000020000000203 0300 0400 6e6567 fb", 25)[2], ColumnValue::Int(-5));
+
+        // score = NULL: the column is entirely absent from the value.
+        let row = decode("80000100000002 0400 6e756c76", 26);
+        assert_eq!(row[1], ColumnValue::Text("nulv".into()));
+        assert_eq!(row[2], ColumnValue::Null);
+    }
+
+    #[test]
     fn test_transaction_tracker_commit_flow() {
         let mut tracker = TransactionTracker::new();
         // COMMITTED row: handle 5, start_ts 100, commit_ts 200
@@ -456,25 +844,129 @@ mod tests {
             commit_ts: 200,
             r#type: 4,
             op_type: 1, // PUT
-            key: {
-                let mut k = Vec::new();
-                k.push(b't');
-                k.extend_from_slice(&encode_cmp_u64_for_test(1));
-                k.push(b'_');
-                k.push(b'r');
-                k.extend_from_slice(&encode_cmp_u64_for_test(5));
-                k
-            },
+            key: record_key(5),
             value: vec![1, 2, 3],
             old_value: vec![],
             ..Default::default()
         };
-        tracker.on_row(&row);
+        tracker.on_row(7, &row);
         // Nothing flushes before resolved_ts reaches 200
         assert!(tracker.flush(150).is_empty());
         let emitted = tracker.flush(200);
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].handle, 5);
         assert_eq!(emitted[0].commit_ts, 200);
+    }
+
+    #[test]
+    fn test_tracker_prewrite_commit_pair() {
+        let mut tracker = TransactionTracker::new();
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 300,
+                commit_ts: 0,
+                r#type: 1, // PREWRITE carries the value
+                op_type: 1,
+                key: record_key(9),
+                value: vec![9, 9],
+                ..Default::default()
+            },
+        );
+        assert!(tracker.flush(u64::MAX).is_empty());
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 300,
+                commit_ts: 301,
+                r#type: 2, // COMMIT carries only key + ts
+                op_type: 1,
+                key: record_key(9),
+                value: vec![],
+                ..Default::default()
+            },
+        );
+        let emitted = tracker.flush(301);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].handle, 9);
+        // The value must come from the prewrite side.
+        assert_eq!(emitted[0].value, vec![9, 9]);
+    }
+
+    #[test]
+    fn test_tracker_caches_commit_before_initialized_and_replays() {
+        let mut tracker = TransactionTracker::new();
+        // COMMIT before the region's INITIALIZED marker, prewrite unseen.
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 10,
+                commit_ts: 11,
+                r#type: 2,
+                op_type: 1,
+                key: record_key(3),
+                ..Default::default()
+            },
+        );
+        assert!(tracker.flush(u64::MAX).is_empty());
+        // The prewrite arrives late (scan-phase reordering), then the marker.
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 10,
+                r#type: 1,
+                op_type: 1,
+                key: record_key(3),
+                value: vec![7],
+                ..Default::default()
+            },
+        );
+        tracker.on_row(7, &CdcRow { r#type: 5, ..Default::default() });
+        let emitted = tracker.flush(11);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].handle, 3);
+        assert_eq!(emitted[0].value, vec![7]);
+    }
+
+    #[test]
+    fn test_tracker_fake_prewrite_does_not_overwrite_real_one() {
+        let mut tracker = TransactionTracker::new();
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 50,
+                r#type: 1,
+                op_type: 1,
+                key: record_key(4),
+                value: vec![1, 2, 3, 4],
+                ..Default::default()
+            },
+        );
+        // Fake heartbeat prewrite (empty value) must not replace the real one.
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 50,
+                r#type: 1,
+                op_type: 1,
+                key: record_key(4),
+                value: vec![],
+                ..Default::default()
+            },
+        );
+        tracker.on_row(
+            7,
+            &CdcRow {
+                start_ts: 50,
+                commit_ts: 51,
+                r#type: 2,
+                op_type: 1,
+                key: record_key(4),
+                ..Default::default()
+            },
+        );
+        let emitted = tracker.flush(51);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].value, vec![1, 2, 3, 4]);
     }
 }

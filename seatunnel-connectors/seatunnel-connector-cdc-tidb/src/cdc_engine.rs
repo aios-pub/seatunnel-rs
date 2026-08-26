@@ -15,7 +15,10 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::cdc_client::{CdcClient, RegionCdcStream};
-use crate::decoder::{decode_record_key, decode_row_value, ColumnValue, TransactionTracker};
+use crate::decoder::{
+    decode_record_key, decode_row_value_with_schema, encode_comparable, ColumnValue, RowColType,
+    TransactionTracker,
+};
 use crate::kvproto::cdcpb::event::{Event as CdcEvent, Row as CdcRow};
 use crate::kvproto::cdcpb::ChangeDataEvent;
 use crate::kvproto::metapb::RegionEpoch;
@@ -61,15 +64,21 @@ pub struct CdcEngineConfig {
     pub checkpoint_ts: u64,
     /// Whether snapshot data still needs to be read (phase).
     pub request_snapshot: bool,
+    /// Table column types in ordinal order — required to decode rowcodec v2
+    /// values (the default TiDB row format, which is not self-describing).
+    pub column_types: Vec<RowColType>,
+    /// Ordinal (1-based) of an integer clustered primary key column, filled
+    /// from the record key handle when decoding rows.
+    pub pk_ordinal: Option<usize>,
     /// Store-address rewrites applied to leader addresses reported by PD
     /// (host part only, first match wins). Typical use: a TiKV advertised on
     /// `host.docker.internal` is rewritten to `127.0.0.1` for workers running
     /// on the host, where that DNS name does not resolve.
     pub address_rewrite: Vec<(String, String)>,
-    /// Re-register each region stream every N milliseconds. Each
-    /// re-registration triggers a fresh incremental scan from the current
-    /// `resolved_ts`, which is currently the only reliably-delivered change
-    /// path against some TiKV builds (see connector docs). 0 disables.
+    /// Optional fallback: re-register each region stream every N
+    /// milliseconds, forcing a fresh incremental scan from the last emitted
+    /// data timestamp. Disabled (0) by default — live delta streaming is the
+    /// primary path; re-registration churn adds load and re-runs scans.
     pub resubscribe_interval_ms: u64,
 }
 
@@ -93,6 +102,12 @@ pub struct CdcEngine {
     cdc: CdcClient,
     regions: HashMap<u64, RegionState>,
     tracker: TransactionTracker,
+    /// Memcomparable-encoded table span (`encode_comparable` of
+    /// `config.start_key/end_key`). PD region boundaries and TiKV observed
+    /// ranges live in this key space; both region discovery and subscription
+    /// spans must use the encoded form.
+    enc_start_key: Vec<u8>,
+    enc_end_key: Vec<u8>,
     /// Global watermark = min(resolved_ts across regions).
     global_resolved_ts: u64,
     /// Row events awaiting consumption.
@@ -113,12 +128,16 @@ pub struct CdcEngine {
 impl CdcEngine {
     pub fn new(config: CdcEngineConfig) -> Self {
         let resume_checkpoint_ts = config.checkpoint_ts;
+        let enc_start_key = encode_comparable(&config.start_key);
+        let enc_end_key = encode_comparable(&config.end_key);
         CdcEngine {
             config,
             pd: None,
             cdc: CdcClient::new(0),
             regions: HashMap::new(),
             tracker: TransactionTracker::new(),
+            enc_start_key,
+            enc_end_key,
             global_resolved_ts: 0,
             pending_rows: VecDeque::new(),
             last_had_events: false,
@@ -168,10 +187,14 @@ impl CdcEngine {
     }
 
     /// Enumerate regions covering [start_key, end_key) from PD.
+    ///
+    /// The query runs in the encoded key space: PD region boundaries are
+    /// memcomparable-encoded, so a raw table span resolves to the wrong
+    /// (broader) region and live deltas never arrive.
     async fn discover_regions(&mut self) -> anyhow::Result<()> {
         let pd = self.pd.as_mut().unwrap();
         let regions = pd
-            .scan_regions(&self.config.start_key, &self.config.end_key)
+            .scan_regions(&self.enc_start_key, &self.enc_end_key)
             .await?;
         for ri in regions {
             self.add_region(ri).await?;
@@ -225,9 +248,10 @@ impl CdcEngine {
             None => return Ok(()),
         };
         // Remove stale regions that no longer overlap the table range.
+        // Region bounds are already encoded; compare in that key space.
         self.regions.retain(|_id, r| {
-            let overlaps = r.start_key < self.config.end_key
-                && (self.config.start_key < r.end_key || r.end_key.is_empty());
+            let overlaps = r.start_key < self.enc_end_key
+                && (self.enc_start_key < r.end_key || r.end_key.is_empty());
             if !overlaps {
                 tracing::info!(
                     "TiKV CDC: dropping region {} (merged or moved out of range)",
@@ -238,7 +262,7 @@ impl CdcEngine {
         });
         // Discover any new regions (from split).
         let regions = pd
-            .scan_regions(&self.config.start_key, &self.config.end_key)
+            .scan_regions(&self.enc_start_key, &self.enc_end_key)
             .await?;
         let mut added = 0;
         for ri in regions {
@@ -255,27 +279,68 @@ impl CdcEngine {
 
     /// Ensure the stream for `region_id` is open; reconnect with backoff on error.
     ///
-    /// The subscription span is the **table's key range intersected with the
-    /// region**, matching official TiCDC: subscribing with raw region bounds
-    /// makes the server-side entry filter reject everything (the observed
-    /// range must decode to the same keyspace as the streamed entries).
+    /// The subscription span is the memcomparable-encoded table span
+    /// intersected with the region's bounds — exactly what official TiCDC
+    /// sends (`spanz.ToComparableKey`). Raw (unencoded) spans decode into an
+    /// invalid TiKV `ObservedRange` and resolve to wrong regions, so no live
+    /// delta is ever delivered.
+    ///
+    /// Epoch and leader address are re-resolved from PD on every (re)connect:
+    /// TiKV silently drops deltas for downstreams registered with a stale
+    /// region epoch.
     async fn ensure_stream(&mut self, region_id: u64) -> anyhow::Result<()> {
         let region = self.regions.get(&region_id).unwrap();
         let already_open = region.stream.is_some();
         if already_open {
             return Ok(());
         }
-        // Span = the table prefix itself (PLAIN keys — official TiCDC notes
-        // they are *not* memcomparable-wrapped; any other form makes TiKV's
-        // ObservedRange decode fail and every entry gets filtered server-side).
-        // TiKV intersects the span with the region internally.
-        let sk = self.config.start_key.clone();
-        let ek = self.config.end_key.clone();
+        // Refresh region metadata: after splits/merges or leader transfers
+        // the stored epoch/leader is stale and TiKV would either reject the
+        // subscription or never deliver deltas for it.
+        if let Some(pd) = self.pd.as_mut() {
+            match pd.get_region_by_id(region_id).await {
+                Ok(Some(ri)) => {
+                    let epoch = ri.region.region_epoch;
+                    let leader = match pd.leader_address(&ri).await {
+                        Ok(Some(addr)) => Some(addr),
+                        _ => ri.leader_addr.clone(),
+                    };
+                    let leader = leader.map(|a| rewrite_address(&a, &self.config.address_rewrite));
+                    if let Some(r) = self.regions.get_mut(&region_id) {
+                        r.epoch = epoch;
+                        r.start_key = ri.region.start_key.clone();
+                        r.end_key = ri.region.end_key.clone();
+                        if let Some(l) = leader {
+                            r.leader_addr = Some(l);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Region disappeared (merged away) — leave state as is;
+                    // the periodic refresh will drop it.
+                }
+                Err(e) => {
+                    tracing::debug!("TiKV CDC: region {} metadata refresh failed: {}", region_id, e);
+                }
+            }
+        }
+        let region = self.regions.get(&region_id).unwrap();
+        // Intersection in the encoded key space (region bounds come from PD
+        // already encoded).
+        let sk = if region.start_key > self.enc_start_key {
+            region.start_key.clone()
+        } else {
+            self.enc_start_key.clone()
+        };
+        let ek = if region.end_key.is_empty() || region.end_key > self.enc_end_key {
+            self.enc_end_key.clone()
+        } else {
+            region.end_key.clone()
+        };
         let epoch = region.epoch;
         let checkpoint = self.config.checkpoint_ts;
         let addr = region.leader_addr.clone().unwrap_or_default();
 
-        // cdc_client wraps sk/ek with EncodeBytes on the wire.
         let stream = self
             .cdc
             .open_region_stream(&addr, region_id, epoch, &sk, &ek, checkpoint)
@@ -294,9 +359,8 @@ impl CdcEngine {
     }
 
     /// Like [`poll`](Self::poll) but each region read waits at most
-    /// `budget_ms` — used by snapshot-phase draining so table scans are not
-    /// starved by idle streams.
-    pub async fn poll_with_budget(&mut self, _budget_ms: u64) -> anyhow::Result<usize> {
+    /// `budget_ms` — a quiet region cannot starve the others.
+    pub async fn poll_with_budget(&mut self, budget_ms: u64) -> anyhow::Result<usize> {
         // Periodically re-check PD for region split/merge (every 128 polls).
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_no = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -306,10 +370,9 @@ impl CdcEngine {
             }
         }
 
-        // Periodic re-registration: each fresh registration makes TiKV run
-        // an incremental scan from the current resolved_ts, which is the
-        // reliably-delivered change path (see config docs). Advance the
-        // checkpoint first so no window is missed; overlap is at-least-once.
+        // Optional periodic re-registration (fallback mode): each fresh
+        // registration makes TiKV run an incremental scan from the last
+        // emitted data timestamp. Overlap is at-least-once.
         if self.config.resubscribe_interval_ms > 0 {
             let due = match self.last_resubscribe {
                 None => true,
@@ -365,36 +428,34 @@ impl CdcEngine {
                 }
             }
 
-            // Read one event batch from the region's stream (bounded wait).
-            // BLOCKING read like official TiCDC — no timeout wrapper.
-            // Dropping tonic's Streaming future mid-read corrupts h2 state.
-            let res = {
-                let region = self.regions.get(&region_id).unwrap();
-                match &region.stream {
-                    Some(stream) => Some(stream.next_event().await),
-                    None => None,
+            // Read one event batch from the region's stream with a bounded
+            // wait. The tonic stream future lives in a dedicated reader
+            // task, so timing out here never cancels it mid-read.
+            let read = {
+                let region = self.regions.get_mut(&region_id).unwrap();
+                match region.stream.as_mut() {
+                    Some(stream) => {
+                        tokio::time::timeout(
+                            Duration::from_millis(budget_ms.max(1)),
+                            stream.next_event(),
+                        )
+                        .await
+                    }
+                    None => {
+                        continue;
+                    }
                 }
             };
-            if res.is_none() {
-                continue;
-            }
-            let res = res.unwrap();
-            if let Ok(Some(_)) = &res {
-                tracing::debug!("TiKV CDC: region {} delivered an event", region_id);
-            }
-            match res {
-                Ok(Some(change_event)) => {
+            match read {
+                // Budget exhausted for this region — move on to the next.
+                Err(_elapsed) => {}
+                Ok(Ok(Some(change_event))) => {
+                    tracing::debug!("TiKV CDC: region {} delivered an event", region_id);
                     had_event = true;
                     consumed += self.handle_change_event(region_id, change_event);
                 }
-                Ok(None) => {
-                    // Stream ended — mark for reconnect.
-                    if let Some(r) = self.regions.get_mut(&region_id) {
-                        r.stream = None;
-                        r.failures += 1;
-                    }
-                }
-                Err(_e) => {
+                Ok(Ok(None)) | Ok(Err(_)) => {
+                    // Stream ended or failed — mark for reconnect.
                     if let Some(r) = self.regions.get_mut(&region_id) {
                         r.stream = None;
                         r.failures += 1;
@@ -435,11 +496,14 @@ impl CdcEngine {
                 );
                 continue;
             }
+            // Sub-events carry their own region id (with stream-multiplexing
+            // a stream may in principle carry other regions' events).
+            let ev_region_id = ev.region_id;
             match ev.event {
                 Some(CdcEvent::Entries(entries)) => {
                     // `entries.entries` is Vec<cdcpb::event::Row> (i.e. CdcRow)
                     for row in entries.entries {
-                        self.tracker.on_row(&row);
+                        self.tracker.on_row(ev_region_id, &row);
                         row_count += 1;
                     }
                 }
@@ -461,9 +525,12 @@ impl CdcEngine {
         }
         // Top-level ResolvedTs: with the `stream-multiplexing` feature TiKV
         // tags it with our request_id; without negotiation it arrives as a
-        // store-wide aggregate tagged 0. Accept both, ignore foreign ids.
+        // store-wide aggregate tagged 0. Accept both, but only when this
+        // region is actually covered by the batch.
         if let Some(rt) = event.resolved_ts {
-            if rt.request_id == my_request_id || rt.request_id == 0 {
+            if (rt.request_id == my_request_id || rt.request_id == 0)
+                && (rt.regions.is_empty() || rt.regions.contains(&region_id))
+            {
                 if let Some(r) = self.regions.get_mut(&region_id) {
                     r.resolved_ts = r.resolved_ts.max(rt.ts);
                 }
@@ -504,10 +571,39 @@ impl CdcEngine {
                 self.last_data_ts = pending.commit_ts;
                 self.resume_checkpoint_ts = self.resume_checkpoint_ts.max(pending.commit_ts);
             }
-            // Decode the row value into columns.
-            let columns = match decode_row_value(&pending.value) {
-                Ok(cols) => cols,
-                Err(_) => continue,
+            // Deletes carry no value; the pre-image (if captured) rides in
+            // old_value. Fall back to a key-only row so downstreams still
+            // see the delete.
+            let value_src: &[u8] = if pending.value.is_empty() {
+                &pending.old_value
+            } else {
+                &pending.value
+            };
+            let columns = if value_src.is_empty() && pending.op_type == 2 {
+                let mut cols = vec![ColumnValue::Null; self.config.column_types.len()];
+                if let Some(pk) = self.config.pk_ordinal.filter(|p| *p <= cols.len()) {
+                    cols[pk - 1] = ColumnValue::Int(pending.handle);
+                }
+                cols
+            } else {
+                match decode_row_value_with_schema(
+                    value_src,
+                    &self.config.column_types,
+                    self.config.pk_ordinal,
+                    pending.handle,
+                ) {
+                    Ok(cols) => cols,
+                    Err(e) => {
+                        tracing::warn!(
+                            "TiKV CDC: failed to decode row value for handle {} (commit_ts={}, {} bytes): {}",
+                            pending.handle,
+                            pending.commit_ts,
+                            value_src.len(),
+                            e
+                        );
+                        continue;
+                    }
+                }
             };
             // Determine operation kind: op_type 1 = PUT, 2 = DELETE.
             // For PUT with non-empty old_value it's an UPDATE; the tracker
@@ -566,8 +662,8 @@ impl CdcEngine {
     /// Close all region streams.
     pub async fn close(&mut self) {
         for region in self.regions.values_mut() {
-            if let Some(stream) = region.stream.take() {
-                stream.close().await;
+            if let Some(mut stream) = region.stream.take() {
+                stream.close();
             }
         }
         self.regions.clear();

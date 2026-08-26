@@ -199,7 +199,7 @@ impl Default for TiDBCdcConfig {
             subtask_count: 1,
             capture_timeout: 300_000,
             store_address_rewrite: Vec::new(),
-            resubscribe_interval_ms: 10_000,
+            resubscribe_interval_ms: 0,
             conn: TiDBCdcConnConfig::new("127.0.0.1", 4000, "root", "", "seatunnel"),
         }
     }
@@ -243,8 +243,10 @@ impl TiDBCdcConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
-            resubscribe_interval_ms: config.get_int("resubscribe-interval-ms", 10_000).max(0)
-                as u64,
+            // 0 (disabled) by default: live delta streaming works on
+            // correctly-encoded spans, and periodic re-registration adds
+            // churn against TiKV's observe-handle lifecycle.
+            resubscribe_interval_ms: config.get_int("resubscribe-interval-ms", 0).max(0) as u64,
             conn: TiDBCdcConnConfig::new(
                 config.get_string("conn-host", "127.0.0.1").as_str(),
                 config.get_int("conn-port", 4000) as u16,
@@ -539,6 +541,36 @@ impl TiDBCdcReader {
             self.config.pd_addrs.clone()
         };
         let (start_key, end_key) = table_key_range(table_id);
+        // Column metadata is required to decode rowcodec v2 row values.
+        let pool = self.config.conn.to_pool();
+        let mut conn = pool.get_conn().await?;
+        let sql = format!(
+            "SELECT ORDINAL_POSITION, COLUMN_TYPE, COLUMN_KEY FROM information_schema.columns \
+             WHERE TABLE_SCHEMA='{}' AND TABLE_NAME='{}' ORDER BY ORDINAL_POSITION",
+            self.config.database_name.replace('\'', "''"),
+            self.config.table_name.replace('\'', "''"),
+        );
+        let rows: Vec<mysql_async::Row> = conn.query(sql).await?;
+        let mut column_types = Vec::with_capacity(rows.len());
+        let mut pk_ordinal = None;
+        for r in &rows {
+            let ordinal: i64 = r.get("ORDINAL_POSITION").unwrap_or(0);
+            let ctype: Option<String> = r.get("COLUMN_TYPE").unwrap_or(None);
+            let ckey: Option<String> = r.get("COLUMN_KEY").unwrap_or(None);
+            let parsed =
+                crate::decoder::parse_column_type(ctype.as_deref().unwrap_or("varchar(255)"));
+            if ckey.as_deref() == Some("PRI") && pk_ordinal.is_none() {
+                pk_ordinal = Some(ordinal as usize);
+            }
+            column_types.push(parsed);
+        }
+        if column_types.is_empty() {
+            anyhow::bail!(
+                "table {}.{} has no columns in information_schema",
+                self.config.database_name,
+                self.config.table_name
+            );
+        }
         let engine_config = crate::cdc_engine::CdcEngineConfig {
             pd_addrs,
             table_id,
@@ -547,6 +579,8 @@ impl TiDBCdcReader {
             cluster_id: self.config.cluster_id.unwrap_or(0),
             checkpoint_ts: self.resolved_ts.0,
             request_snapshot: false,
+            column_types,
+            pk_ordinal,
             address_rewrite: self.config.store_address_rewrite.clone(),
             resubscribe_interval_ms: self.config.resubscribe_interval_ms,
         };
@@ -899,7 +933,7 @@ fn column_value_to_field(col: &crate::decoder::ColumnValue) -> Field {
 ///
 /// Returns PLAIN TiDB-level keys (NOT additionally encoded). TiKV intersects
 /// these with region boundaries internally.
-fn table_key_range(table_id: i64) -> (Vec<u8>, Vec<u8>) {
+pub fn table_key_range(table_id: i64) -> (Vec<u8>, Vec<u8>) {
     let id_cmp = (table_id as u64 ^ (1 << 63)).to_be_bytes();
     let mut start = Vec::with_capacity(11);
     start.push(b't');

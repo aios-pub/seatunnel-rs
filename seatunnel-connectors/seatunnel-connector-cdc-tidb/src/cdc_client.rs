@@ -1,38 +1,56 @@
 //! TiKV CDC client: manages EventFeedV2 bidirectional streams per region.
 //!
 //! Each `RegionCdcStream` owns one gRPC stream to a TiKV node's
-//! `/cdcpb.ChangeData/EventFeedV2`. The client sends a `ChangeDataRequest`
-//! (with a `Register`) and receives a stream of `ChangeDataEvent`s containing
+//! `/cdcpb.ChangeData/EventFeedV2`. The client sends one subscribe
+//! `ChangeDataRequest` (the `request` oneof left unset, exactly like
+//! official TiCDC) and receives a stream of `ChangeDataEvent`s containing
 //! row changes and resolved-ts progress.
+//!
+//! Two lifecycle details matter against TiKV:
+//! - Span keys must arrive pre-encoded in the memcomparable form (see
+//!   `decoder::encode_comparable`) — the key space PD region boundaries and
+//!   TiKV observed ranges use.
+//! - The send side must stay open while subscribed (TiKV treats client EOF
+//!   as a disconnect), but it must terminate when the handle is dropped —
+//!   an immortal request stream leaves zombie server-side connections that
+//!   poison TiKV's per-region CDC delegates. A oneshot guard ends the
+//!   request stream (client half-close) on drop.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 use tonic::Streaming;
 
 use crate::kvproto::cdcpb::change_data_client::ChangeDataClient;
-use crate::kvproto::cdcpb::change_data_request::{KvApi, Request};
+use crate::kvproto::cdcpb::change_data_request::KvApi;
 use crate::kvproto::cdcpb::{ChangeDataEvent, ChangeDataRequest, Header};
 use crate::kvproto::kvrpcpb::ExtraOp;
 use crate::kvproto::metapb::RegionEpoch;
 
 /// TiKV CDC service version advertised in the request header.
-const SCAN_PRIORITY_NORMAL: i32 = 0;
-
 const TICDC_VERSION: &str = "8.1.0";
+
+/// Events buffered per region before backpressure kicks in (the reader task
+/// stops draining the gRPC stream and h2 flow control stalls the server).
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// One forwarded stream item: an event, or a terminal error message.
+type StreamItem = Result<ChangeDataEvent, String>;
 
 /// A single EventFeedV2 stream for one region.
 pub struct RegionCdcStream {
     pub region_id: u64,
     pub request_id: u64,
-    /// Stream of events from TiKV. Mutex so poll and retry can share it.
-    stream: Arc<Mutex<Option<Streaming<ChangeDataEvent>>>>,
-    /// The client used to (re)establish the stream on retry.
-    client: ChangeDataClient<Channel>,
+    /// Events forwarded by the dedicated reader task that owns the tonic
+    /// `Streaming`. Decouples polling (which may time out freely) from the
+    /// actual stream future.
+    events: tokio::sync::mpsc::Receiver<StreamItem>,
+    /// Ends the request stream (half-close) on `close()`; dropping it has
+    /// the same effect, making TiKV deregister the connection instead of
+    /// leaking a zombie downstream.
+    end_request: Option<tokio::sync::oneshot::Sender<()>>,
     /// Immutable request template (region_id, epoch, keys, checkpoint).
     pub base_request: ChangeDataRequest,
 }
@@ -61,9 +79,11 @@ impl RegionCdcStream {
             request_id,
             extra_op: ExtraOp::ReadOldValue as i32,
             kv_api: KvApi::TiDb as i32,
-            scan_priority: SCAN_PRIORITY_NORMAL,
-            filter_loop: false,
-            request: Some(Request::Register(Default::default())),
+            // Byte-for-byte parity with official TiCDC: the `request` oneof
+            // stays unset for a subscribe (TiKV treats `None` and `Register`
+            // identically, but the official client never sets it).
+            request: None,
+            ..Default::default()
         }
     }
 
@@ -88,17 +108,24 @@ impl RegionCdcStream {
             request_id,
             cluster_id,
         );
-        // Span bounds travel EncodeBytes-wrapped on the wire (see helper above).
+        // Span keys are already memcomparable-encoded by the caller (see
+        // `decoder::encode_comparable`) — send them verbatim.
 
         // EventFeedV2 is a bidi stream. The registration request goes first,
         // then the send side must STAY OPEN — closing it makes TiKV cancel
         // the whole stream (the server treats client EOF as disconnect).
+        // The oneshot guard turns "handle dropped" into a graceful
+        // half-close so TiKV deregisters the downstream promptly.
         //
         // The `features: stream-multiplexing` h2 header mirrors official
-        // TiCDC: with it, TiKV buckets per-request state and tags
-        // ResolvedTs messages with their request_id.
-        use futures::stream;
-        let req_stream = stream::iter(vec![request.clone()]).chain(stream::pending());
+        // TiCDC: with it, TiKV buckets per-request state and tags ResolvedTs
+        // messages with their request_id.
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel::<()>();
+        let req_stream = futures::stream::iter(vec![request.clone()])
+            .chain(futures::stream::pending::<ChangeDataRequest>())
+            .take_until(async move {
+                let _ = end_rx.await;
+            });
         let mut grpc_req = tonic::Request::new(req_stream);
         grpc_req.metadata_mut().insert(
             "features",
@@ -113,76 +140,75 @@ impl RegionCdcStream {
             "TiKV CDC: EventFeedV2 stream opened for region {}",
             region_id
         );
+
+        // Dedicated reader task owns the tonic stream; the engine can poll
+        // (and time out) freely without ever cancelling the stream future
+        // mid-read.
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            let mut stream: Streaming<ChangeDataEvent> = response.into_inner();
+            loop {
+                match stream.message().await {
+                    Ok(Some(event)) => {
+                        if tx.send(Ok(event)).await.is_err() {
+                            break; // consumer gone
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tx.send(Err("stream closed by server".to_string())).await;
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("stream error: {e}"))).await;
+                        break;
+                    }
+                }
+            }
+            // Dropping `stream` here releases the RPC receive side.
+        });
+
         Ok(RegionCdcStream {
             region_id,
             request_id,
-            stream: Arc::new(Mutex::new(Some(response.into_inner()))),
-            client,
+            events: rx,
+            end_request: Some(end_tx),
             base_request: request,
         })
     }
 
-    /// Poll the stream for a batch of events.
-    ///
-    /// Returns `None` when the stream is exhausted or closed.
-    pub async fn next_event(&self) -> anyhow::Result<Option<ChangeDataEvent>> {
+    /// Poll the next event batch. Returns `Ok(None)` when the stream is
+    /// exhausted or closed; `Err` on a terminal stream failure.
+    pub async fn next_event(&mut self) -> anyhow::Result<Option<ChangeDataEvent>> {
         tracing::trace!("TiKV CDC: next_event awaiting region {}", self.region_id);
-        let mut guard = self.stream.lock().await;
-        let stream = match guard.as_mut() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        // `message()` yields individual framed messages.
-        match stream.message().await {
-            Ok(Some(event)) => {
-                tracing::trace!("TiKV CDC: region {} got message", self.region_id);
-                Ok(Some(event))
-            }
-            Ok(None) => {
-                tracing::warn!("TiKV CDC: stream closed for region {}", self.region_id);
-                *guard = None;
-                Ok(None)
-            }
-            Err(e) => {
+        match self.events.recv().await {
+            Some(Ok(event)) => Ok(Some(event)),
+            Some(Err(msg)) => {
                 tracing::warn!(
-                    "TiKV CDC: stream error for region {}: {}",
+                    "TiKV CDC: stream ended for region {}: {}",
                     self.region_id,
-                    e
+                    msg
                 );
-                *guard = None;
-                Err(anyhow::anyhow!("EventFeedV2 stream error: {}", e))
+                Err(anyhow::anyhow!(
+                    "EventFeedV2 region {}: {}",
+                    self.region_id,
+                    msg
+                ))
+            }
+            None => {
+                tracing::warn!("TiKV CDC: reader task stopped for region {}", self.region_id);
+                Ok(None)
             }
         }
     }
 
-    /// Re-establish the stream using the stored request (used on retry).
-    pub async fn reconnect(&mut self) -> anyhow::Result<()> {
-        use futures::stream;
-        // Re-wrap is unnecessary: base_request already has wrapped keys.
-        let req_stream = stream::iter(vec![self.base_request.clone()]).chain(stream::pending());
-        let mut grpc_req = tonic::Request::new(req_stream);
-        grpc_req.metadata_mut().insert(
-            "features",
-            "stream-multiplexing".parse().expect("valid header value"),
-        );
-        let response = self.client.event_feed_v2(grpc_req).await.map_err(|e| {
-            anyhow::anyhow!(
-                "EventFeedV2 reconnect for region {} failed: {}",
-                self.region_id,
-                e
-            )
-        })?;
-        let mut guard = self.stream.lock().await;
-        *guard = Some(response.into_inner());
-        tracing::info!("TiKV CDC: reconnected region {}", self.region_id);
-        Ok(())
-    }
-
-    /// Close the stream (deregister). Dropping the inner `Streaming`
-    /// cancels the gRPC stream.
-    pub async fn close(&self) {
-        let mut guard = self.stream.lock().await;
-        *guard = None;
+    /// Close the stream. Dropping the handle has the same effect: the
+    /// request stream ends (half-close) and the reader task stops, making
+    /// TiKV deregister the downstream.
+    pub fn close(&mut self) {
+        if let Some(end) = self.end_request.take() {
+            let _ = end.send(());
+        }
+        self.events.close();
     }
 }
 
@@ -222,6 +248,7 @@ impl CdcClient {
     }
 
     /// Open an EventFeedV2 stream for one region on `tikv_addr` (host:port).
+    #[allow(clippy::too_many_arguments)] // mirrors the TiKV CDC protocol handshake
     pub async fn open_region_stream(
         &self,
         tikv_addr: &str,
