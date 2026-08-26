@@ -118,6 +118,8 @@ const MAX_BUFFERED_BINLOG_ROWS: usize = 65_536;
 
 /// Number of rows fetched per keyset-paginated snapshot query.
 const SNAPSHOT_BATCH_SIZE: i64 = 500;
+/// Events drained per poll during the timestamp warm-up skip.
+const TIMESTAMP_WARMUP_DRAIN_BUDGET: usize = 2000;
 
 /// Binlog offset for MySQL binlog streaming.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -235,6 +237,28 @@ impl MySqlCdcConfig {
                     "snapshot" | "snapshot-only" => MySqlStartupMode::SnapshotOnly,
                     "earliest" => MySqlStartupMode::Earliest,
                     "latest" => MySqlStartupMode::Latest,
+                    "timestamp" => MySqlStartupMode::Timestamp {
+                        timestamp: config.get_int(
+                            "startup.timestamp",
+                            config.get_int("startup_timestamp", 0),
+                        ),
+                    },
+                    "specific" | "specific-offset" => MySqlStartupMode::Specific {
+                        file: config.get_string("startup.specific.file", ""),
+                        position: config
+                            .get_int(
+                                "startup.specific.pos",
+                                config.get_int("startup.specific.position", 0),
+                            )
+                            .max(0) as u64,
+                        gtid_set: {
+                            let gtid = config.get_string(
+                                "startup.specific.gtid-set",
+                                &config.get_string("startup.specific.gtid_set", ""),
+                            );
+                            if gtid.is_empty() { None } else { Some(gtid) }
+                        },
+                    },
                     _ => MySqlStartupMode::Initial,
                 })
                 .unwrap_or(MySqlStartupMode::Initial),
@@ -519,6 +543,9 @@ pub struct MySqlCdcReader {
     stream_broken: bool,
     /// Schema-evolution watcher fed by binlog query (DDL) events.
     schema_watcher: Option<SchemaWatcher>,
+    /// Timestamp warm-up (milliseconds): discard binlog events older than
+    /// this before starting to emit (startup.mode = timestamp).
+    skip_until_ts_ms: Option<i64>,
     /// Persistent connection pool shared by snapshot batches and metadata
     /// queries (avoids a fresh pool — and TCP churn — per batch).
     pool: Option<Pool>,
@@ -542,6 +569,7 @@ impl MySqlCdcReader {
             table_maps: HashMap::new(),
             stream_broken: false,
             schema_watcher: None,
+            skip_until_ts_ms: None,
             pool: None,
         }
     }
@@ -599,6 +627,12 @@ impl MySqlCdcReader {
         }
         if let Some(gtid) = state.offset.get("gtid_set") {
             self.offset.gtid_set = Some(gtid.clone());
+        }
+        if let Some(ts) = state.offset.get("skip_until_ts") {
+            // Checkpoint taken during the timestamp warm-up: keep skipping.
+            if let Ok(ts) = ts.parse::<i64>() {
+                self.skip_until_ts_ms = Some(ts);
+            }
         }
         if let Some(idx) = state.offset.get("current_idx") {
             self.current_idx.set(idx.parse().unwrap_or(0));
@@ -802,6 +836,26 @@ impl MySqlCdcReader {
     /// Decode one binlog event into the replay buffer, tracking offsets.
     fn absorb_event(&mut self, event: Event) {
         self.offset.position = event.header().log_pos() as u64;
+
+        // Timestamp warm-up: discard events older than the requested start
+        // time; only the offset (and binlog rotation) is tracked.
+        if let Some(ts_ms) = self.skip_until_ts_ms {
+            if i64::from(event.header().timestamp()) * 1000 < ts_ms {
+                tracing::trace!(
+                    "MySQL CDC warm-up: skip event type={:?} ts={} pos={}",
+                    event.header().event_type(),
+                    event.header().timestamp(),
+                    event.header().log_pos()
+                );
+                self.track_rotation(&event);
+                return;
+            }
+            self.skip_until_ts_ms = None;
+            tracing::info!(
+                "MySQL CDC reader: reached startup.timestamp boundary, streaming live events"
+            );
+        }
+
         let data = match event.read_data() {
             Ok(Some(d)) => d,
             _ => return,
@@ -812,7 +866,20 @@ impl MySqlCdcReader {
             }
             EventData::RowsEvent(rows) => self.absorb_rows_event(rows),
             EventData::QueryEvent(qe) => self.observe_query_event(&qe),
+            EventData::RotateEvent(_) => self.track_rotation(&event),
             _ => {}
+        }
+    }
+
+    /// Update the tracked offset across a binlog rotation so checkpoints
+    /// and reconnects stay valid after the server switches files.
+    fn track_rotation(&mut self, event: &Event) {
+        if let Ok(Some(EventData::RotateEvent(re))) = event.read_data() {
+            let name = re.name().to_string();
+            if !name.is_empty() {
+                self.offset.file = name;
+                self.offset.position = re.position();
+            }
         }
     }
 
@@ -1010,6 +1077,11 @@ impl SourceReader for MySqlCdcReader {
                     position,
                     ref gtid_set,
                 } => {
+                    if file.is_empty() {
+                        anyhow::bail!(
+                            "startup.mode=specific requires startup.specific.file"
+                        );
+                    }
                     self.offset.file = file.clone();
                     self.offset.position = position;
                     self.offset.gtid_set = gtid_set.clone();
@@ -1024,12 +1096,55 @@ impl SourceReader for MySqlCdcReader {
                     self.binlog_stream = Some(Box::pin(stream));
                     return Ok(());
                 }
-                MySqlStartupMode::Timestamp { .. } => {
-                    // Timestamp resume requires binlog timestamp scanning;
-                    // fall back to a full snapshot + stream from now.
-                    tracing::warn!(
-                        "MySQL CDC: startup.mode=timestamp not supported yet, using initial"
+                MySqlStartupMode::Timestamp { timestamp } => {
+                    if timestamp <= 0 {
+                        anyhow::bail!(
+                            "startup.mode=timestamp requires startup.timestamp (milliseconds since epoch)"
+                        );
+                    }
+                    self.phase = CdcPhase::Incremental;
+                    self.splits.clear();
+                    self.skip_until_ts_ms = Some(timestamp);
+                    // Start from the earliest retained binlog so changes
+                    // between `timestamp` and now are captured; older
+                    // events are discarded by the warm-up filter. The
+                    // baseline GTID set must go too, or the server would
+                    // jump straight back to "now".
+                    self.offset.gtid_set = None;
+                    self.binlog_stream = None;
+                    self.stream_broken = false;
+                    let pool = self.build_pool();
+                    let mut conn = pool.get_conn().await?;
+                    // SHOW BINARY LOGS yields (name, size, encrypted); take
+                    // the first log's name.
+                    let first_log: Option<String> = match conn
+                        .query_first::<mysql_async::Row, _>("SHOW BINARY LOGS")
+                        .await
+                    {
+                        Ok(row) => row.and_then(|r| r.get::<Option<String>, _>(0).flatten()),
+                        Err(e) => {
+                            tracing::warn!("SHOW BINARY LOGS failed: {}", e);
+                            None
+                        }
+                    };
+                    match first_log {
+                        Some(file) => {
+                            self.offset.file = file;
+                            self.offset.position = 4;
+                        }
+                        None => {
+                            // No binary logs listed (unusual) — fall back
+                            // to the baseline position.
+                        }
+                    }
+                    let stream =
+                        Self::open_binlog_stream(conn, &self.config, &self.offset).await?;
+                    self.binlog_stream = Some(Box::pin(stream));
+                    tracing::info!(
+                        "MySQL CDC reader: timestamp startup — skipping binlog events before {}",
+                        timestamp
                     );
+                    return Ok(());
                 }
                 MySqlStartupMode::SnapshotOnly | MySqlStartupMode::Initial => {}
             }
@@ -1161,6 +1276,9 @@ impl SourceReader for MySqlCdcReader {
                 offset.insert("split_last_pk".to_string(), json);
             }
         }
+        if let Some(ts) = self.skip_until_ts_ms {
+            offset.insert("skip_until_ts".to_string(), ts.to_string());
+        }
         let ranges: Vec<(String, String)> = self
             .splits
             .iter()
@@ -1224,7 +1342,31 @@ impl MySqlCdcReader {
             }
         }
 
-        // 3. Read one event (bounded block) and try again.
+        // 3a. Timestamp warm-up: drain historical events in a tight loop
+        // (a per-poll single event would crawl through hundreds of stale
+        // entries before reaching the requested start time).
+        if self.skip_until_ts_ms.is_some() {
+            for _ in 0..TIMESTAMP_WARMUP_DRAIN_BUDGET {
+                match self.next_binlog_event_with_timeout(50).await {
+                    Ok(Some(())) => {
+                        if self.skip_until_ts_ms.is_none() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                tracing::trace!("MySQL CDC warm-up: idle at tail (no event within budget)");
+                break;
+            }
+            Err(e) => return Err(e),
+                }
+            }
+            if let Some(row) = self.next_buffered_change() {
+                return Ok(PollResult::Record(MySqlCdcOutput(row)));
+            }
+            return Ok(PollResult::Empty);
+        }
+
+        // 3b. Read one event (bounded block) and try again.
         self.next_binlog_event_with_timeout(250).await?;
         if let Some(row) = self.next_buffered_change() {
             return Ok(PollResult::Record(MySqlCdcOutput(row)));
@@ -1482,6 +1624,39 @@ mod tests {
             subtask_count: 1,
             schema_evolution: SchemaEvolutionConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_mysql_startup_mode_parsing() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let props: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            MySqlCdcConfig::from_config(&ConnectorConfig::new(props)).startup_mode
+        };
+        assert_eq!(
+            mk(&[
+                ("startup.mode", "timestamp"),
+                ("startup.timestamp", "1667232000000"),
+            ]),
+            MySqlStartupMode::Timestamp {
+                timestamp: 1_667_232_000_000
+            }
+        );
+        assert_eq!(
+            mk(&[
+                ("startup.mode", "specific"),
+                ("startup.specific.file", "binlog.000003"),
+                ("startup.specific.pos", "987"),
+                ("startup.specific.gtid-set", "aaa:1-5"),
+            ]),
+            MySqlStartupMode::Specific {
+                file: "binlog.000003".to_string(),
+                position: 987,
+                gtid_set: Some("aaa:1-5".to_string()),
+            }
+        );
     }
 
     #[test]

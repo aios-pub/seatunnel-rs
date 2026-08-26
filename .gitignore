@@ -29,3 +29,4 @@ examples/**/*.toml.backup
 .seatunnel-state/
 /.zcode/
 /CLAUDE.md
+book/

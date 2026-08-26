@@ -147,6 +147,14 @@ impl TiDBCdcConnConfig {
 )]
 pub struct ResolvedTs(pub u64);
 
+/// Convert wall-clock milliseconds into an approximate TSO start point
+/// (`physical_ms << 18 | logical`). TiDB encodes timestamps this way, so a
+/// wall-clock start time maps directly onto the MVCC scan range; the value
+/// must still be inside the GC lifetime or TiKV rejects the request.
+pub fn tso_from_millis(millis: u64) -> u64 {
+    millis << 18
+}
+
 impl ResolvedTs {
     pub fn new(ts: u64) -> Self {
         ResolvedTs(ts)
@@ -168,6 +176,8 @@ pub struct TiDBCdcConfig {
     /// Split key column for snapshot chunking (defaults to the integer PK).
     pub split_column: String,
     pub startup_mode: String,
+    /// Wall-clock start time (ms) for startup.mode = timestamp.
+    pub startup_timestamp_ms: u64,
     pub parallelism: usize,
     /// This reader's subtask index / total count — snapshot ranges are
     /// partitioned so each subtask scans a disjoint interval.
@@ -197,6 +207,7 @@ impl Default for TiDBCdcConfig {
             table_name: "users".to_string(),
             split_column: "id".to_string(),
             startup_mode: "initial".to_string(),
+            startup_timestamp_ms: 0,
             parallelism: 4,
             subtask_index: 0,
             subtask_count: 1,
@@ -232,6 +243,7 @@ impl TiDBCdcConfig {
             table_name: config.get_string("table-name", "users"),
             split_column: config.get_string("split.column", "id"),
             startup_mode: config.get_string("startup.mode", "initial"),
+            startup_timestamp_ms: config.get_int("startup.timestamp", 0).max(0) as u64,
             parallelism: config.get_int("parallelism", 4) as usize,
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
@@ -777,6 +789,24 @@ impl SourceReader for TiDBCdcReader {
                             self.config.startup_mode
                         );
                     }
+                    "timestamp" => {
+                        if self.config.startup_timestamp_ms == 0 {
+                            anyhow::bail!(
+                                "startup.mode=timestamp requires startup.timestamp (milliseconds since epoch)"
+                            );
+                        }
+                        let tso = tso_from_millis(self.config.startup_timestamp_ms);
+                        // TiKV MVCC scans from checkpoint_ts; anything older
+                        // must still be inside the GC lifetime.
+                        self.resolved_ts = ResolvedTs(tso);
+                        self.phase = CdcPhase::Incremental;
+                        self.pending_ranges.clear();
+                        tracing::info!(
+                            "TiDB CDC reader: timestamp startup — checkpoint_ts={} (from {} ms)",
+                            tso,
+                            self.config.startup_timestamp_ms
+                        );
+                    }
                     _ => {}
                 }
             } else {
@@ -1109,6 +1139,14 @@ mod tests {
 
     fn cmp_i64(v: i64) -> [u8; 8] {
         (v as u64 ^ (1 << 63)).to_be_bytes()
+    }
+
+    #[test]
+    fn test_tso_from_millis() {
+        // TSO = physical(ms) << 18 | logical; zero logical is a valid floor.
+        assert_eq!(tso_from_millis(0), 0);
+        assert_eq!(tso_from_millis(1), 1 << 18);
+        assert_eq!(tso_from_millis(1_667_232_000), 1_667_232_000u64 << 18);
     }
 
     #[test]

@@ -1,0 +1,12 @@
+[book]
+title = "SeaTunnel-RS"
+description = "Rust implementation of Apache SeaTunnel — connectors, CDC and distributed execution engine"
+src = "docs/en"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/aios-pub/seatunnel-rs"
+edit-url-template = "https://github.com/aios-pub/seatunnel-rs/edit/main/docs/en/{path}"
+
+[output.html.search]
+enable = true
