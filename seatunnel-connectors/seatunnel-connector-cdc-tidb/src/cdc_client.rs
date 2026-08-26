@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
+
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 use tonic::Streaming;
@@ -63,6 +65,7 @@ impl RegionCdcStream {
     }
 
     /// Create a stream handle and immediately open the EventFeedV2 stream.
+    #[allow(clippy::too_many_arguments)] // mirrors the TiKV CDC protocol handshake
     pub async fn connect(
         channel: Channel,
         region_id: u64,
@@ -82,16 +85,20 @@ impl RegionCdcStream {
             request_id,
             cluster_id,
         );
-        // EventFeedV2 is a bidi stream: wrap the single ChangeDataRequest
-        // into a one-shot stream that satisfies IntoStreamingRequest<Message = ChangeDataRequest>.
+        // EventFeedV2 is a bidi stream. The registration request goes first,
+        // then the send side must STAY OPEN — closing it makes TiKV cancel
+        // the whole stream (the server treats client EOF as disconnect).
         use futures::stream;
-        let req_stream = stream::iter(vec![request.clone()]);
+        let req_stream = stream::iter(vec![request.clone()]).chain(stream::pending());
         let mut client = ChangeDataClient::new(channel);
         let response = client
             .event_feed_v2(req_stream)
             .await
             .map_err(|e| anyhow::anyhow!("EventFeedV2 for region {} failed: {}", region_id, e))?;
-        tracing::info!("TiKV CDC: EventFeedV2 stream opened for region {}", region_id);
+        tracing::info!(
+            "TiKV CDC: EventFeedV2 stream opened for region {}",
+            region_id
+        );
         Ok(RegionCdcStream {
             region_id,
             request_id,
@@ -105,6 +112,7 @@ impl RegionCdcStream {
     ///
     /// Returns `None` when the stream is exhausted or closed.
     pub async fn next_event(&self) -> anyhow::Result<Option<ChangeDataEvent>> {
+        tracing::trace!("TiKV CDC: next_event awaiting region {}", self.region_id);
         let mut guard = self.stream.lock().await;
         let stream = match guard.as_mut() {
             Some(s) => s,
@@ -112,7 +120,10 @@ impl RegionCdcStream {
         };
         // `message()` yields individual framed messages.
         match stream.message().await {
-            Ok(Some(event)) => Ok(Some(event)),
+            Ok(Some(event)) => {
+                tracing::trace!("TiKV CDC: region {} got message", self.region_id);
+                Ok(Some(event))
+            }
             Ok(None) => {
                 tracing::warn!("TiKV CDC: stream closed for region {}", self.region_id);
                 *guard = None;
@@ -133,18 +144,14 @@ impl RegionCdcStream {
     /// Re-establish the stream using the stored request (used on retry).
     pub async fn reconnect(&mut self) -> anyhow::Result<()> {
         use futures::stream;
-        let req_stream = stream::iter(vec![self.base_request.clone()]);
-        let response = self
-            .client
-            .event_feed_v2(req_stream)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "EventFeedV2 reconnect for region {} failed: {}",
-                    self.region_id,
-                    e
-                )
-            })?;
+        let req_stream = stream::iter(vec![self.base_request.clone()]).chain(stream::pending());
+        let response = self.client.event_feed_v2(req_stream).await.map_err(|e| {
+            anyhow::anyhow!(
+                "EventFeedV2 reconnect for region {} failed: {}",
+                self.region_id,
+                e
+            )
+        })?;
         let mut guard = self.stream.lock().await;
         *guard = Some(response.into_inner());
         tracing::info!("TiKV CDC: reconnected region {}", self.region_id);
@@ -166,11 +173,32 @@ impl RegionCdcStream {
 pub struct CdcClient {
     /// Cluster id for request headers.
     cluster_id: u64,
+    /// Base for per-stream request ids. TiKV keys subscriptions by
+    /// `(region_id, request_id)` — a duplicate id from another client would
+    /// silently REPLACE this subscription, so ids must be unique.
+    request_id_base: u64,
 }
 
 impl CdcClient {
     pub fn new(cluster_id: u64) -> Self {
-        CdcClient { cluster_id }
+        // Derive a per-process random-ish base so concurrent clients never
+        // collide on the same (region, request_id) subscription.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+            .unwrap_or(0);
+        let base = (nanos << 12) ^ (std::process::id() as u64) | 1;
+        CdcClient {
+            cluster_id,
+            request_id_base: base,
+        }
+    }
+
+    fn next_request_id(&self) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        self.request_id_base
+            .wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Open an EventFeedV2 stream for one region on `tikv_addr` (host:port).
@@ -195,7 +223,7 @@ impl CdcClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to TiKV {}: {}", tikv_addr, e))?;
 
-        let request_id = region_id.wrapping_mul(1000).wrapping_add(1);
+        let request_id = self.next_request_id();
         RegionCdcStream::connect(
             channel,
             region_id,

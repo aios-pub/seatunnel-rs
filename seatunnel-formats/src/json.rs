@@ -1,5 +1,5 @@
 use seatunnel_api::{Row, TableSchema};
-use serde_json::{Value};
+use serde_json::Value;
 use std::error::Error;
 
 pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
@@ -23,18 +23,29 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
 }
 
 fn json_to_field(value: Option<&Value>) -> Result<seatunnel_api::Field, Box<dyn Error>> {
-    let value = match value { Some(v) => v, None => return Ok(seatunnel_api::Field::Null) };
+    let value = match value {
+        Some(v) => v,
+        None => return Ok(seatunnel_api::Field::Null),
+    };
     match value {
         Value::Bool(b) => Ok(seatunnel_api::Field::Bool(*b)),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() { Ok(seatunnel_api::Field::Int64(i)) }
-            else if let Some(u) = n.as_u64() { Ok(seatunnel_api::Field::UInt64(u)) }
-            else if let Some(f) = n.as_f64() { Ok(seatunnel_api::Field::Float64(f)) }
-            else { Ok(seatunnel_api::Field::Null) }
+            if let Some(i) = n.as_i64() {
+                Ok(seatunnel_api::Field::Int64(i))
+            } else if let Some(u) = n.as_u64() {
+                Ok(seatunnel_api::Field::UInt64(u))
+            } else if let Some(f) = n.as_f64() {
+                Ok(seatunnel_api::Field::Float64(f))
+            } else {
+                Ok(seatunnel_api::Field::Null)
+            }
         }
         Value::String(s) => Ok(seatunnel_api::Field::String(s.clone())),
         Value::Array(arr) => {
-            let fields: Vec<seatunnel_api::Field> = arr.iter().map(|v| json_to_field(Some(v))).collect::<Result<_,_>>()?;
+            let fields: Vec<seatunnel_api::Field> = arr
+                .iter()
+                .map(|v| json_to_field(Some(v)))
+                .collect::<Result<_, _>>()?;
             Ok(seatunnel_api::Field::Array(fields))
         }
         Value::Object(_) => Ok(seatunnel_api::Field::Json(value.clone())),
@@ -49,7 +60,9 @@ fn field_to_json(field: &seatunnel_api::Field) -> Result<Value, Box<dyn Error>> 
         seatunnel_api::Field::Int32(v) => Ok(Value::Number((*v as i64).into())),
         seatunnel_api::Field::Int64(v) => Ok(Value::Number((*v).into())),
         seatunnel_api::Field::UInt64(v) => Ok(Value::Number((*v).into())),
-        seatunnel_api::Field::Float64(v) => Ok(serde_json::Number::from_f64(*v).map(Value::Number).unwrap_or(Value::Null)),
+        seatunnel_api::Field::Float64(v) => Ok(serde_json::Number::from_f64(*v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)),
         seatunnel_api::Field::String(s) => Ok(Value::String(s.clone())),
         seatunnel_api::Field::Bytes(b) => Ok(Value::String(hex::encode(b))),
         seatunnel_api::Field::Json(v) => Ok(v.clone()),
@@ -58,7 +71,7 @@ fn field_to_json(field: &seatunnel_api::Field) -> Result<Value, Box<dyn Error>> 
         seatunnel_api::Field::DateTime(dt) => Ok(Value::String(dt.to_string())),
         seatunnel_api::Field::TimestampTz(ts) => Ok(Value::String(ts.to_rfc3339())),
         seatunnel_api::Field::Array(arr) => {
-            let vals: Vec<Value> = arr.iter().map(field_to_json).collect::<Result<_,_>>()?;
+            let vals: Vec<Value> = arr.iter().map(field_to_json).collect::<Result<_, _>>()?;
             Ok(Value::Array(vals))
         }
         _ => Ok(Value::String(format!("{}", field))),
@@ -70,20 +83,25 @@ mod tests {
     use super::*;
     use seatunnel_api::{ColumnDef, ColumnType};
     fn make_schema() -> TableSchema {
-        TableSchema::new("t", vec![
-            ColumnDef::new("id".to_string(), ColumnType::Int64),
-            ColumnDef::new("name".to_string(), ColumnType::String),
-            ColumnDef::new("active".to_string(), ColumnType::Bool),
-        ])
+        TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("id".to_string(), ColumnType::Int64),
+                ColumnDef::new("name".to_string(), ColumnType::String),
+                ColumnDef::new("active".to_string(), ColumnType::Bool),
+            ],
+        )
     }
     #[test]
     fn test_json_deserialize() {
         let schema = make_schema();
-        let rows = deserialize(b"{\"id\":42,\"name\":\"hello\",\"active\":true}", &schema)
-.unwrap();
+        let rows = deserialize(b"{\"id\":42,\"name\":\"hello\",\"active\":true}", &schema).unwrap();
         let row = &rows[0];
         assert_eq!(*row.get(0), seatunnel_api::Field::Int64(42));
-        assert_eq!(*row.get(1), seatunnel_api::Field::String("hello".to_string()));
+        assert_eq!(
+            *row.get(1),
+            seatunnel_api::Field::String("hello".to_string())
+        );
         assert_eq!(*row.get(2), seatunnel_api::Field::Bool(true));
     }
     #[test]
@@ -93,11 +111,9 @@ mod tests {
         row.set(0, seatunnel_api::Field::Int64(99));
         row.set(1, seatunnel_api::Field::String("world".to_string()));
         row.set(2, seatunnel_api::Field::Bool(false));
-        let bytes = serialize(&schema, &row)
-.unwrap();
+        let bytes = serialize(&schema, &row).unwrap();
 
-        let value: Value = serde_json::from_slice(&bytes)
-.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(value["id"].as_i64(), Some(99));
         assert_eq!(value["name"].as_str(), Some("world"));

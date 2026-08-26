@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use seatunnel_engine_client::EngineClient;
@@ -38,7 +38,7 @@ pub enum Commands {
         #[arg(short, long, default_value = "local")]
         mode: String,
         /// Cluster master address (cluster mode)
-        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
         /// Parallelism override
         #[arg(long)]
@@ -55,7 +55,7 @@ pub enum Commands {
     /// Show cluster information
     Cluster {
         /// Cluster master address
-        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
     },
 }
@@ -66,7 +66,7 @@ pub enum JobCommand {
     Submit {
         #[arg(short, long)]
         config: PathBuf,
-        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
         /// Explicit job name (defaults to env.job.name or the file stem)
         #[arg(long)]
@@ -80,21 +80,21 @@ pub enum JobCommand {
     },
     /// List all jobs
     List {
-        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
     },
     /// Show detailed status of one job
     Status {
         #[arg(short, long)]
         job_id: String,
-        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
     },
     /// Cancel a running job
     Cancel {
         #[arg(short, long)]
         job_id: String,
-        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
     },
 }
@@ -102,7 +102,13 @@ pub enum JobCommand {
 /// Parse and execute CLI commands.
 pub async fn execute(cli: Cli) -> Result<()> {
     match cli.command {
-        Some(Commands::Run { config, mode, address, parallelism, watch }) => {
+        Some(Commands::Run {
+            config,
+            mode,
+            address,
+            parallelism,
+            watch,
+        }) => {
             if mode == "local" {
                 run_local(config, parallelism).await?;
             } else if mode == "cluster" {
@@ -116,7 +122,13 @@ pub async fn execute(cli: Cli) -> Result<()> {
             }
         }
         Some(Commands::Job { command }) => match command {
-            JobCommand::Submit { config, address, name, parallelism, watch } => {
+            JobCommand::Submit {
+                config,
+                address,
+                name,
+                parallelism,
+                watch,
+            } => {
                 let job_id = submit_config(&config, &address, name.as_deref(), parallelism).await?;
                 println!("Submitted job {}", job_id);
                 if watch {
@@ -179,15 +191,12 @@ async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) ->
 
     let mut handles = Vec::new();
     for subtask in 0..parallelism {
-        let reader = create_source(
-            &source_plugin,
-            &json_to_config_map(source_cfg),
-            parallelism,
-            None,
-        )
-        .with_context(|| format!("creating source '{}'", source_plugin))?;
-        let transforms =
-            create_transforms(&transforms_cfg).context("creating transforms")?;
+        let mut source_map = json_to_config_map(source_cfg);
+        source_map.insert("subtask.index".into(), subtask.to_string());
+        source_map.insert("subtask.count".into(), parallelism.to_string());
+        let reader = create_source(&source_plugin, &source_map, parallelism, None)
+            .with_context(|| format!("creating source '{}'", source_plugin))?;
+        let transforms = create_transforms(&transforms_cfg).context("creating transforms")?;
         let writer = create_sink(&sink_plugin, &json_to_config_map(sink_cfg))
             .with_context(|| format!("creating sink '{}'", sink_plugin))?;
 
@@ -206,16 +215,13 @@ async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) ->
 
     let mut failures = Vec::new();
     for handle in handles {
-        match handle.await.context("task panicked")?? {
-            status => {
-                println!(
-                    "Task {} finished: {:?} records={}",
-                    status.task_id, status.state, status.processed_records
-                );
-                if let Some(err) = &status.error {
-                    failures.push(err.clone());
-                }
-            }
+        let status = handle.await.context("task panicked")??;
+        println!(
+            "Task {} finished: {:?} records={}",
+            status.task_id, status.state, status.processed_records
+        );
+        if let Some(err) = &status.error {
+            failures.push(err.clone());
         }
     }
     if !failures.is_empty() {
@@ -244,7 +250,7 @@ pub fn load_json_config(path: &PathBuf) -> Result<serde_json::Value> {
     parse_config_string(&contents, detect_format(path))
 }
 
-fn detect_format(path: &PathBuf) -> ConfigFormat {
+fn detect_format(path: &Path) -> ConfigFormat {
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => ConfigFormat::TOML,
         Some("conf") | Some("hocon") => ConfigFormat::HOCON,
@@ -253,6 +259,7 @@ fn detect_format(path: &PathBuf) -> ConfigFormat {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::upper_case_acronyms)]
 enum ConfigFormat {
     YAML,
     TOML,
@@ -306,7 +313,10 @@ fn transform_list(config: &serde_json::Value) -> Vec<serde_json::Value> {
             .map(|(name, cfg)| match cfg {
                 serde_json::Value::Object(inner) => {
                     let mut full = inner.clone();
-                    full.insert("plugin_name".into(), serde_json::Value::String(name.clone()));
+                    full.insert(
+                        "plugin_name".into(),
+                        serde_json::Value::String(name.clone()),
+                    );
                     serde_json::Value::Object(full)
                 }
                 other => serde_json::json!({ "plugin_name": name, "config": other }),
@@ -382,7 +392,7 @@ async fn watch_job(address: &str, job_id: &str) -> Result<()> {
                     records,
                     status.tasks.len()
                 );
-                if matches!(status.state, 4 | 5 | 6) {
+                if matches!(status.state, 4..=6) {
                     if !status.error_message.is_empty() {
                         bail!("job failed: {}", status.error_message);
                     }
@@ -396,8 +406,11 @@ async fn watch_job(address: &str, job_id: &str) -> Result<()> {
 
 async fn list_jobs(address: &str) -> Result<()> {
     let client = EngineClient::new(address);
-    let jobs = client.list_jobs().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-    println!("{:<40} {:<28} {:<12} {}", "JOB_ID", "NAME", "STATE", "STARTED");
+    let jobs = client
+        .list_jobs()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    println!("{:<40} {:<28} {:<12} STARTED", "JOB_ID", "NAME", "STATE");
     for j in jobs.jobs {
         println!(
             "{:<40} {:<28} {:<12} {}",
@@ -442,19 +455,28 @@ async fn show_status(address: &str, job_id: &str) -> Result<()> {
 
 async fn cancel_job(address: &str, job_id: &str) -> Result<()> {
     let client = EngineClient::new(address);
-    client.cancel_job(job_id).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    client
+        .cancel_job(job_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("Cancel request sent for job {}", job_id);
     Ok(())
 }
 
 async fn print_cluster_info(address: &str) -> Result<()> {
     let client = EngineClient::new(address);
-    let info = client.get_cluster_info().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    let info = client
+        .get_cluster_info()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("Cluster leader   : {}", info.leader_id);
     println!("Workers          : {}", info.available_workers);
     println!("Total tasks      : {}", info.total_tasks);
     for w in info.workers {
-        println!("  ● {} @ {} (last hb {})", w.worker_id, w.address, w.last_heartbeat);
+        println!(
+            "  ● {} @ {} (last hb {})",
+            w.worker_id, w.address, w.last_heartbeat
+        );
     }
     Ok(())
 }
@@ -467,9 +489,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse() {
-        let cli = Cli::parse_from([
-            "seatunnel", "run", "-c", "config.yaml", "-m", "local",
-        ]);
+        let cli = Cli::parse_from(["seatunnel", "run", "-c", "config.yaml", "-m", "local"]);
         assert!(matches!(cli.command, Some(Commands::Run { .. })));
     }
 
@@ -514,8 +534,13 @@ sink:
 
     #[tokio::test]
     async fn test_submit_rejects_when_master_unreachable() {
-        let result =
-            submit_config(&PathBuf::from("/tmp/nonexistent.yaml"), "127.0.0.1:1", None, None).await;
+        let result = submit_config(
+            &PathBuf::from("/tmp/nonexistent.yaml"),
+            "127.0.0.1:1",
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_err());
     }
 }

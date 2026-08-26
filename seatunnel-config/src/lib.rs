@@ -7,11 +7,8 @@
 //!
 //! Supports YAML, TOML, and HOCON formats.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-
-use serde_json::Value;
 
 pub mod hocon;
 pub mod job_config;
@@ -44,7 +41,10 @@ fn detect_format(path: &Path) -> ConfigFormat {
 }
 
 /// Load a config string with the given format.
-pub fn load_config_from_str(content: &str, format: ConfigFormat) -> Result<JobConfig, Box<dyn Error>> {
+pub fn load_config_from_str(
+    content: &str,
+    format: ConfigFormat,
+) -> Result<JobConfig, Box<dyn Error>> {
     let parsed = parse_config_file(content, format)?;
     JobConfig::from_parsed(parsed)
 }

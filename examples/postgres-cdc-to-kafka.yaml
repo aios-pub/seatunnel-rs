@@ -1,0 +1,34 @@
+# PostgreSQL CDC → Kafka real-time sync job.
+#
+# The connector auto-creates the publication (and the replication slot when
+# `auto-create-slot` is true, the default) on first run.
+#
+# Submit:
+#   seatunnel job submit -c examples/postgres-cdc-to-kafka.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: postgres-cdc-to-kafka
+  parallelism: 2
+  checkpoint.interval: 5000
+
+source:
+  Postgres-CDC:
+    hostname: "127.0.0.1"
+    port: 15432
+    username: postgres
+    password: postgres
+    database-name: seatunnel
+    schema-name: public
+    table-name: users
+    split.column: id
+    publication-name: seatunnel_pg_pub
+    slot-name: seatunnel_pg_slot
+    # initial = full snapshot then stream; latest = stream only
+    startup.mode: initial
+
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    topic: pg-users-cdc
+    format: json
+    acks: all

@@ -61,5 +61,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Start infrastructure (Kafka + MySQL)
+        run: docker compose up -d kafka mysql
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 60); do
+            docker exec seatunnel-rs-mysql-1 mysqladmin ping -uroot -proot && \
+            docker exec seatunnel-rs-kafka-1 kafka-broker-api-versions --bootstrap-server localhost:9092 && break
+            sleep 2
+          done
       - name: Run E2E tests
-        run: cargo test --test e2e --all
+        run: cargo test -p seatunnel-e2e --test e2e -- --nocapture

@@ -11,6 +11,7 @@ seatunnel-engine-core = { path = "../seatunnel-engine-core" }
 seatunnel-engine-comm = { path = "../seatunnel-engine-comm" }
 tokio = { workspace = true }
 tonic = { workspace = true }
+tokio-stream = "0.1"
 axum = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -21,11 +22,14 @@ prometheus = { workspace = true, optional = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
 seatunnel-api = { path = "../../seatunnel-api" }
 async-trait = { workspace = true }
 
 pin-project = "1"
+uuid = { workspace = true }
+seatunnel-engine-client = { path = "../seatunnel-engine-client" }
 seatunnel-connector-cdc-mysql = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-mysql", optional = true }
 seatunnel-connector-cdc-postgres = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-postgres", optional = true }
 seatunnel-connector-cdc-tidb = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-tidb", optional = true }

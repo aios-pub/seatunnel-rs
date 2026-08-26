@@ -37,11 +37,14 @@
 //!        └─ then follow the live binlog stream forever
 //! ```
 //!
-//! Delivery guarantees: **at-least-once**. The snapshot→binlog overlap window
-//! deduplicates inserts by primary key; updates/deletes are always replayed.
-//! Checkpoint state serializes phase, binlog file/position/GTID, split
-//! progress and the snapshot high-watermark so a restarted task resumes
-//! exactly where it stopped.
+//! Delivery guarantees: **at-least-once**. With `parallelism > 1`, snapshot
+//! ranges are partitioned across subtasks while exactly one designated
+//! subtask (index 0) streams the binlog from its pre-snapshot baseline —
+//! changes committed during the snapshot window are replayed on top of the
+//! snapshot, so nothing is lost; a bounded number of duplicates inside the
+//! overlap window is possible and expected. Checkpoint state serializes
+//! phase, binlog file/position/GTID, split progress and the snapshot
+//! high-watermark so a restarted task resumes where it stopped.
 //!
 //! ## Requirements
 //! - MySQL 5.7+/8.0+, `binlog_format=ROW`, `binlog_row_image=FULL`
@@ -51,17 +54,13 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use mysql_async::{
-    prelude:: *,
-    binlog::events::{
-        DeleteRowsEvent, Event, EventData, RowsEventData, TableMapEvent, UpdateRowsEvent,
-        WriteRowsEvent,
-    },
+    binlog::events::{Event, EventData, RowsEventData, TableMapEvent},
     binlog::row::BinlogRow,
+    prelude::*,
     BinlogStream, BinlogStreamRequest, OptsBuilder, Pool, Row, Value,
 };
-use serde::{Deserialize, Serialize};
 use seatunnel_api::{
     row::{Field, Row as SeatunnelRow, RowKind},
     schema::TableSchema,
@@ -69,13 +68,14 @@ use seatunnel_api::{
         source_reader::{PollResult, SourceReader, SourceReaderContext},
         source_split::SourceSplit,
         source_split_enum::SourceSplitEnumeratorContext,
-        Source, Boundedness,
+        Boundedness, Source,
     },
 };
 use seatunnel_connector_cdc_base::{
     CdcConfig, CdcPhase, CdcSource, CdcState, IncrementalSplit, SnapshotSplit, Watermark,
 };
 use seatunnel_connector_common::ConnectorConfig;
+use serde::{Deserialize, Serialize};
 
 /// Output row from MySQL CDC.
 #[derive(Debug, Clone)]
@@ -119,7 +119,7 @@ const MAX_BUFFERED_BINLOG_ROWS: usize = 65_536;
 const SNAPSHOT_BATCH_SIZE: i64 = 500;
 
 /// Binlog offset for MySQL binlog streaming.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BinlogOffset {
     pub file: String,
     pub position: u64,
@@ -151,20 +151,11 @@ impl BinlogOffset {
     }
 }
 
-impl Default for BinlogOffset {
-    fn default() -> Self {
-        BinlogOffset {
-            file: String::new(),
-            position: 0,
-            gtid_set: None,
-        }
-    }
-}
-
 /// MySQL CDC startup mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MySqlStartupMode {
     /// Full snapshot followed by streaming (default).
+    #[default]
     Initial,
     /// Snapshot only, stop after the snapshot completes.
     SnapshotOnly,
@@ -172,14 +163,14 @@ pub enum MySqlStartupMode {
     Earliest,
     /// Skip the snapshot; stream from "now".
     Latest,
-    Timestamp { timestamp: i64 },
-    Specific { file: String, position: u64, gtid_set: Option<String> },
-}
-
-impl Default for MySqlStartupMode {
-    fn default() -> Self {
-        MySqlStartupMode::Initial
-    }
+    Timestamp {
+        timestamp: i64,
+    },
+    Specific {
+        file: String,
+        position: u64,
+        gtid_set: Option<String>,
+    },
 }
 
 /// MySQL CDC configuration.
@@ -197,6 +188,10 @@ pub struct MySqlCdcConfig {
     pub server_id: u32,
     /// Split key column (defaults to `id`).
     pub split_column: String,
+    /// This reader's subtask index / total subtask count — snapshot ranges
+    /// are partitioned so each subtask scans a disjoint id interval.
+    pub subtask_index: usize,
+    pub subtask_count: usize,
 }
 
 impl Default for MySqlCdcConfig {
@@ -213,6 +208,8 @@ impl Default for MySqlCdcConfig {
             server_timezone: "+00:00".to_string(),
             server_id: 0,
             split_column: "id".to_string(),
+            subtask_index: 0,
+            subtask_count: 1,
         }
     }
 }
@@ -240,17 +237,33 @@ impl MySqlCdcConfig {
             server_timezone: config.get_string("server-timezone", "+00:00"),
             server_id: config.get_int("server-id", 0) as u32,
             split_column: config.get_string("split.column", "id"),
+            subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
+            subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
         }
     }
 
-    /// Effective pseudo-random replication server id derived from the port
-    /// when none was configured, avoiding collisions between local readers.
+    /// Effective replication pseudo-server id, unique per dump connection.
+    ///
+    /// MySQL rejects a second replica that reuses a live server_id, so the
+    /// value mixes process, port and a monotonically increasing counter —
+    /// distinct across parallel readers *and* across reconnects.
     fn effective_server_id(&self) -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
         if self.server_id != 0 {
             return self.server_id;
         }
-        let pid = std::process::id();
-        ((self.port as u32) << 12) | (pid & 0x0FFF) | 0x7000_0000
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mixed = (self.port as u32).wrapping_mul(0x9E37_79B9)
+            ^ (std::process::id())
+            ^ n.wrapping_mul(0x85EB_CA6B)
+            ^ nanos;
+        // Keep well clear of typical server ids (0/1) and of the sign bit.
+        (mixed % 0x0FFF_FFF0) + 0x1000
     }
 
     /// Extract the bare table name from a possibly `db.table` qualified value.
@@ -292,7 +305,11 @@ impl MySqlCdcSource {
             &config.database_name,
             &config.table_name,
         );
-        MySqlCdcSource { config, cdc_config, schema }
+        MySqlCdcSource {
+            config,
+            cdc_config,
+            schema,
+        }
     }
 
     pub fn from_config(config: &ConnectorConfig, schema: Option<TableSchema>) -> Self {
@@ -334,9 +351,8 @@ impl Source for MySqlCdcSource {
         context: &SourceSplitEnumeratorContext<Self::Split>,
     ) -> anyhow::Result<Vec<Self::Split>> {
         let pool = self.build_pool();
-        let splits = tokio_block_on(async {
-            enumerate_snapshot_splits(&pool, &self.config).await
-        })?;
+        let splits =
+            tokio_block_on(async { enumerate_snapshot_splits(&pool, &self.config).await })?;
         let _ = context.parallelism;
         Ok(splits.into_iter().map(MySqlCdcSplit::Snapshot).collect())
     }
@@ -373,11 +389,17 @@ impl Source for MySqlCdcSource {
 /// Enumerate snapshot splits from the live table: `[MIN(id), MAX(id))`
 /// divided into `parallelism` chunks. Fails loudly when the table cannot be
 /// read — silently guessing ranges would produce wrong data.
-async fn enumerate_snapshot_splits(pool: &Pool, config: &MySqlCdcConfig) -> anyhow::Result<Vec<SnapshotSplit>> {
+async fn enumerate_snapshot_splits(
+    pool: &Pool,
+    config: &MySqlCdcConfig,
+) -> anyhow::Result<Vec<SnapshotSplit>> {
     let mut conn = pool.get_conn().await.map_err(|e| {
         anyhow::anyhow!(
             "MySQL CDC cannot connect to {}:{} as {}: {}",
-            config.hostname, config.port, config.username, e
+            config.hostname,
+            config.port,
+            config.username,
+            e
         )
     })?;
     let table_ref = format!("`{}`.`{}`", config.database_name, config.table_name);
@@ -389,10 +411,8 @@ async fn enumerate_snapshot_splits(pool: &Pool, config: &MySqlCdcConfig) -> anyh
         ))
         .await?;
 
-    let (Some(min_id), Some(max_id)) = (
-        min_max.and_then(|(a, _)| a),
-        min_max.and_then(|(_, b)| b),
-    ) else {
+    let (Some(min_id), Some(max_id)) = (min_max.and_then(|(a, _)| a), min_max.and_then(|(_, b)| b))
+    else {
         tracing::info!(
             "MySQL CDC: table {} is empty; a single empty snapshot split is created",
             table_ref
@@ -406,13 +426,32 @@ async fn enumerate_snapshot_splits(pool: &Pool, config: &MySqlCdcConfig) -> anyh
         )]);
     };
 
-    let parallelism = config.parallelism.max(1);
+    let parallelism = config.subtask_count.max(1);
     let span = (max_id - min_id + 1).max(1);
-    let chunk = ((span as i64) + (parallelism as i64) - 1) / (parallelism as i64);
-    let mut splits = Vec::with_capacity(parallelism);
-    let mut cursor = min_id;
-    while cursor <= max_id {
-        let end = cursor.saturating_add(chunk);
+    let chunk = (span + (parallelism as i64) - 1) / (parallelism as i64);
+    // Each subtask scans a disjoint interval of the id space so parallel
+    // readers never duplicate snapshot rows.
+    let idx = (config.subtask_index.min(parallelism - 1)) as i64;
+    let range_start = min_id + idx * chunk;
+    let range_end = range_start.saturating_add(chunk).min(max_id + 1);
+    if range_start > max_id {
+        tracing::info!(
+            "MySQL CDC: subtask {}/{} has an empty snapshot range",
+            config.subtask_index,
+            parallelism
+        );
+        return Ok(vec![SnapshotSplit::new(
+            &config.database_name,
+            &config.table_name,
+            &config.split_column,
+            "0",
+            "1",
+        )]);
+    }
+    let mut splits = Vec::new();
+    let mut cursor = range_start;
+    while cursor < range_end {
+        let end = cursor.saturating_add(chunk).min(range_end);
         splits.push(SnapshotSplit::new(
             &config.database_name,
             &config.table_name,
@@ -423,11 +462,13 @@ async fn enumerate_snapshot_splits(pool: &Pool, config: &MySqlCdcConfig) -> anyh
         cursor = end;
     }
     tracing::info!(
-        "MySQL CDC: enumerated {} snapshot splits for {} covering ids [{}, {}]",
+        "MySQL CDC: subtask {}/{} enumerated {} split(s) for {} covering ids [{}, {})",
+        config.subtask_index,
+        parallelism,
         splits.len(),
         table_ref,
-        min_id,
-        max_id
+        range_start,
+        range_end
     );
     Ok(splits)
 }
@@ -445,13 +486,13 @@ fn tokio_block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// A decoded change row waiting in the binlog replay buffer.
 #[derive(Debug, Clone)]
 struct BufferedChange {
-    kind: RowKind,
     row: SeatunnelRow,
 }
 
 /// MySQL CDC Source reader.
 pub struct MySqlCdcReader {
     config: MySqlCdcConfig,
+    #[allow(dead_code)] // retained for future schema-aware serialization
     schema: Option<TableSchema>,
     phase: CdcPhase,
     splits: Vec<MySqlCdcSplit>,
@@ -500,7 +541,7 @@ impl MySqlCdcReader {
     /// Apply previously snapshotted state (checkpoint restore path).
     pub fn apply_cdc_state(&mut self, state: CdcState) {
         self.phase = state.phase;
-        self.watermark = state.watermark.clone();
+        self.watermark = state.watermark;
 
         if let Some(file) = state.offset.get("file") {
             self.offset.file = file.clone();
@@ -517,38 +558,32 @@ impl MySqlCdcReader {
         if let Some(pk) = state.offset.get("max_snapshot_pk") {
             self.max_snapshot_pk = pk.parse().unwrap_or(i64::MIN);
         }
-        if let Ok(map) = state
+        if let Some(map) = state
             .offset
             .get("split_last_pk")
-            .map(|s| serde_json::from_str::<HashMap<usize, i64>>(s))
-            .transpose()
+            .and_then(|s| serde_json::from_str::<HashMap<usize, i64>>(s).ok())
         {
-            if let Some(map) = map {
-                self.split_last_pk = map;
-            }
+            self.split_last_pk = map;
         }
         // Rebuild the exact split layout captured at checkpoint time so the
         // pagination cursors stay meaningful across restarts.
-        if let Ok(ranges) = state
+        if let Some(ranges) = state
             .offset
             .get("splits")
-            .map(|s| serde_json::from_str::<Vec<(String, String)>>(s))
-            .transpose()
+            .and_then(|s| serde_json::from_str::<Vec<(String, String)>>(s).ok())
         {
-            if let Some(ranges) = ranges {
-                self.splits = ranges
-                    .into_iter()
-                    .map(|(start, end)| {
-                        MySqlCdcSplit::Snapshot(SnapshotSplit::new(
-                            &self.config.database_name,
-                            &self.config.table_name,
-                            &self.config.split_column,
-                            &start,
-                            &end,
-                        ))
-                    })
-                    .collect();
-            }
+            self.splits = ranges
+                .into_iter()
+                .map(|(start, end)| {
+                    MySqlCdcSplit::Snapshot(SnapshotSplit::new(
+                        &self.config.database_name,
+                        &self.config.table_name,
+                        &self.config.split_column,
+                        &start,
+                        &end,
+                    ))
+                })
+                .collect();
         }
 
         // An incremental-phase restore skips straight back to streaming.
@@ -578,7 +613,10 @@ impl MySqlCdcReader {
         let mut conn = pool.get_conn().await.map_err(|e| {
             anyhow::anyhow!(
                 "MySQL CDC cannot connect to {}:{} as {}: {}",
-                self.config.hostname, self.config.port, self.config.username, e
+                self.config.hostname,
+                self.config.port,
+                self.config.username,
+                e
             )
         })?;
 
@@ -588,13 +626,17 @@ impl MySqlCdcReader {
             .ok_or_else(|| anyhow::anyhow!("MySQL ping returned no result"))?;
 
         // Resume positions only make sense when a previous state exists.
-        let resuming_incremental = self.phase == CdcPhase::Incremental && !self.offset.file.is_empty();
+        let resuming_incremental =
+            self.phase == CdcPhase::Incremental && !self.offset.file.is_empty();
         let resuming_snapshot = self.phase == CdcPhase::Snapshot && !self.offset.file.is_empty();
 
         if !resuming_incremental && !resuming_snapshot {
-            let master_status = conn.query_first::<mysql_async::Row, _>("SHOW MASTER STATUS").await?;
-            let row = master_status
-                .ok_or_else(|| anyhow::anyhow!("SHOW MASTER STATUS empty — is the binlog enabled?"))?;
+            let master_status = conn
+                .query_first::<mysql_async::Row, _>("SHOW MASTER STATUS")
+                .await?;
+            let row = master_status.ok_or_else(|| {
+                anyhow::anyhow!("SHOW MASTER STATUS empty — is the binlog enabled?")
+            })?;
             if let Some(file) = row.get::<Option<String>, usize>(0).flatten() {
                 self.offset.file = file;
             }
@@ -622,7 +664,15 @@ impl MySqlCdcReader {
 
         // Start streaming immediately from the recorded position so nothing
         // between the baseline and the end of the snapshot is lost.
-        if !matches!(self.config.startup_mode, MySqlStartupMode::SnapshotOnly) {
+        //
+        // With parallelism > 1 only subtask 0 streams: MySQL allows one
+        // replication stream per server_id and a single binlog parser is the
+        // standard design (Debezium-style). Other subtasks are
+        // snapshot-only; their ranges plus subtask 0's stream cover
+        // everything with at-least-once delivery.
+        let streams_binlog = !matches!(self.config.startup_mode, MySqlStartupMode::SnapshotOnly)
+            && self.config.subtask_index == 0;
+        if streams_binlog {
             match Self::open_binlog_stream(conn, &self.config, &self.offset).await {
                 Ok(stream) => {
                     self.binlog_stream = Some(Box::pin(stream));
@@ -640,7 +690,7 @@ impl MySqlCdcReader {
     }
 
     async fn open_binlog_stream(
-        mut conn: mysql_async::Conn,
+        conn: mysql_async::Conn,
         config: &MySqlCdcConfig,
         offset: &BinlogOffset,
     ) -> anyhow::Result<BinlogStream> {
@@ -669,19 +719,34 @@ impl MySqlCdcReader {
             return;
         }
         while self.binlog_buffer.len() < MAX_BUFFERED_BINLOG_ROWS {
-            let poll_res = {
-                let mut stream = self.binlog_stream.as_mut().unwrap();
-                std::future::poll_fn(|cx| Stream::poll_next(stream.as_mut(), cx)).await
-            };
+            // Single non-blocking attempt: map Pending to "nothing queued"
+            // instead of awaiting the next event (that would stall snapshot
+            // reads until the source table changes).
+            use std::task::Poll;
+            let poll_res = std::future::poll_fn(|cx| {
+                let stream = self.binlog_stream.as_mut().unwrap();
+                match Stream::poll_next(stream.as_mut(), cx) {
+                    Poll::Ready(item) => Poll::Ready(Some(item)),
+                    Poll::Pending => Poll::Ready(None),
+                }
+            })
+            .await;
             match poll_res {
-                Some(Ok(event)) => self.absorb_event(event),
-                Some(Err(e)) => {
+                Some(Some(Ok(event))) => {
+                    tracing::trace!(
+                        "MySQL CDC drain: event type={:?} pos={}",
+                        event.header().event_type(),
+                        event.header().log_pos()
+                    );
+                    self.absorb_event(event);
+                }
+                Some(Some(Err(e))) => {
                     tracing::warn!("MySQL CDC binlog stream error during snapshot: {}", e);
                     self.binlog_stream = None;
                     self.stream_broken = true;
                     return;
                 }
-                None => return, // nothing queued right now
+                _ => return, // nothing queued right now
             }
         }
     }
@@ -721,7 +786,6 @@ impl MySqlCdcReader {
                 for pair in e.rows(tme) {
                     if let Ok((_, Some(after))) = pair {
                         decoded.push_back(BufferedChange {
-                            kind: RowKind::Insert,
                             row: binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert),
                         });
                     }
@@ -731,11 +795,9 @@ impl MySqlCdcReader {
                 for pair in e.rows(tme) {
                     if let Ok((Some(before), Some(after))) = pair {
                         decoded.push_back(BufferedChange {
-                            kind: RowKind::UpdateBefore,
                             row: binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete),
                         });
                         decoded.push_back(BufferedChange {
-                            kind: RowKind::UpdateAfter,
                             row: binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert),
                         });
                     }
@@ -745,7 +807,6 @@ impl MySqlCdcReader {
                 for pair in e.rows(tme) {
                     if let Ok((Some(before), _)) = pair {
                         decoded.push_back(BufferedChange {
-                            kind: RowKind::Delete,
                             row: binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete),
                         });
                     }
@@ -801,39 +862,24 @@ impl MySqlCdcReader {
             self.offset.position
         );
         let pool = self.build_pool();
-        let mut conn = pool.get_conn().await?;
-        let stream =
-            Self::open_binlog_stream(conn, &self.config, &self.offset).await?;
+        let conn = pool.get_conn().await?;
+        let stream = Self::open_binlog_stream(conn, &self.config, &self.offset).await?;
         self.binlog_stream = Some(Box::pin(stream));
         self.stream_broken = false;
         Ok(())
     }
 
-    /// Pop the next change from the replay buffer applying snapshot-dedup.
+    /// Pop the next change from the replay buffer.
+    ///
+    /// No value-based suppression is applied: changes buffered during the
+    /// snapshot window are replayed verbatim, giving clean **at-least-once**
+    /// semantics without risking loss on rows that landed in snapshot gaps.
     fn next_buffered_change(&mut self) -> Option<SeatunnelRow> {
-        while let Some(change) = self.binlog_buffer.pop_front() {
-            if change.kind == RowKind::Insert && self.is_covered_by_snapshot(&change.row) {
-                continue; // insert already contained in the snapshot
-            }
-            return Some(change.row);
-        }
-        None
-    }
-
-    /// True when an INSERT's split-key value falls within the snapshot's
-    /// emitted primary-key range, meaning the snapshot already carries it.
-    fn is_covered_by_snapshot(&self, row: &SeatunnelRow) -> bool {
-        if self.max_snapshot_pk == i64::MIN {
-            return false;
-        }
-        Some(row.get(0))
-            .and_then(|f| field_to_i64(f))
-            .map(|pk| pk <= self.max_snapshot_pk)
-            .unwrap_or(false)
+        self.binlog_buffer.pop_front().map(|change| change.row)
     }
 
     fn note_snapshot_pk(&mut self, row: &SeatunnelRow) {
-        if let Some(pk) = Some(row.get(0)).and_then(|f| field_to_i64(f)) {
+        if let Some(pk) = Some(row.get(0)).and_then(field_to_i64) {
             if pk > self.max_snapshot_pk {
                 self.max_snapshot_pk = pk;
             }
@@ -845,7 +891,9 @@ impl SourceReader for MySqlCdcReader {
     type Output = MySqlCdcOutput;
     type Split = MySqlCdcSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn open(
+        &mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             tracing::info!(
                 "MySQL CDC reader opening: {}.{} mode={:?}",
@@ -862,10 +910,17 @@ impl SourceReader for MySqlCdcReader {
                     // Streaming-only: skip the snapshot entirely.
                     self.phase = CdcPhase::Incremental;
                     self.splits.clear();
-                    tracing::info!("MySQL CDC reader: skipping snapshot ({:?})", self.config.startup_mode);
+                    tracing::info!(
+                        "MySQL CDC reader: skipping snapshot ({:?})",
+                        self.config.startup_mode
+                    );
                     return Ok(());
                 }
-                MySqlStartupMode::Specific { ref file, position, ref gtid_set } => {
+                MySqlStartupMode::Specific {
+                    ref file,
+                    position,
+                    ref gtid_set,
+                } => {
                     self.offset.file = file.clone();
                     self.offset.position = position;
                     self.offset.gtid_set = gtid_set.clone();
@@ -883,7 +938,9 @@ impl SourceReader for MySqlCdcReader {
                 MySqlStartupMode::Timestamp { .. } => {
                     // Timestamp resume requires binlog timestamp scanning;
                     // fall back to a full snapshot + stream from now.
-                    tracing::warn!("MySQL CDC: startup.mode=timestamp not supported yet, using initial");
+                    tracing::warn!(
+                        "MySQL CDC: startup.mode=timestamp not supported yet, using initial"
+                    );
                 }
                 MySqlStartupMode::SnapshotOnly | MySqlStartupMode::Initial => {}
             }
@@ -901,13 +958,22 @@ impl SourceReader for MySqlCdcReader {
 
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>,
+    > {
         Box::pin(async move {
             if self.phase == CdcPhase::Incremental {
                 return self.poll_incremental().await;
             }
 
             // ---- Snapshot phase ---------------------------------------
+            tracing::trace!(
+                "MySQL CDC poll[snapshot]: buffered_binlog={} snapshot_buf={} idx={}/{}",
+                self.binlog_buffer.len(),
+                self.snapshot_buffer.len(),
+                self.current_idx.get(),
+                self.splits.len()
+            );
             // Keep the binlog socket drained while chunk-scanning the table.
             self.drain_binlog_nonblocking().await;
 
@@ -919,7 +985,17 @@ impl SourceReader for MySqlCdcReader {
 
             let idx = self.current_idx.get();
             if idx >= self.splits.len() {
-                // All snapshot splits consumed → switch to streaming.
+                // All snapshot splits consumed. Subtask 0 transitions to the
+                // incremental stream; auxiliary subtasks are snapshot-only
+                // and finish (their changes are covered by subtask 0).
+                if self.config.subtask_index != 0 {
+                    tracing::info!(
+                        "MySQL CDC reader: subtask {}/{} snapshot complete, EOF (streaming handled by subtask 0)",
+                        self.config.subtask_index,
+                        self.config.subtask_count
+                    );
+                    return Ok(PollResult::EOF);
+                }
                 self.handle_no_more_splits();
                 if self.config.startup_mode == MySqlStartupMode::SnapshotOnly {
                     tracing::info!("MySQL CDC reader: snapshot-only mode, EOF");
@@ -935,16 +1011,35 @@ impl SourceReader for MySqlCdcReader {
             let split = split.clone();
 
             let last_pk = self.split_last_pk.get(&idx).copied().unwrap_or(0);
+            tracing::trace!(
+                "MySQL CDC poll[snapshot]: querying split {} range [{}, {}) after pk {}",
+                idx,
+                split.start_key,
+                split.end_key,
+                last_pk
+            );
             let rows = query_snapshot_batch(&self.config, &split, last_pk).await?;
+            tracing::trace!(
+                "MySQL CDC poll[snapshot]: batch returned {} rows",
+                rows.len()
+            );
             if rows.is_empty() {
                 self.current_idx.set(idx + 1);
                 return Ok(PollResult::Empty);
             }
-            let start = rows[0].0;
+            let end = rows[rows.len() - 1].0;
             for (_, row) in rows {
                 self.snapshot_buffer.push_back(row);
             }
-            self.split_last_pk.insert(idx, start);
+            // Advance the keyset cursor to the LAST pk of this batch so the
+            // next query resumes strictly after what was already emitted.
+            self.split_last_pk.insert(idx, end);
+            tracing::trace!(
+                "MySQL CDC poll[snapshot]: split {} cursor advanced to pk {} (map={:?})",
+                idx,
+                end,
+                self.split_last_pk
+            );
             if let Some(row) = self.snapshot_buffer.pop_front() {
                 self.note_snapshot_pk(&row);
                 return Ok(PollResult::Record(MySqlCdcOutput(row)));
@@ -957,7 +1052,10 @@ impl SourceReader for MySqlCdcReader {
         &mut self,
     ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let mut offset = self.offset.to_hashmap();
-        offset.insert("current_idx".to_string(), self.current_idx.get().to_string());
+        offset.insert(
+            "current_idx".to_string(),
+            self.current_idx.get().to_string(),
+        );
         offset.insert(
             "max_snapshot_pk".to_string(),
             self.max_snapshot_pk.to_string(),
@@ -982,12 +1080,10 @@ impl SourceReader for MySqlCdcReader {
         }
         let state = CdcState {
             phase: self.phase,
-            watermark: self.watermark.clone(),
+            watermark: self.watermark,
             offset,
         };
-        Box::pin(async move {
-            serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e))
-        })
+        Box::pin(async move { serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e)) })
     }
 
     fn add_splits(&mut self, splits: Vec<Self::Split>) {
@@ -1005,7 +1101,9 @@ impl SourceReader for MySqlCdcReader {
         );
     }
 
-    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn close(
+        &mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             self.binlog_stream = None;
             tracing::info!("MySQL CDC reader closed");
@@ -1048,7 +1146,12 @@ async fn query_snapshot_batch(
 ) -> anyhow::Result<Vec<(i64, SeatunnelRow)>> {
     let pool = MySqlCdcSource::build_pool_for(config);
     let mut conn = pool.get_conn().await.map_err(|e| {
-        anyhow::anyhow!("snapshot query failed ({}:{}): {}", config.hostname, config.port, e)
+        anyhow::anyhow!(
+            "snapshot query failed ({}:{}): {}",
+            config.hostname,
+            config.port,
+            e
+        )
     })?;
 
     let start_id: i64 = split.start_key.parse().unwrap_or(0);
@@ -1067,21 +1170,33 @@ async fn query_snapshot_batch(
         split.split_column,
         SNAPSHOT_BATCH_SIZE,
     );
-    let rows: Vec<Row> = conn.query(sql).await?;
+    // `exec` uses the binary protocol so numeric/temporal columns arrive
+    // fully typed instead of as raw byte strings.
+    let rows: Vec<Row> = conn.exec(sql, ()).await?;
     Ok(rows
         .iter()
         .map(|r| {
-            let pk = r
-                .get::<Value, usize>(0)
-                .and_then(|v| match v {
-                    Value::Int(i) => Some(i),
-                    Value::UInt(u) => i64::try_from(u).ok(),
-                    _ => None,
-                })
-                .unwrap_or(last_pk);
+            let pk = extract_pk(r, last_pk);
             (pk, mysql_row_to_seatunnel_row(r))
         })
         .collect())
+}
+
+/// Pull an i64 split-key value out of the first column of a snapshot row.
+/// Handles the binary-protocol numeric variants and falls back to parsing
+/// textual representations.
+fn extract_pk(row: &Row, default_pk: i64) -> i64 {
+    match row.get::<Value, usize>(0) {
+        Some(Value::Int(i)) => i,
+        Some(Value::UInt(u)) => i64::try_from(u).unwrap_or(default_pk),
+        Some(Value::Float(f)) => f as i64,
+        Some(Value::Double(d)) => d as i64,
+        Some(Value::Bytes(b)) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(default_pk),
+        _ => default_pk,
+    }
 }
 
 /// Converts a mysql_async Row to a seatunnel Row.
@@ -1102,13 +1217,20 @@ fn mysql_value_to_field(row: &Row, col_idx: usize) -> Field {
         Some(Value::UInt(v)) => Field::UInt64(v),
         Some(Value::Float(v)) => Field::Float32(v),
         Some(Value::Double(v)) => Field::Float64(v),
-        Some(Value::Bytes(v)) => Field::Bytes(v),
+        Some(Value::Bytes(v)) => bytes_to_field(v),
         Some(Value::Date(y, m, d, _, _, _, _)) => {
             Field::String(format!("{:04}-{:02}-{:02}", y, m, d))
         }
-        Some(Value::Time(_, _, h, m, s, _)) => {
-            Field::String(format!("{:02}:{:02}:{:02}", h, m, s))
-        }
+        Some(Value::Time(_, _, h, m, s, _)) => Field::String(format!("{:02}:{:02}:{:02}", h, m, s)),
+    }
+}
+
+/// Decode bytes as UTF-8 text when possible (VARCHAR/TEXT columns);
+/// keep raw bytes for binary payloads (BLOB).
+fn bytes_to_field(bytes: Vec<u8>) -> Field {
+    match String::from_utf8(bytes) {
+        Ok(s) => Field::String(s),
+        Err(b) => Field::Bytes(b.into_bytes()),
     }
 }
 
@@ -1182,19 +1304,15 @@ fn value_to_field(v: &Value) -> Field {
         Value::UInt(u) => Field::UInt64(*u),
         Value::Float(f) => Field::Float32(*f),
         Value::Double(d) => Field::Float64(*d),
-        Value::Bytes(b) => Field::Bytes(b.clone()),
-        Value::Date(y, m, d, _, _, _, _) => {
-            Field::String(format!("{:04}-{:02}-{:02}", y, m, d))
-        }
-        Value::Time(_, _, h, m, s, _) => {
-            Field::String(format!("{:02}:{:02}:{:02}", h, m, s))
-        }
+        Value::Bytes(b) => bytes_to_field(b.clone()),
+        Value::Date(y, m, d, _, _, _, _) => Field::String(format!("{:04}-{:02}-{:02}", y, m, d)),
+        Value::Time(_, _, h, m, s, _) => Field::String(format!("{:02}:{:02}:{:02}", h, m, s)),
     }
 }
 
 /// Parse a MySQL GTID set string (`uuid:1-10:20,uuid2:5`) into `Vec<Sid>`
 /// for the binlog dump request.
-fn parse_gtid_set(gtid_set: &str) -> Vec<mysql_async::Sid> {
+fn parse_gtid_set(gtid_set: &str) -> Vec<mysql_async::Sid<'_>> {
     use mysql_async::{GnoInterval, Sid};
     let mut sids = Vec::new();
     for part in gtid_set.split(',') {
@@ -1233,7 +1351,9 @@ fn parse_gtid_set(gtid_set: &str) -> Vec<mysql_async::Sid> {
                 Some((s, e)) => (s, e),
                 None => (interval, interval),
             };
-            let Ok(s) = start.parse::<u64>() else { continue };
+            let Ok(s) = start.parse::<u64>() else {
+                continue;
+            };
             let Ok(e) = end.parse::<u64>() else { continue };
             // GnoInterval is [start, end); a single GNO is [n, n+1).
             if let Ok(gno) = GnoInterval::check_and_new(s, e + 1) {
@@ -1262,6 +1382,8 @@ mod tests {
             server_timezone: "+00:00".into(),
             server_id: 0,
             split_column: "id".into(),
+            subtask_index: 0,
+            subtask_count: 1,
         }
     }
 
@@ -1320,7 +1442,11 @@ mod tests {
         // error so the engine can fail/retry the task.
         let mut reader = MySqlCdcReader::new(test_config(), None);
         reader.add_splits(vec![MySqlCdcSplit::Snapshot(SnapshotSplit::new(
-            "testdb", "test_table", "id", "0", "1000",
+            "testdb",
+            "test_table",
+            "id",
+            "0",
+            "1000",
         ))]);
         let result = reader.poll_next().await;
         assert!(result.is_err(), "expected error, got {:?}", result);
@@ -1373,32 +1499,49 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_dedup_logic() {
+    fn replay_buffer_preserves_all_changes() {
         let mut reader = MySqlCdcReader::new(test_config(), None);
         reader.max_snapshot_pk = 50;
 
-        let mut covered = SeatunnelRow::new(RowKind::Insert, 1);
-        covered.set(0, Field::Int64(30));
-        let mut beyond = SeatunnelRow::new(RowKind::Insert, 1);
-        beyond.set(0, Field::Int64(80));
-        let mut delete = SeatunnelRow::new(RowKind::Delete, 1);
-        delete.set(0, Field::Int64(30));
+        let mut covered = BufferedChange {
+            row: SeatunnelRow::new(RowKind::Insert, 1),
+        };
+        covered.row.set(0, Field::Int64(30));
+        let mut beyond = BufferedChange {
+            row: SeatunnelRow::new(RowKind::Insert, 1),
+        };
+        beyond.row.set(0, Field::Int64(80));
+        let mut delete = BufferedChange {
+            row: SeatunnelRow::new(RowKind::Delete, 1),
+        };
+        delete.row.set(0, Field::Int64(30));
 
-        assert!(reader.is_covered_by_snapshot(&covered));
-        assert!(!reader.is_covered_by_snapshot(&beyond));
-        // Deletes are never suppressed by the insert dedup rule.
-        assert_ne!(delete.kind, RowKind::Insert);
+        // At-least-once: the replay buffer is emitted verbatim, no
+        // value-based suppression that could silently drop rows landing in
+        // snapshot gaps.
+        reader.binlog_buffer.push_back(covered);
+        reader.binlog_buffer.push_back(beyond);
+        reader.binlog_buffer.push_back(delete);
+
+        assert_eq!(reader.binlog_buffer.len(), 3);
+        assert!(reader.next_buffered_change().is_some());
+        assert!(reader.next_buffered_change().is_some());
+        assert!(reader.next_buffered_change().is_some());
+        assert!(reader.next_buffered_change().is_none());
     }
 
     #[test]
-    fn effective_server_id_is_stable_and_unique_per_port() {
+    fn effective_server_id_unique_per_call() {
         let mut cfg = test_config();
         cfg.server_id = 0;
-        let a = cfg.effective_server_id();
-        let b = cfg.effective_server_id();
-        assert_eq!(a, b);
-        cfg.port = 3307;
-        assert_ne!(a, cfg.effective_server_id());
+        // Distinct dump connections must never share a replication id.
+        let ids: std::collections::HashSet<u32> =
+            (0..16).map(|_| cfg.effective_server_id()).collect();
+        assert_eq!(ids.len(), 16);
+        assert!(ids
+            .iter()
+            .all(|id| *id >= 0x1000 && *id < 0x1000 + 0x0FFF_FFF0));
+        // Explicit configuration always wins.
         cfg.server_id = 42;
         assert_eq!(cfg.effective_server_id(), 42);
     }

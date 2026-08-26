@@ -1,12 +1,15 @@
 use seatunnel_api::{Row, TableSchema};
-use serde_json::{Value};
+use serde_json::Value;
 use std::error::Error;
 
 pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(bytes)?;
     let obj = value.as_object().ok_or("Expected JSON object")?;
     let empty_map: serde_json::Map<String, Value> = serde_json::Map::<String, Value>::default();
-    let payload = match obj.get("payload").and_then(|v| v.as_object()) { Some(m) => m, None => &empty_map };
+    let payload = match obj.get("payload").and_then(|v| v.as_object()) {
+        Some(m) => m,
+        None => &empty_map,
+    };
     let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
     for (i, col) in schema.columns.iter().enumerate() {
         row.set(i, json_to_field(payload.get(&col.name))?);
@@ -17,12 +20,17 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<d
 pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut payload = serde_json::Map::<String, Value>::default();
     for (i, col) in schema.columns.iter().enumerate() {
-        if i < row.field_count() { payload.insert(col.name.clone(), field_to_json(row.get(i))?); }
+        if i < row.field_count() {
+            payload.insert(col.name.clone(), field_to_json(row.get(i))?);
+        }
     }
     let mut fields = Vec::new();
     for col in &schema.columns {
         let mut f = serde_json::Map::<String, Value>::default();
-        f.insert("type".to_string(), Value::String(field_type_str(&col.column_type)));
+        f.insert(
+            "type".to_string(),
+            Value::String(field_type_str(&col.column_type)),
+        );
         f.insert("field".to_string(), Value::String(col.name.clone()));
         fields.push(Value::Object(f));
     }
@@ -32,7 +40,8 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
     let mut obj = serde_json::Map::<String, Value>::default();
     obj.insert("schema".to_string(), Value::Object(schema_obj));
     obj.insert("payload".to_string(), Value::Object(payload));
-    serde_json::to_vec(&Value::Object(obj)).map_err(|e| format!("Kafka Connect error: {}", e).into())
+    serde_json::to_vec(&Value::Object(obj))
+        .map_err(|e| format!("Kafka Connect error: {}", e).into())
 }
 
 fn field_type_str(col_type: &seatunnel_api::ColumnType) -> String {
@@ -47,10 +56,23 @@ fn field_type_str(col_type: &seatunnel_api::ColumnType) -> String {
 }
 
 fn json_to_field(value: Option<&Value>) -> Result<seatunnel_api::Field, Box<dyn Error>> {
-    let value = match value { Some(v) => v, None => return Ok(seatunnel_api::Field::Null) };
+    let value = match value {
+        Some(v) => v,
+        None => return Ok(seatunnel_api::Field::Null),
+    };
     match value {
         Value::Bool(b) => Ok(seatunnel_api::Field::Bool(*b)),
-        Value::Number(n) => { if let Some(i) = n.as_i64() { Ok(seatunnel_api::Field::Int64(i)) } else if let Some(u) = n.as_u64() { Ok(seatunnel_api::Field::UInt64(u)) } else if let Some(f) = n.as_f64() { Ok(seatunnel_api::Field::Float64(f)) } else { Ok(seatunnel_api::Field::Null) } }
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(seatunnel_api::Field::Int64(i))
+            } else if let Some(u) = n.as_u64() {
+                Ok(seatunnel_api::Field::UInt64(u))
+            } else if let Some(f) = n.as_f64() {
+                Ok(seatunnel_api::Field::Float64(f))
+            } else {
+                Ok(seatunnel_api::Field::Null)
+            }
+        }
         Value::String(s) => Ok(seatunnel_api::Field::String(s.clone())),
         Value::Null => Ok(seatunnel_api::Field::Null),
         _ => Ok(seatunnel_api::Field::Null),
@@ -72,24 +94,29 @@ mod tests {
     use super::*;
     use seatunnel_api::{ColumnDef, ColumnType};
     fn make_schema() -> TableSchema {
-        TableSchema::new("t", vec![
-            ColumnDef::new("id".to_string(), ColumnType::Int64),
-            ColumnDef::new("name".to_string(), ColumnType::String),
-        ])
+        TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("id".to_string(), ColumnType::Int64),
+                ColumnDef::new("name".to_string(), ColumnType::String),
+            ],
+        )
     }
     #[test]
     fn test_deserialize() {
-        let rows = deserialize(b"{\"schema\":{},\"payload\":{\"id\":42,\"name\":\"hello\"}}", &make_schema())
-.unwrap();
-        let row = &rows[0];
+        let rows = deserialize(
+            b"{\"schema\":{},\"payload\":{\"id\":42,\"name\":\"hello\"}}",
+            &make_schema(),
+        )
+        .unwrap();
+        let _row = &rows[0];
         let row = &rows[0];
         assert_eq!(*row.get(0), seatunnel_api::Field::Int64(42));
     }
     #[test]
     fn test_null_payload() {
-        let rows = deserialize(b"{\"schema\":{},\"payload\":null}", &make_schema())
-.unwrap();
-        let row = &rows[0];
+        let rows = deserialize(b"{\"schema\":{},\"payload\":null}", &make_schema()).unwrap();
+        let _row = &rows[0];
         assert!(rows[0].get(0).is_null());
     }
 }

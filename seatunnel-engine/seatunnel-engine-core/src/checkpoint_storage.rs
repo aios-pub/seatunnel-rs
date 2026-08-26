@@ -60,6 +60,12 @@ pub struct InMemoryCheckpointStorage {
     checkpoints: RwLock<HashMap<CheckpointId, CompletedCheckpoint>>,
 }
 
+impl Default for InMemoryCheckpointStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryCheckpointStorage {
     pub fn new() -> Self {
         InMemoryCheckpointStorage {
@@ -185,7 +191,9 @@ impl CheckpointStorageBackend for LocalCheckpointStorage {
 
 /// HDFS checkpoint storage (stub — requires hdfs-rs or hdfs3 bindings).
 pub struct HDFSCheckpointStorage {
+    #[allow(dead_code)] // stub backend; fields kept for the real HDFS client
     namenode_uri: String,
+    #[allow(dead_code)]
     base_path: String,
     checkpoints: RwLock<HashMap<CheckpointId, CompletedCheckpoint>>,
 }
@@ -233,8 +241,11 @@ impl CheckpointStorageBackend for HDFSCheckpointStorage {
 
 /// S3 checkpoint storage (stub — requires aws-sdk-s3 or reqwest presigned URLs).
 pub struct S3CheckpointStorage {
+    #[allow(dead_code)] // stub backend; fields kept for the real S3 client
     bucket: String,
+    #[allow(dead_code)]
     region: String,
+    #[allow(dead_code)]
     base_path: String,
     checkpoints: RwLock<HashMap<CheckpointId, CompletedCheckpoint>>,
 }

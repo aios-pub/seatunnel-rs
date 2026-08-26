@@ -44,9 +44,17 @@ pub trait StateHandle: Send + Sync {
     fn restore(&self, state: &TaskCheckpointState);
 }
 
+/// Task-scoped key/value state shared by the in-memory backends.
+type TaskStateMap = HashMap<String, HashMap<Vec<u8>, Vec<u8>>>;
 /// In-memory state backend (for testing and local mode).
 pub struct MemoryStateBackend {
-    states: Arc<RwLock<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>>,
+    states: Arc<RwLock<TaskStateMap>>,
+}
+
+impl Default for MemoryStateBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryStateBackend {
@@ -60,9 +68,7 @@ impl MemoryStateBackend {
 impl StateBackend for MemoryStateBackend {
     fn state_handle(&self, task_id: &str) -> Box<dyn StateHandle> {
         let mut states = self.states.write();
-        states
-            .entry(task_id.to_string())
-            .or_insert_with(HashMap::new);
+        states.entry(task_id.to_string()).or_default();
         Box::new(MemoryStateHandle {
             task_id: task_id.to_string(),
             states: self.states.clone(),
@@ -77,7 +83,7 @@ impl StateBackend for MemoryStateBackend {
 /// In-memory state handle.
 struct MemoryStateHandle {
     task_id: String,
-    states: Arc<RwLock<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>>,
+    states: Arc<RwLock<TaskStateMap>>,
 }
 
 impl StateHandle for MemoryStateHandle {
@@ -133,6 +139,7 @@ impl StateHandle for MemoryStateHandle {
 /// Managed state backend with remote storage + local cache (stub).
 pub struct ManagedStateBackend {
     memory: MemoryStateBackend,
+    #[allow(dead_code)] // reserved for future remote state persistence
     remote_base_path: String,
 }
 

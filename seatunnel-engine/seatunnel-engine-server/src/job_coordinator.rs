@@ -35,7 +35,6 @@
 //! Only `Created` tasks are ever handed out, so heartbeats never double-assign.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
@@ -62,7 +61,9 @@ impl From<&str> for JobState {
         match s {
             "RUNNING" => JobState::Running,
             "COMPLETED" => JobState::Completed,
-            "FAILED" => JobState::Failed { reason: "unknown".to_string() },
+            "FAILED" => JobState::Failed {
+                reason: "unknown".to_string(),
+            },
             "CANCELLED" => JobState::Cancelled,
             "SCHEDULED" => JobState::Scheduled,
             "DEPLOYING" => JobState::Deploying,
@@ -138,6 +139,12 @@ pub struct JobCoordinator {
     all_tasks: RwLock<HashMap<String, TaskDescriptor>>,
 }
 
+impl Default for JobCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JobCoordinator {
     pub fn new() -> Self {
         JobCoordinator {
@@ -210,10 +217,7 @@ impl JobCoordinator {
                         serde_json::to_string(&source.1)
                             .map_err(|e| anyhow::anyhow!("serialize source config: {}", e))?,
                     ),
-                    (
-                        "sink.plugin".to_string(),
-                        sink.0.clone(),
-                    ),
+                    ("sink.plugin".to_string(), sink.0.clone()),
                     (
                         "sink.config".to_string(),
                         serde_json::to_string(&sink.1)
@@ -307,7 +311,12 @@ impl JobCoordinator {
                     continue;
                 }
                 if let Some(desc) = all.get(&info.task_id) {
-                    if desc.config.get("worker_id").map(|w| w == worker_id).unwrap_or(false) {
+                    if desc
+                        .config
+                        .get("worker_id")
+                        .map(|w| w == worker_id)
+                        .unwrap_or(false)
+                    {
                         out.push(desc.clone());
                     }
                 }
@@ -352,7 +361,16 @@ impl JobCoordinator {
             task.processed_records = records.max(task.processed_records);
             task.error = error;
         } else {
-            warn!("status report for unknown task {} in job {}", task_id, job_id);
+            warn!(
+                "status report for unknown task {} in job {}",
+                task_id, job_id
+            );
+        }
+
+        // A terminal job state (cancelled, failed, completed) is never
+        // overwritten by late or in-flight task reports.
+        if job.state.is_terminal() {
+            return;
         }
 
         let total = job.tasks.len();
@@ -362,16 +380,25 @@ impl JobCoordinator {
             .find(|t| matches!(t.state, JobState::Failed { .. }))
             .cloned();
         let running_or_more = job.tasks.values().any(|t| {
-            matches!(t.state, JobState::Running | JobState::Deploying | JobState::Completed)
+            matches!(
+                t.state,
+                JobState::Running | JobState::Deploying | JobState::Completed
+            )
         });
-        let completed = job.tasks.values().filter(|t| t.state == JobState::Completed).count();
+        let completed = job
+            .tasks
+            .values()
+            .filter(|t| t.state == JobState::Completed)
+            .count();
 
         match failed {
             Some(f) => {
                 let reason = f.error.clone().unwrap_or_else(|| "task failed".into());
                 if !job.state.is_terminal() {
                     error!("Job {} failed: task {}: {}", job_id, f.task_id, reason);
-                    job.state = JobState::Failed { reason: reason.clone() };
+                    job.state = JobState::Failed {
+                        reason: reason.clone(),
+                    };
                     job.end_time = Some(seatunnel_engine_core::now_millis());
                     job.error_message = Some(reason);
                 }
@@ -391,7 +418,13 @@ impl JobCoordinator {
     }
 
     /// Record a checkpoint reported by a worker.
-    pub fn report_checkpoint(&self, job_id: &str, _task_id: &str, checkpoint_id: u64, success: bool) {
+    pub fn report_checkpoint(
+        &self,
+        job_id: &str,
+        _task_id: &str,
+        checkpoint_id: u64,
+        success: bool,
+    ) {
         let mut jobs = self.jobs.write();
         if let Some(job) = jobs.get_mut(job_id) {
             if success {
@@ -403,7 +436,11 @@ impl JobCoordinator {
                     job.checkpoints_completed
                 );
             } else {
-                tracing::warn!("Job {} checkpoint {} reported as failed", job_id, checkpoint_id);
+                tracing::warn!(
+                    "Job {} checkpoint {} reported as failed",
+                    job_id,
+                    checkpoint_id
+                );
             }
         }
     }
@@ -454,7 +491,10 @@ fn extract_transform_list(config: &serde_json::Value) -> Vec<serde_json::Value> 
             .map(|(name, cfg)| match cfg {
                 serde_json::Value::Object(inner) => {
                     let mut full = inner.clone();
-                    full.insert("plugin_name".into(), serde_json::Value::String(name.clone()));
+                    full.insert(
+                        "plugin_name".into(),
+                        serde_json::Value::String(name.clone()),
+                    );
                     serde_json::Value::Object(full)
                 }
                 other => serde_json::json!({ "plugin_name": name, "config": other }),
@@ -479,16 +519,22 @@ pub fn env_parallelism(config: &serde_json::Value) -> usize {
         .unwrap_or(1)
 }
 
-/// Read `env.checkpoint.interval` from a job config.
+/// Read `env.checkpoint.interval` from a job config. Handles both the nested
+/// form (`env.checkpoint = { interval = N }`) and the dotted flat key
+/// (`env."checkpoint.interval" = N`) produced by YAML/TOML parsers.
 pub fn env_checkpoint_interval(config: &serde_json::Value) -> u64 {
     config
         .get("env")
         .and_then(|env| {
-            env.get("checkpoint").and_then(|c| match c {
+            // Nested shape.
+            let nested = env.get("checkpoint").and_then(|c| match c {
                 serde_json::Value::Number(n) => n.as_u64(),
                 serde_json::Value::Object(m) => m.get("interval").and_then(|i| i.as_u64()),
                 _ => None,
-            })
+            });
+            // Flat dotted key.
+            let flat = env.get("checkpoint.interval").and_then(|v| v.as_u64());
+            nested.or(flat)
         })
         .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL_MS)
 }
@@ -535,10 +581,15 @@ mod tests {
         let pending = coordinator.get_pending_tasks_for_worker("worker-0");
         assert_eq!(pending.len(), 1);
         coordinator.mark_tasks_dispatched(
-            &pending.iter().map(|t| t.task_id.clone()).collect::<Vec<_>>(),
+            &pending
+                .iter()
+                .map(|t| t.task_id.clone())
+                .collect::<Vec<_>>(),
             "worker-0",
         );
-        assert!(coordinator.get_pending_tasks_for_worker("worker-0").is_empty());
+        assert!(coordinator
+            .get_pending_tasks_for_worker("worker-0")
+            .is_empty());
     }
 
     #[test]
@@ -563,7 +614,7 @@ mod tests {
             .compile_and_schedule("jr", "r", &config, Some(2), &workers(1))
             .unwrap();
         for t in &tasks {
-            coordinator.mark_tasks_dispatched(&[t.task_id.clone()], "worker-0");
+            coordinator.mark_tasks_dispatched(std::slice::from_ref(&t.task_id), "worker-0");
         }
         let job = coordinator.get_job(&job_id).unwrap();
         assert_eq!(job.state, JobState::Deploying);
@@ -571,12 +622,18 @@ mod tests {
         for t in &tasks {
             coordinator.report_task_status(&job_id, &t.task_id, "RUNNING", 5, None);
         }
-        assert_eq!(coordinator.get_job(&job_id).unwrap().state, JobState::Running);
+        assert_eq!(
+            coordinator.get_job(&job_id).unwrap().state,
+            JobState::Running
+        );
 
         for t in &tasks {
             coordinator.report_task_status(&job_id, &t.task_id, "COMPLETED", 50, None);
         }
-        assert_eq!(coordinator.get_job(&job_id).unwrap().state, JobState::Completed);
+        assert_eq!(
+            coordinator.get_job(&job_id).unwrap().state,
+            JobState::Completed
+        );
     }
 
     #[test]
@@ -619,10 +676,24 @@ mod tests {
     #[test]
     fn test_env_parsing_shapes() {
         assert_eq!(env_parallelism(&json!({"env":{"parallelism":4}})), 4);
-        assert_eq!(env_parallelism(&json!({"env":{"parallelism":{"default":3}}})), 3);
+        assert_eq!(
+            env_parallelism(&json!({"env":{"parallelism":{"default":3}}})),
+            3
+        );
         assert_eq!(env_parallelism(&json!({})), 1);
-        assert_eq!(env_checkpoint_interval(&json!({"env":{"checkpoint":{"interval":5000}}})), 5000);
-        assert_eq!(env_checkpoint_interval(&json!({"env":{"checkpoint":12345}})), 12345);
+        assert_eq!(
+            env_checkpoint_interval(&json!({"env":{"checkpoint":{"interval":5000}}})),
+            5000
+        );
+        assert_eq!(
+            env_checkpoint_interval(&json!({"env":{"checkpoint":12345}})),
+            12345
+        );
+        // Flat dotted key produced by YAML/TOML parsers.
+        assert_eq!(
+            env_checkpoint_interval(&json!({"env":{"checkpoint.interval":7000}})),
+            7000
+        );
         assert_eq!(
             env_checkpoint_interval(&json!({})),
             DEFAULT_CHECKPOINT_INTERVAL_MS

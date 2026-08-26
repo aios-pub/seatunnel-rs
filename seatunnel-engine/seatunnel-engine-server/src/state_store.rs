@@ -40,8 +40,8 @@ impl LocalStateStore {
     }
 
     pub fn from_env_or_default() -> Self {
-        let root = std::env::var("SEATUNNEL_STATE_DIR")
-            .unwrap_or_else(|_| ".seatunnel-state".to_string());
+        let root =
+            std::env::var("SEATUNNEL_STATE_DIR").unwrap_or_else(|_| ".seatunnel-state".to_string());
         LocalStateStore::new(root)
     }
 
@@ -84,7 +84,10 @@ impl LocalStateStore {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                let Some(rest) = name.strip_prefix("cp-").and_then(|r| r.strip_suffix(".state")) else {
+                let Some(rest) = name
+                    .strip_prefix("cp-")
+                    .and_then(|r| r.strip_suffix(".state"))
+                else {
                     continue;
                 };
                 if let Ok(id) = rest.parse::<u64>() {
@@ -106,7 +109,9 @@ impl LocalStateStore {
     }
 
     fn prune(&self, dir: &Path) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         let mut ids: Vec<(u64, PathBuf)> = entries
             .flatten()
             .filter_map(|e| {
@@ -164,7 +169,13 @@ impl seatunnel_engine_core::CheckpointListener for PersistAndReportListener {
 fn sanitize(component: &str) -> String {
     component
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -188,7 +199,10 @@ mod tests {
             .save_checkpoint("job1", "task1", 2, b"state-two")
             .unwrap();
 
-        let (id, data) = store.load_latest_checkpoint("job1", "task1").unwrap().unwrap();
+        let (id, data) = store
+            .load_latest_checkpoint("job1", "task1")
+            .unwrap()
+            .unwrap();
         assert_eq!(id, 2);
         assert_eq!(data, b"state-two");
     }
@@ -196,7 +210,10 @@ mod tests {
     #[test]
     fn load_missing_returns_none() {
         let store = tmp_store("missing");
-        assert!(store.load_latest_checkpoint("nope", "nope").unwrap().is_none());
+        assert!(store
+            .load_latest_checkpoint("nope", "nope")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

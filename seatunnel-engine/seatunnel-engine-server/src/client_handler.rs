@@ -38,7 +38,10 @@ pub struct ClientHandler {
 
 impl ClientHandler {
     pub fn new(coordinator: Arc<JobCoordinator>, workers: WorkerRegistry) -> Self {
-        ClientHandler { coordinator, workers }
+        ClientHandler {
+            coordinator,
+            workers,
+        }
     }
 
     pub fn coordinator(&self) -> &Arc<JobCoordinator> {
@@ -60,6 +63,7 @@ impl ClientHandler {
     }
 }
 
+#[allow(dead_code)] // kept for the upcoming REST status endpoint
 fn job_state_to_proto(state: &str) -> i32 {
     match state {
         "RUNNING" => 3,
@@ -83,7 +87,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         } else {
             req.job_name.clone()
         };
-        let parallelism_override = (req.parallelism > 0).then(|| req.parallelism as usize);
+        let parallelism_override = (req.parallelism > 0).then_some(req.parallelism as usize);
 
         tracing::info!(
             "Submitting job {}: name='{}' parallelism-override={:?}",
@@ -115,11 +119,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         Ok(Response::new(SubmitJobResponse {
             success: true,
             job_id: scheduled_id,
-            message: format!(
-                "job '{}' scheduled with {} task(s)",
-                job_name,
-                tasks.len()
-            ),
+            message: format!("job '{}' scheduled with {} task(s)", job_name, tasks.len()),
         }))
     }
 
@@ -202,10 +202,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         }))
     }
 
-    async fn list_jobs(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<JobList>, Status> {
+    async fn list_jobs(&self, _request: Request<Empty>) -> Result<Response<JobList>, Status> {
         let mut summaries: Vec<JobSummary> = self
             .coordinator
             .list_jobs()
@@ -217,7 +214,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 start_time: j.start_time,
             })
             .collect();
-        summaries.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+        summaries.sort_by_key(|j| std::cmp::Reverse(j.start_time));
         Ok(Response::new(JobList { jobs: summaries }))
     }
 }

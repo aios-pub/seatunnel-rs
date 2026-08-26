@@ -11,6 +11,7 @@ members = [
     "seatunnel-transforms",
     "seatunnel-cli",
     "seatunnel-macros",
+    "seatunnel-e2e",
     "seatunnel-connectors/seatunnel-connector-common",
     "seatunnel-connectors/seatunnel-connector-kafka",
     "seatunnel-connectors/seatunnel-connector-cdc-base",

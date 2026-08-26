@@ -41,6 +41,9 @@ pub enum MessageFormat {
 }
 
 impl MessageFormat {
+    // Kept as an inherent method for backward-compatible public API;
+    // renaming or removing it would break downstream callers.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "json" => Some(MessageFormat::Json),
@@ -103,7 +106,9 @@ pub fn deserialize(
         MessageFormat::Protobuf => protobuf::deserialize(bytes, schema)?,
         MessageFormat::Native => native::deserialize(bytes, schema)?,
     };
-    rows.into_iter().next().ok_or("Empty result from format deserializer".into())
+    rows.into_iter()
+        .next()
+        .ok_or("Empty result from format deserializer".into())
 }
 
 /// Deserialize bytes into all Rows (useful for CDC formats with UPDATE_BEFORE/UPDATE_AFTER).

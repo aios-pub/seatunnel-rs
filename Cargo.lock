@@ -5026,6 +5026,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "seatunnel-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "seatunnel-engine-client",
+ "seatunnel-engine-comm",
+ "seatunnel-engine-core",
+ "seatunnel-engine-server",
+ "serde_json 1.0.151",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "seatunnel-engine-client"
 version = "0.1.0"
 dependencies = [
@@ -5092,6 +5109,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "clap",
+ "futures",
  "parking_lot",
  "pin-project",
  "prometheus",
@@ -5103,16 +5121,19 @@ dependencies = [
  "seatunnel-connector-common",
  "seatunnel-connector-jdbc",
  "seatunnel-connector-kafka",
+ "seatunnel-engine-client",
  "seatunnel-engine-comm",
  "seatunnel-engine-core",
  "seatunnel-formats",
  "serde 1.0.229",
  "serde_json 1.0.151",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::checkpoint::{CheckpointId, CompletedCheckpoint};
-use crate::state::TaskState;
 
 /// Failure event that triggers recovery.
 #[derive(Debug, Clone)]
@@ -124,7 +123,7 @@ impl RecoveryManager {
 
     /// Handle a failure event and produce a recovery plan.
     pub fn handle_failure(&mut self, job_id: &str, event: &FailureEvent) -> Option<RecoveryPlan> {
-        let (failed_tasks, restart_from_checkpoint, last_cp_id) = match event {
+        let (failed_tasks, restart_from_checkpoint, _last_cp_id) = match event {
             FailureEvent::TaskFailed { task_id, .. } => {
                 (vec![task_id.clone()], true, None as Option<CheckpointId>)
             }

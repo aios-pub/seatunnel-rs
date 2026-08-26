@@ -30,13 +30,13 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::Serialize;
 use seatunnel_api::row::{Field, Row};
 use seatunnel_api::schema::TableSchema;
 use seatunnel_api::sink::sink_writer::SinkWriter;
 use seatunnel_api::source::source_reader::{PollResult, SourceReader};
 use seatunnel_api::source::source_split::SourceSplit;
 use seatunnel_api::transform::Transform;
+use serde::Serialize;
 
 /// A split handle whose concrete payload is erased by the reader adapter.
 /// The engine's chained TaskGroup lets readers self-manage splits, so the
@@ -62,7 +62,8 @@ impl SourceSplit for AnySplit {
 pub type BoxedSourceReader = Box<dyn SourceReader<Output = Row, Split = AnySplit>>;
 
 /// Type-erased sink writer consuming `Row`s with byte-serialized states.
-pub type BoxedSinkWriter = Box<dyn SinkWriter<Input = Row, WriterState = Vec<u8>, CommitInfo = Vec<u8>>>;
+pub type BoxedSinkWriter =
+    Box<dyn SinkWriter<Input = Row, WriterState = Vec<u8>, CommitInfo = Vec<u8>>>;
 
 /// Type-erased transform chain element.
 pub type BoxedTransform = Box<dyn Transform<Input = Row, Output = Row>>;
@@ -147,7 +148,10 @@ where
         Box::pin(async move { self.inner.open().await })
     }
 
-    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move { self.inner.write(record).await })
     }
 
@@ -212,7 +216,7 @@ impl SourceReader for FakeSeqSource {
             let mut row = Row::new(seatunnel_api::row::RowKind::Insert, 3);
             row.set(0, Field::Int64(self.emitted as i64));
             row.set(1, Field::String(format!("fake-row-{}", self.emitted)));
-            row.set(2, Field::Bool(self.emitted % 2 == 0));
+            row.set(2, Field::Bool(self.emitted.is_multiple_of(2)));
             self.emitted += 1;
             Ok(PollResult::Record(row))
         })
@@ -245,7 +249,10 @@ pub struct ConsoleSinkWriter {
 
 impl ConsoleSinkWriter {
     pub fn new(prefix: impl Into<String>) -> Self {
-        ConsoleSinkWriter { prefix: prefix.into(), written: 0 }
+        ConsoleSinkWriter {
+            prefix: prefix.into(),
+            written: 0,
+        }
     }
 }
 
@@ -259,7 +266,10 @@ impl SinkWriter for ConsoleSinkWriter {
         Box::pin(async { Ok(()) })
     }
 
-    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         self.written += 1;
         let line = row_to_json(&record);
         Box::pin(async move {
@@ -278,7 +288,9 @@ impl SinkWriter for ConsoleSinkWriter {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let n = self.written;
-        Box::pin(async move { Ok(serde_json::to_vec(&serde_json::json!({ "written": n })).unwrap()) })
+        Box::pin(
+            async move { Ok(serde_json::to_vec(&serde_json::json!({ "written": n })).unwrap()) },
+        )
     }
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
@@ -299,8 +311,12 @@ fn field_to_json(field: &Field) -> serde_json::Value {
         Field::UInt16(v) => (*v).into(),
         Field::UInt32(v) => (*v).into(),
         Field::UInt64(v) => (*v).into(),
-        Field::Float32(v) => serde_json::Number::from_f64(*v as f64).map(Value::Number).unwrap_or(Value::Null),
-        Field::Float64(v) => serde_json::Number::from_f64(*v).map(Value::Number).unwrap_or(Value::Null),
+        Field::Float32(v) => serde_json::Number::from_f64(*v as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        Field::Float64(v) => serde_json::Number::from_f64(*v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         Field::String(s) => Value::String(s.clone()),
         Field::Bytes(b) => Value::String(format!("0x{}", hex::encode(b))),
         Field::Decimal(d) => Value::String(d.to_string()),
@@ -369,7 +385,9 @@ pub struct FilterByIndexTransform {
 }
 
 impl FilterByIndexTransform {
-    pub fn new(index: usize, op: CompareOp, value: Option<Field>) -> Self {
+    // Private: callers go through `create_transforms`, which parses the
+    // crate-private `CompareOp`.
+    fn new(index: usize, op: CompareOp, value: Option<Field>) -> Self {
         FilterByIndexTransform { index, op, value }
     }
 }
@@ -412,10 +430,17 @@ impl Transform for FilterByIndexTransform {
                     },
                     _ => false,
                 };
-                if self.op == CompareOp::Eq { eq } else { !eq }
+                if self.op == CompareOp::Eq {
+                    eq
+                } else {
+                    !eq
+                }
             }
             CompareOp::Gt | CompareOp::Lt | CompareOp::Gte | CompareOp::Lte => {
-                let (Some(a), Some(b)) = (self.value.as_ref().and_then(numeric_value), numeric_value(field)) else {
+                let (Some(a), Some(b)) = (
+                    self.value.as_ref().and_then(numeric_value),
+                    numeric_value(field),
+                ) else {
                     return Ok(vec![]);
                 };
                 match self.op {
@@ -451,14 +476,21 @@ pub fn json_to_config_map(value: &serde_json::Value) -> HashMap<String, String> 
         match v {
             serde_json::Value::Object(map) => {
                 for (k, child) in map {
-                    let key = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{}.{}", prefix, k)
+                    };
                     walk(&key, child, out);
                 }
             }
             serde_json::Value::Array(items) => {
                 // Arrays are stored as comma-separated scalars when they hold
                 // scalars, otherwise as JSON text.
-                if items.iter().all(|i| i.is_string() || i.is_number() || i.is_boolean()) {
+                if items
+                    .iter()
+                    .all(|i| i.is_string() || i.is_number() || i.is_boolean())
+                {
                     let joined = items
                         .iter()
                         .map(scalar_to_string)
@@ -513,13 +545,17 @@ pub fn create_source(
 
     match lower.as_str() {
         "mysqlcdc" | "mysql" | "mysqlcdcsource" | "cdcmysql" => {
-            #[cfg(feature = "connector-mysql")]
+            #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_cdc_mysql::{MySqlCdcConfig, MySqlCdcReader};
                 let cfg = MySqlCdcConfig::from_config(&conn);
                 tracing::info!(
                     "factory: MySQL-CDC source → {}:{} db={} table={} startup={:?}",
-                    cfg.hostname, cfg.port, cfg.database_name, cfg.table_name, cfg.startup_mode
+                    cfg.hostname,
+                    cfg.port,
+                    cfg.database_name,
+                    cfg.table_name,
+                    cfg.startup_mode
                 );
                 let mut reader = MySqlCdcReader::new(cfg, None);
                 if let Some(bytes) = restore_state {
@@ -527,51 +563,95 @@ pub fn create_source(
                         .restore_from_state_bytes(bytes)
                         .map_err(|e| anyhow::anyhow!("restore MySQL CDC state: {}", e))?;
                 }
-                Ok(Box::new(ReaderAdapter { inner: reader, warned_splits: false }))
+                Ok(Box::new(ReaderAdapter {
+                    inner: reader,
+                    warned_splits: false,
+                }))
             }
-            #[cfg(not(feature = "connector-mysql"))]
+            #[cfg(not(feature = "connectors"))]
             {
                 let _ = (parallelism, restore_state);
-                Err(anyhow::anyhow!("MySQL CDC connector not compiled in (feature connector-mysql)"))
+                Err(anyhow::anyhow!(
+                    "MySQL CDC connector not compiled in (feature connector-mysql)"
+                ))
             }
         }
         "postgrescdc" | "postgres" | "postgresqlcdc" | "cdcpostgres" => {
-            #[cfg(feature = "connector-postgres")]
+            #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_cdc_postgres::{PostgresCdcConfig, PostgresCdcReader};
                 let cfg = PostgresCdcConfig::from_config(&conn);
-                tracing::info!("factory: Postgres-CDC source");
-                Ok(Box::new(ReaderAdapter { inner: PostgresCdcReader::new(cfg, None), warned_splits: false }))
+                tracing::info!(
+                    "factory: Postgres-CDC source → {}:{} db={} table={}.{}",
+                    cfg.hostname,
+                    cfg.port,
+                    cfg.database_name,
+                    cfg.schema_name,
+                    cfg.table_name
+                );
+                let mut reader = PostgresCdcReader::new(cfg, None);
+                if let Some(bytes) = restore_state {
+                    reader
+                        .restore_from_state_bytes(bytes)
+                        .map_err(|e| anyhow::anyhow!("restore Postgres CDC state: {}", e))?;
+                }
+                Ok(Box::new(ReaderAdapter {
+                    inner: reader,
+                    warned_splits: false,
+                }))
             }
-            #[cfg(not(feature = "connector-postgres"))]
+            #[cfg(not(feature = "connectors"))]
             {
                 let _ = (parallelism, restore_state);
                 Err(anyhow::anyhow!("Postgres CDC connector not compiled in"))
             }
         }
         "tidbcdc" | "tidb" | "cdctidb" => {
-            #[cfg(feature = "connector-tidb")]
+            #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_cdc_tidb::{TiDBCdcConfig, TiDBCdcReader};
                 let cfg = TiDBCdcConfig::from_config(&conn);
-                tracing::info!("factory: TiDB-CDC source");
-                Ok(Box::new(ReaderAdapter { inner: TiDBCdcReader::new(cfg, None, 0), warned_splits: false }))
+                tracing::info!(
+                    "factory: TiDB-CDC source → pd={:?} db={} table={} sql={}:{}",
+                    cfg.pd_addrs,
+                    cfg.database_name,
+                    cfg.table_name,
+                    cfg.conn.host,
+                    cfg.conn.port
+                );
+                let mut reader = TiDBCdcReader::new(cfg, None);
+                if let Some(bytes) = restore_state {
+                    reader
+                        .restore_from_state_bytes(bytes)
+                        .map_err(|e| anyhow::anyhow!("restore TiDB CDC state: {}", e))?;
+                }
+                Ok(Box::new(ReaderAdapter {
+                    inner: reader,
+                    warned_splits: false,
+                }))
             }
-            #[cfg(not(feature = "connector-tidb"))]
+            #[cfg(not(feature = "connectors"))]
             {
                 let _ = (parallelism, restore_state);
                 Err(anyhow::anyhow!("TiDB CDC connector not compiled in"))
             }
         }
         "kafka" | "kafkasource" => {
-            #[cfg(feature = "connector-kafka")]
+            #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_kafka::{KafkaSourceConfig, KafkaSourceReader};
                 let cfg = KafkaSourceConfig::from_config(&conn);
-                tracing::info!("factory: Kafka source topic={} brokers={}", cfg.topic, cfg.bootstrap_servers);
-                Ok(Box::new(ReaderAdapter { inner: KafkaSourceReader::new(cfg, None), warned_splits: false }))
+                tracing::info!(
+                    "factory: Kafka source topic={} brokers={}",
+                    cfg.topic,
+                    cfg.bootstrap_servers
+                );
+                Ok(Box::new(ReaderAdapter {
+                    inner: KafkaSourceReader::new(cfg, None),
+                    warned_splits: false,
+                }))
             }
-            #[cfg(not(feature = "connector-kafka"))]
+            #[cfg(not(feature = "connectors"))]
             {
                 let _ = (parallelism, restore_state);
                 Err(anyhow::anyhow!("Kafka connector not compiled in"))
@@ -579,44 +659,60 @@ pub fn create_source(
         }
         "fake" | "fake source" | "fakesource" => {
             let _ = (parallelism, restore_state);
-            Ok(Box::new(ReaderAdapter { inner: FakeSeqSource::default(), warned_splits: false }))
+            let total = config
+                .get("row.num")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10);
+            Ok(Box::new(ReaderAdapter {
+                inner: FakeSeqSource::with_total(total),
+                warned_splits: false,
+            }))
         }
         other => Err(anyhow::anyhow!("unknown source plugin '{}'", other)),
     }
 }
 
 /// Build the sink writer described by `plugin` + flat config.
-pub fn create_sink(plugin: &str, config: &HashMap<String, String>) -> anyhow::Result<BoxedSinkWriter> {
+pub fn create_sink(
+    plugin: &str,
+    config: &HashMap<String, String>,
+) -> anyhow::Result<BoxedSinkWriter> {
     use seatunnel_connector_common::ConnectorConfig;
     let conn = ConnectorConfig::new(config.clone());
     let lower = plugin.to_lowercase().replace(['-', '_'], "");
 
     match lower.as_str() {
         "kafka" | "kafkasink" => {
-            #[cfg(feature = "connector-kafka")]
+            #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_kafka::{KafkaSinkConfig, KafkaSinkWriter};
                 let cfg = KafkaSinkConfig::from_config(&conn);
                 tracing::info!(
                     "factory: Kafka sink topic={} brokers={} acks={}",
-                    cfg.topic, cfg.bootstrap_servers, cfg.acks
+                    cfg.topic,
+                    cfg.bootstrap_servers,
+                    cfg.acks
                 );
-                Ok(Box::new(SinkWriterAdapter { inner: KafkaSinkWriter::new(cfg) }))
+                Ok(Box::new(SinkWriterAdapter {
+                    inner: KafkaSinkWriter::new(cfg),
+                }))
             }
-            #[cfg(not(feature = "connector-kafka"))]
+            #[cfg(not(feature = "connectors"))]
             {
                 Err(anyhow::anyhow!("Kafka connector not compiled in"))
             }
         }
         "jdbc" | "jdbcsink" => {
-            #[cfg(feature = "connector-jdbc")]
+            #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_jdbc::{JdbcSinkConfig, JdbcSinkWriter};
                 let cfg = JdbcSinkConfig::from_config(&conn);
                 tracing::info!("factory: JDBC sink");
-                Ok(Box::new(SinkWriterAdapter { inner: JdbcSinkWriter::new(cfg, None) }))
+                Ok(Box::new(SinkWriterAdapter {
+                    inner: JdbcSinkWriter::new(cfg, None),
+                }))
             }
-            #[cfg(not(feature = "connector-jdbc"))]
+            #[cfg(not(feature = "connectors"))]
             {
                 Err(anyhow::anyhow!("JDBC connector not compiled in"))
             }
@@ -632,8 +728,8 @@ pub fn create_sink(plugin: &str, config: &HashMap<String, String>) -> anyhow::Re
 ///
 /// Recognized transform types:
 /// - `filter` with `{field_index, operator, value}`
-/// Unknown transforms produce an error — failing fast beats silently dropping
-/// user logic.
+///   Unknown transforms produce an error — failing fast beats silently dropping
+///   user logic.
 pub fn create_transforms(configs: &[serde_json::Value]) -> anyhow::Result<Vec<BoxedTransform>> {
     let mut chain: Vec<BoxedTransform> = Vec::with_capacity(configs.len());
     for cfg in configs {
@@ -645,11 +741,16 @@ pub fn create_transforms(configs: &[serde_json::Value]) -> anyhow::Result<Vec<Bo
             .to_lowercase();
         match plugin.as_str() {
             "filter" => {
-                let index = cfg.get("field_index").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    anyhow::anyhow!("filter transform requires integer 'field_index'")
-                })? as usize;
+                let index = cfg
+                    .get("field_index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("filter transform requires integer 'field_index'")
+                    })? as usize;
                 let op = CompareOp::parse(
-                    cfg.get("operator").and_then(|v| v.as_str()).unwrap_or("not_null"),
+                    cfg.get("operator")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("not_null"),
                 )?;
                 let value = cfg.get("value").map(json_scalar_to_field);
                 chain.push(Box::new(FilterByIndexTransform::new(index, op, value)));

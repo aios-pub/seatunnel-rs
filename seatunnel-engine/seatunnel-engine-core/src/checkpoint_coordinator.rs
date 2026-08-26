@@ -8,9 +8,7 @@ use std::fmt;
 use tokio::sync::mpsc;
 
 use crate::barrier::CheckpointBarrier;
-use crate::checkpoint::{
-    CheckpointConfig, CheckpointId, CheckpointState, CompletedCheckpoint, TaskCheckpointState,
-};
+use crate::checkpoint::{CheckpointConfig, CheckpointId, CompletedCheckpoint, TaskCheckpointState};
 use crate::checkpoint_storage::{CheckpointStorageBackend, InMemoryCheckpointStorage};
 use crate::recovery::{FailureEvent, RecoveryManager};
 
@@ -63,6 +61,7 @@ pub struct CheckpointCoordinator {
     completed_checkpoints: HashMap<CheckpointId, CompletedCheckpoint>,
 
     /// Channel to receive checkpoint reports from tasks.
+    #[allow(dead_code)] // reports are currently consumed via report_tx clones
     report_rx: mpsc::UnboundedReceiver<(CheckpointId, TaskCheckpointState)>,
     report_tx: mpsc::UnboundedSender<(CheckpointId, TaskCheckpointState)>,
 }
@@ -101,7 +100,7 @@ impl CheckpointCoordinator {
     }
 
     /// Trigger a new checkpoint.
-    pub fn trigger_checkpoint(&mut self, timestamp: i64) -> Option<CheckpointId> {
+    pub fn trigger_checkpoint(&mut self, _timestamp: i64) -> Option<CheckpointId> {
         if let Some((_, _)) = &self.pending_checkpoint {
             return None;
         }

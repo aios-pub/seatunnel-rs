@@ -20,11 +20,12 @@
 /// Mirrors Java's `ExecutionMode` and `MasterType`.
 /// - `Local`: Single process, embedded Master + Worker (对应 `-m local`)
 /// - `Cluster`: Connect to an external cluster (对应 `-m cluster`)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExecutionMode {
     /// Local mode: single process acting as both master and worker.
     /// No network communication needed. Fast startup, ideal for development
     /// and small batch jobs.
+    #[default]
     Local,
 
     /// Cluster mode: connect to an external distributed cluster.
@@ -33,12 +34,6 @@ pub enum ExecutionMode {
         /// List of cluster node addresses (host:port).
         addresses: Vec<String>,
     },
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        ExecutionMode::Local
-    }
 }
 
 impl std::fmt::Display for ExecutionMode {

@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-use serde::Serialize;
-
 /// A typed configuration option key.
 #[derive(Debug, Clone)]
 pub struct ConfigOption<T: Clone> {

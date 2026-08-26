@@ -174,17 +174,9 @@ fn build_transforms(config: &serde_json::Value) -> Vec<Box<dyn LocalTransform>> 
 
 /// Detect the sink type from the config.
 fn detect_sink(config: &serde_json::Value) -> &str {
-    if config
-        .get("sink")
-        .and_then(|s| s.get("console"))
-        .is_some()
-    {
+    if config.get("sink").and_then(|s| s.get("console")).is_some() {
         "console"
-    } else if config
-        .get("sink")
-        .and_then(|s| s.get("kafka"))
-        .is_some()
-    {
+    } else if config.get("sink").and_then(|s| s.get("kafka")).is_some() {
         "kafka"
     } else {
         "console"
@@ -232,10 +224,7 @@ fn format_field(field: &Field) -> String {
         Field::Json(v) => v.to_string(),
         Field::Array(arr) => format!(
             "[{}]",
-            arr.iter()
-                .map(format_field)
-                .collect::<Vec<_>>()
-                .join(", ")
+            arr.iter().map(format_field).collect::<Vec<_>>().join(", ")
         ),
         _ => format!("{:?}", field),
     }

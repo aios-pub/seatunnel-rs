@@ -58,6 +58,7 @@ type SharedMasterClient = Arc<Mutex<Option<MasterServiceClient<tonic::transport:
 /// Worker node that executes chained pipeline tasks assigned by the master.
 pub struct WorkerNode {
     worker_id: String,
+    #[allow(dead_code)] // reported to the master once registration is wired up
     address: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
@@ -109,7 +110,10 @@ impl WorkerNode {
         let cancel = Arc::new(CancellationToken::new());
         self.running_tasks.lock().await.insert(
             task_id.clone(),
-            RunningTaskHandle { job_id: job_id.clone(), cancel: cancel.clone() },
+            RunningTaskHandle {
+                job_id: job_id.clone(),
+                cancel: cancel.clone(),
+            },
         );
 
         let ctx = TaskExecCtx {
@@ -132,8 +136,8 @@ impl WorkerNode {
         self.running_tasks
             .lock()
             .await
-            .iter()
-            .map(|(tid, h)| seatunnel_engine_comm::TaskHeartbeat {
+            .keys()
+            .map(|tid| seatunnel_engine_comm::TaskHeartbeat {
                 task_id: tid.clone(),
                 state: 2, // TASK_RUNNING
                 processed_records: 0,
@@ -207,6 +211,9 @@ struct TaskExecCtx {
 
 /// Execute one descriptor end-to-end: build connectors, restore state, run
 /// the TaskGroup, and report every transition to the master.
+///
+/// Panics inside the pipeline are caught and converted into a FAILED report
+/// so a buggy connector cannot take down the whole worker process silently.
 async fn execute_descriptor(
     task: TaskDescriptor,
     ctx: TaskExecCtx,
@@ -215,10 +222,31 @@ async fn execute_descriptor(
     let task_id = task.task_id.clone();
     let job_id = task.job_id.clone();
 
-    report_transition_raw(&ctx.worker_id, &ctx.master_client, &job_id, &task_id, 2, 0, None)
-        .await;
+    report_transition_raw(
+        &ctx.worker_id,
+        &ctx.master_client,
+        &job_id,
+        &task_id,
+        2,
+        0,
+        None,
+    )
+    .await;
 
-    match run_pipeline(&task, &ctx, cancel).await {
+    let result = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_pipeline(
+        &task, &ctx, cancel,
+    )))
+    .await
+    {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(e)) => Err(e),
+        Err(panic_payload) => {
+            let msg = panic_message(&panic_payload);
+            Err(anyhow::anyhow!("task panicked: {}", msg))
+        }
+    };
+
+    match result {
         Ok(status) => {
             let (code, err) = match status.state {
                 TaskState::Completed => (3, None),
@@ -253,6 +281,16 @@ async fn execute_descriptor(
     }
 }
 
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 /// Build and run the chained pipeline for a descriptor.
 async fn run_pipeline(
     task: &TaskDescriptor,
@@ -263,16 +301,29 @@ async fn run_pipeline(
 
     let source_plugin = cfg.get("source.plugin").map(String::as_str).unwrap_or("");
     let source_config_raw = cfg.get("source.config").map(String::as_str).unwrap_or("{}");
-    let sink_plugin = cfg.get("sink.plugin").map(String::as_str).unwrap_or("console");
+    let sink_plugin = cfg
+        .get("sink.plugin")
+        .map(String::as_str)
+        .unwrap_or("console");
     let sink_config_raw = cfg.get("sink.config").map(String::as_str).unwrap_or("{}");
-    let transform_raw = cfg.get("transform.config").map(String::as_str).unwrap_or("[]");
+    let transform_raw = cfg
+        .get("transform.config")
+        .map(String::as_str)
+        .unwrap_or("[]");
     let checkpoint_interval: u64 = cfg
         .get("checkpoint.interval")
         .and_then(|v| v.parse().ok())
         .unwrap_or(crate::job_coordinator::DEFAULT_CHECKPOINT_INTERVAL_MS);
 
     let source_value: serde_json::Value = serde_json::from_str(source_config_raw)?;
-    let source_config = seatunnel_engine_core::connector_factory::json_to_config_map(&source_value);
+    let mut source_config =
+        seatunnel_engine_core::connector_factory::json_to_config_map(&source_value);
+    // Partition snapshot ranges across parallel subtasks.
+    source_config.insert("subtask.index".to_string(), task.task_index.to_string());
+    source_config.insert(
+        "subtask.count".to_string(),
+        task.parallelism.max(1).to_string(),
+    );
     let sink_value: serde_json::Value = serde_json::from_str(sink_config_raw)?;
     let sink_config = seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
     let transforms_cfg: Vec<serde_json::Value> = serde_json::from_str(transform_raw)?;
@@ -291,7 +342,12 @@ async fn run_pipeline(
             data
         });
 
-    let reader = create_source(source_plugin, &source_config, task.parallelism.max(1) as usize, restore_state.as_deref())?;
+    let reader = create_source(
+        source_plugin,
+        &source_config,
+        task.parallelism.max(1) as usize,
+        restore_state.as_deref(),
+    )?;
     let transforms = create_transforms(&transforms_cfg)?;
     let writer = create_sink(sink_plugin, &sink_config)?;
 
@@ -317,6 +373,7 @@ async fn run_pipeline(
 /// Checkpoint listener that persists state durably and reports success to the
 /// master over gRPC.
 struct TaskCheckpointReporter {
+    #[allow(dead_code)] // included in future checkpoint reports to the master
     worker_id: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
@@ -333,9 +390,9 @@ impl CheckpointListener for TaskCheckpointReporter {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // 1. Durable local persistence (crash recovery).
-            if let Err(e) =
-                self.state_store
-                    .save_checkpoint(job_id, task_id, checkpoint_id, &state)
+            if let Err(e) = self
+                .state_store
+                .save_checkpoint(job_id, task_id, checkpoint_id, &state)
             {
                 error!(
                     "Task {} checkpoint {}: local persist failed: {}",
@@ -380,8 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_assign_and_complete_fake_job() {
-        let worker =
-            Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("run")));
+        let worker = Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("run")));
         let mut config = HashMap::new();
         config.insert("source.plugin".to_string(), "Fake".to_string());
         config.insert(
@@ -410,13 +466,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_stops_running_task() {
-        let worker =
-            Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("cancel")));
+        let worker = Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("cancel")));
         let mut config = HashMap::new();
         config.insert("source.plugin".to_string(), "Kafka".to_string());
         config.insert(
             "source.config".to_string(),
-            serde_json::json!({ "bootstrap.servers": "127.0.0.1:19092", "topic": "never" }).to_string(),
+            serde_json::json!({ "bootstrap.servers": "127.0.0.1:19092", "topic": "never" })
+                .to_string(),
         );
         config.insert("sink.plugin".to_string(), "Console".to_string());
         config.insert("sink.config".to_string(), "{}".to_string());

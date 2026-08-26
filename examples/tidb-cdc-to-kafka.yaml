@@ -1,0 +1,41 @@
+# TiDB CDC → Kafka real-time sync job.
+#
+# Requires a real TiDB cluster (PD + TiKV + TiDB) reachable from workers:
+#   docker compose --profile tidb up -d
+#   # PD:      127.0.0.1:2379   TiKV: host.docker.internal:30160 (mapped 30160)
+#   # TiDB SQL: 127.0.0.1:14000
+#
+# Submit:
+#   seatunnel job submit -c examples/tidb-cdc-to-kafka.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: tidb-cdc-to-kafka
+  parallelism: 1
+  checkpoint.interval: 5000
+
+source:
+  TiDB-CDC:
+    # Placement Driver endpoints (gRPC client port)
+    pd-addrs: "127.0.0.1:2379"
+    database-name: seatunnel
+    table-name: users
+    # Snapshot chunking key (integer primary key)
+    split.column: id
+    # MySQL-compatible SQL endpoint for metadata + snapshot reads
+    conn-host: "127.0.0.1"
+    conn-port: 14000
+    conn-user: root
+    conn-password: ""
+    conn-database: seatunnel
+    # initial = full snapshot then stream; latest = stream only
+    startup.mode: initial
+    # TiKV advertises host.docker.internal (for the SQL container); rewrite
+    # it to 127.0.0.1 for workers running on the host.
+    store-address-rewrite: "host.docker.internal=127.0.0.1"
+
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    topic: tidb-users-cdc
+    format: json
+    acks: all

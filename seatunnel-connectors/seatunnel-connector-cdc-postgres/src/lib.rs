@@ -15,47 +15,73 @@
  * limitations under the License.
  */
 
-// _
-
 //! PostgreSQL CDC (Change Data Capture) connector.
 //!
-//! ## Architecture
-//! - Snapshot phase: SELECT ... LIMIT/OFFSET or partition-based parallel scans
-//! - Incremental phase: PostgreSQL logical replication via pgoutput protocol
-//! - Exactly-once: LSN-based watermark deduplication
-//! - Schema evolution: DDL event parsing from logical decoding output
+//! ## Pipeline semantics (mirrors the MySQL connector)
+//!
+//! ```text
+//! open()
+//!   ├─ tokio_postgres connect + ping          (fail ⇒ task error)
+//!   ├─ ensure publication exists & covers the table
+//!   ├─ SELECT pg_current_wal_lsn()            → baseline LSN (metadata)
+//!   ├─ cache column names/types               → uniform row layout
+//!   ├─ start logical-replication stream       → events buffer while snapshot runs
+//!   └─ enumerate snapshot splits              → disjoint id ranges per subtask
+//!
+//! poll_next()
+//!   ├─ SNAPSHOT phase
+//!   │    ├─ bounded drain of stream events into the replay buffer
+//!   │    └─ keyset-paginated `SELECT … WHERE id ∈ [start,end) AND id > :last`
+//!   └─ INCREMENTAL phase
+//!        └─ replay buffer first, then follow the live WAL stream forever
+//! ```
+//!
+//! Delivery guarantees: **at-least-once**. With `parallelism > 1`, snapshot
+//! ranges are partitioned across subtasks while subtask 0 alone streams the
+//! WAL; changes committed during the snapshot window are replayed on top of
+//! the snapshot, so nothing is lost (bounded duplicate window). Checkpoint
+//! state serializes phase, LSN, split progress and the column order so a
+//! restarted task resumes where it stopped.
 //!
 //! ## Requirements
-//! - PostgreSQL 10+ with logical replication enabled
-//! - `wal_level = logical` in postgresql.conf
-//! - `CREATE PUBLICATION seatunnel_pub FOR TABLE ...`
-//! - `CREATE_REPLICATION_SLOT` before first use
+//! - `wal_level = logical`; user with `REPLICATION` attribute
+//! - A publication covering the captured table (auto-created when absent)
+//! - Replication slot auto-creation is controlled by `auto-create-slot`
+//!   (default **true**, matching Debezium's behavior; disable and provision
+//!   out of band in production if slot loss must be a hard failure)
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use postgres_types::Type;
+use rustcdc::core::Operation;
+use rustcdc::source::postgres::{PostgresConnection, PostgresSourceConfig};
+use rustcdc::source::Source as _;
+use rustcdc::source::StreamHandle;
 use seatunnel_api::row::{Field, Row, RowKind};
-use serde::{Deserialize, Serialize};
-use tokio_postgres::{Client, NoTls};
 use seatunnel_api::schema::TableSchema;
 use seatunnel_api::source::{
     source_reader::{PollResult, SourceReader, SourceReaderContext},
     source_split::SourceSplit,
     source_split_enum::SourceSplitEnumeratorContext,
-    Source, Boundedness,
+    Boundedness, Source,
 };
+use seatunnel_connector_cdc_base::{CdcPhase, IncrementalSplit, SnapshotSplit, Watermark};
 use seatunnel_connector_common::ConnectorConfig;
-use seatunnel_connector_cdc_base::{
-    CdcPhase, IncrementalSplit, SnapshotSplit, Watermark,
-};
-use rustcdc::source::postgres::{
-    PostgresSourceConfig, PostgresConnection,
-};
-use rustcdc::source::{StreamHandle};
-use rustcdc::source::Source as _;
-use rustcdc::core::Operation;
+use serde::{Deserialize, Serialize};
+use tokio_postgres::{Client, NoTls};
+
+/// Maximum change rows buffered while the snapshot phase runs.
+const MAX_BUFFERED_STREAM_ROWS: usize = 65_536;
+
+/// Number of rows fetched per keyset-paginated snapshot query.
+const SNAPSHOT_BATCH_SIZE: i64 = 500;
+
+/// Consecutive stream errors tolerated before the task fails.
+const STREAM_ERROR_TOLERANCE: u32 = 5;
 
 /// Output row from PostgreSQL CDC.
 #[derive(Debug, Clone)]
@@ -125,8 +151,8 @@ impl Lsn {
         if parts.len() != 2 {
             return None;
         }
-        let high = u32::from_str_radix(parts[0], 16).ok()?;
-        let low = u32::from_str_radix(parts[1], 16).ok()?;
+        let high = u32::from_str_radix(parts[0].trim_start_matches('0').max("0"), 16).ok()?;
+        let low = u32::from_str_radix(parts[1].trim_start_matches('0').max("0"), 16).ok()?;
         Some(Lsn::new(high, low))
     }
 }
@@ -140,32 +166,6 @@ impl Default for Lsn {
 impl std::fmt::Display for Lsn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.fmt_hex())
-    }
-}
-
-/// PostgreSQL WAL output plugin format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalOutputPlugin {
-    PgOutput,
-    Wal2Json,
-    DecodingJson,
-    TestDecoding,
-}
-
-impl std::fmt::Display for WalOutputPlugin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WalOutputPlugin::PgOutput => write!(f, "pgoutput"),
-            WalOutputPlugin::Wal2Json => write!(f, "wal2json"),
-            WalOutputPlugin::DecodingJson => write!(f, "decoderbufs"),
-            WalOutputPlugin::TestDecoding => write!(f, "test_decoding"),
-        }
-    }
-}
-
-impl Default for WalOutputPlugin {
-    fn default() -> Self {
-        WalOutputPlugin::Wal2Json
     }
 }
 
@@ -206,20 +206,23 @@ impl PostgresCdcState {
 }
 
 /// PostgreSQL CDC startup mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PostgresStartupMode {
+    /// Full snapshot followed by streaming (default).
+    #[default]
     Initial,
+    /// Snapshot only, stop after the snapshot completes.
     SnapshotOnly,
+    /// Stream from the slot's position without a snapshot.
     Earliest,
+    /// Stream from now without a snapshot.
     Latest,
-    SpecificLsn { lsn: Lsn },
-    Timestamp { timestamp: i64 },
-}
-
-impl Default for PostgresStartupMode {
-    fn default() -> Self {
-        PostgresStartupMode::Initial
-    }
+    SpecificLsn {
+        lsn: Lsn,
+    },
+    Timestamp {
+        timestamp: i64,
+    },
 }
 
 /// PostgreSQL CDC configuration.
@@ -230,12 +233,21 @@ pub struct PostgresCdcConfig {
     pub username: String,
     pub password: String,
     pub database_name: String,
+    /// Schema containing the captured table (PostgreSQL "public" by default).
+    pub schema_name: String,
     pub table_name: String,
+    /// Split key column used for snapshot chunking (defaults to `id`).
+    pub split_column: String,
     pub publication_name: String,
     pub slot_name: String,
+    /// Create the replication slot automatically when absent.
+    pub auto_create_slot: bool,
     pub startup_mode: PostgresStartupMode,
-    pub wal_plugin: WalOutputPlugin,
     pub parallelism: usize,
+    /// This reader's subtask index / total count — snapshot ranges are
+    /// partitioned so each subtask scans a disjoint interval.
+    pub subtask_index: usize,
+    pub subtask_count: usize,
 }
 
 impl Default for PostgresCdcConfig {
@@ -246,12 +258,16 @@ impl Default for PostgresCdcConfig {
             username: "postgres".to_string(),
             password: String::new(),
             database_name: "seatunnel".to_string(),
+            schema_name: "public".to_string(),
             table_name: "users".to_string(),
+            split_column: "id".to_string(),
             publication_name: "seatunnel_pub".to_string(),
             slot_name: "seatunnel_slot".to_string(),
+            auto_create_slot: true,
             startup_mode: PostgresStartupMode::Initial,
-            wal_plugin: WalOutputPlugin::Wal2Json,
             parallelism: 4,
+            subtask_index: 0,
+            subtask_count: 1,
         }
     }
 }
@@ -264,29 +280,25 @@ impl PostgresCdcConfig {
             username: config.get_string("username", "postgres"),
             password: config.get_string("password", ""),
             database_name: config.get_string("database-name", "seatunnel"),
+            schema_name: config.get_string("schema-name", "public"),
             table_name: config.get_string("table-name", "users"),
+            split_column: config.get_string("split.column", "id"),
             publication_name: config.get_string("publication-name", "seatunnel_pub"),
             slot_name: config.get_string("slot-name", "seatunnel_slot"),
+            auto_create_slot: config.get_bool("auto-create-slot", true),
             startup_mode: config
                 .get("startup.mode")
                 .map(|s| match s.as_str() {
                     "initial" => PostgresStartupMode::Initial,
-                    "snapshot" => PostgresStartupMode::SnapshotOnly,
+                    "snapshot" | "snapshot-only" => PostgresStartupMode::SnapshotOnly,
                     "earliest" => PostgresStartupMode::Earliest,
                     "latest" => PostgresStartupMode::Latest,
                     _ => PostgresStartupMode::Initial,
                 })
                 .unwrap_or(PostgresStartupMode::Initial),
-            wal_plugin: config
-                .get("wal-plugin")
-                .map(|s| match s.to_lowercase().as_str() {
-                    "pgoutput" => WalOutputPlugin::PgOutput,
-                    "wal2json" => WalOutputPlugin::Wal2Json,
-                    "decoderbufs" => WalOutputPlugin::DecodingJson,
-                    _ => WalOutputPlugin::Wal2Json,
-                })
-                .unwrap_or(WalOutputPlugin::Wal2Json),
             parallelism: config.get_int("parallelism", 4) as usize,
+            subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
+            subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
         }
     }
 
@@ -296,12 +308,69 @@ impl PostgresCdcConfig {
             self.hostname, self.port, self.username, self.password, self.database_name
         )
     }
+
+    /// `"schema"."table"` reference for SQL.
+    fn qualified_table(&self) -> String {
+        format!("\"{}\".\"{}\"", self.schema_name, self.table_name)
+    }
+
+    /// `schema.table` entry for the publication / include list.
+    fn qualified_plain(&self) -> String {
+        format!("{}.{}", self.schema_name, self.table_name)
+    }
+}
+
+/// Extract an i64 split-key value from a row, honoring the column's actual
+/// type (int2/int4/int8/serial/numeric-text). Falls back to `default` when
+/// the value is NULL or unparseable — never panics.
+fn pg_extract_pk(row: &tokio_postgres::Row, idx: usize, ty: &Type, default: i64) -> i64 {
+    let parsed: Option<i64> = match *ty {
+        Type::INT8 => row.try_get::<_, Option<i64>>(idx).ok().flatten(),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)
+            .ok()
+            .flatten()
+            .map(i64::from),
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)
+            .ok()
+            .flatten()
+            .map(i64::from),
+        Type::OID => row
+            .try_get::<_, Option<u32>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v as i64),
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v as i64),
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v as i64),
+        Type::NUMERIC => row
+            .try_get::<_, Option<String>>(idx)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<i64>().ok()),
+        _ => row
+            .try_get::<_, Option<String>>(idx)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok()),
+    };
+    parsed.unwrap_or(default)
 }
 
 /// Convert a PostgreSQL row value to a SeaTunnel `Field` by deserializing directly.
-/// Returns `Field::Null` if the column value is NULL, otherwise deserializes based on type.
-fn postgres_row_value_to_field(row: &tokio_postgres::Row, col_idx: usize, col_type: &Type) -> Field {
-    // Check null via try_get returning Err (which indicates null for FromSql)
+fn postgres_row_value_to_field(
+    row: &tokio_postgres::Row,
+    col_idx: usize,
+    col_type: &Type,
+) -> Field {
     match *col_type {
         Type::BOOL => match row.try_get::<_, Option<bool>>(col_idx) {
             Ok(Some(v)) => Field::Bool(v),
@@ -327,47 +396,22 @@ fn postgres_row_value_to_field(row: &tokio_postgres::Row, col_idx: usize, col_ty
             Ok(Some(v)) => Field::Float64(v),
             _ => Field::Null,
         },
-        Type::TEXT | Type::VARCHAR | Type::CHAR | Type::BPCHAR | Type::NAME
-        | Type::UUID | Type::OID_VECTOR | Type::INT2_VECTOR
-        | Type::TIMESTAMP | Type::DATE | Type::TIME | Type::TIMESTAMPTZ
-        | Type::INTERVAL | Type::INET | Type::CIDR | Type::MACADDR
-        | Type::XML | Type::JSON | Type::JSONB | Type::NUMERIC => {
-            match row.try_get::<_, Option<String>>(col_idx) {
-                Ok(Some(v)) => Field::String(v),
-                _ => Field::Null,
-            }
-        }
+        Type::OID => match row.try_get::<_, Option<u32>>(col_idx) {
+            Ok(Some(v)) => Field::UInt32(v),
+            _ => Field::Null,
+        },
         Type::BYTEA => match row.try_get::<_, Option<Vec<u8>>>(col_idx) {
             Ok(Some(v)) => Field::Bytes(v),
             _ => Field::Null,
         },
-        _ => {
-            // For any other type, fall back to string representation
-            match row.try_get::<_, Option<String>>(col_idx) {
-                Ok(Some(v)) => Field::String(v),
-                _ => Field::Null,
-            }
-        }
+        // Everything else (TEXT/VARCHAR/NUMERIC/JSON/temporal/network/…) is
+        // read through its text representation — lossless enough for CDC
+        // transport and avoids panics on exotic types.
+        _ => match row.try_get::<_, Option<String>>(col_idx) {
+            Ok(Some(v)) => Field::String(v),
+            _ => Field::Null,
+        },
     }
-}
-
-/// Create default splits when PostgreSQL connection is unavailable.
-fn default_splits(config: &PostgresCdcConfig, parallelism: usize) -> Vec<PostgresCdcSplit> {
-    (0..parallelism)
-        .map(|i| {
-            let offset = i * 1000;
-            let limit = (i + 1) * 1000;
-            let mut snapshot = SnapshotSplit::new(
-                &config.database_name,
-                &config.table_name,
-                "id",
-                &offset.to_string(),
-                &limit.to_string(),
-            );
-            snapshot.id = format!("pg-{}-{}-shard-{}", config.database_name, config.table_name, i);
-            PostgresCdcSplit::Snapshot(snapshot)
-        })
-        .collect()
 }
 
 /// PostgreSQL CDC Source.
@@ -398,85 +442,26 @@ impl Source for PostgresCdcSource {
 
     fn enumerate_splits(
         &self,
-        context: &SourceSplitEnumeratorContext<Self::Split>,
+        _context: &SourceSplitEnumeratorContext<Self::Split>,
     ) -> anyhow::Result<Vec<Self::Split>> {
-        let parallelism = self.config.parallelism.max(1).min(context.parallelism);
-
-        // Try to connect synchronously via the tokio runtime to get real table info.
-        // If unavailable, fall back to default splits with fixed size.
-        let splits = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            match handle.block_on(async {
-                tokio_postgres::connect(&self.config.connection_string(), NoTls).await
-            }) {
-                Ok((client, _conn)) => {
-                    // Query row count for intelligent split sizing
-                    let count_sql = format!(
-                        "SELECT COUNT(*) FROM \"{}\".\"{}\"",
-                        self.config.database_name, self.config.table_name
-                    );
-                    match handle.block_on(client.query(&count_sql, &[])) {
-                        Ok(count_rows) => {
-                            let total_rows: i64 = count_rows
-                                .first()
-                                .and_then(|r| r.get::<_, Option<i64>>(0))
-                                .unwrap_or(0);
-                            let split_size = if total_rows > 0 {
-                                ((total_rows as usize) / parallelism).max(1)
-                            } else {
-                                1000
-                            };
-                            tracing::info!(
-                                "PostgreSQL CDC: table {}.{} has {} rows, using split size {}",
-                                self.config.database_name,
-                                self.config.table_name,
-                                total_rows,
-                                split_size
-                            );
-                            (0..parallelism)
-                                .map(|i| {
-                                    let offset = i * split_size;
-                                    let limit = (i + 1) * split_size;
-                                    let mut snapshot = SnapshotSplit::new(
-                                        &self.config.database_name,
-                                        &self.config.table_name,
-                                        "id",
-                                        &offset.to_string(),
-                                        &limit.to_string(),
-                                    );
-                                    snapshot.id = format!(
-                                        "pg-{}-{}-shard-{}",
-                                        self.config.database_name,
-                                        self.config.table_name,
-                                        i
-                                    );
-                                    PostgresCdcSplit::Snapshot(snapshot)
-                                })
-                                .collect()
-                        }
-                        Err(_) => default_splits(&self.config, parallelism),
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "PostgreSQL CDC: cannot connect to {} for split enumeration: {}. Using default splits.",
-                        self.config.connection_string(), e
-                    );
-                    default_splits(&self.config, parallelism)
-                }
-            }
-        } else {
-            // No tokio runtime available — use defaults
-            default_splits(&self.config, parallelism)
+        // Synchronous trait surface: run the async enumeration on the current
+        // runtime (or a temporary one outside tokio).
+        let ranges = {
+            let config = self.config.clone();
+            tokio_block_on(async move { enumerate_snapshot_ranges(&config).await })?
         };
-
-        tracing::info!(
-            "PostgreSQL CDC: enumerated {} snapshot splits for {}.{} publication={}",
-            splits.len(),
-            self.config.database_name,
-            self.config.table_name,
-            self.config.publication_name
-        );
-        Ok(splits)
+        Ok(ranges
+            .into_iter()
+            .map(|(start, end)| {
+                PostgresCdcSplit::Snapshot(SnapshotSplit::new(
+                    &self.config.database_name,
+                    &self.config.table_name,
+                    &self.config.split_column,
+                    &start.to_string(),
+                    &end.to_string(),
+                ))
+            })
+            .collect())
     }
 
     fn create_reader(
@@ -494,20 +479,8 @@ impl Source for PostgresCdcSource {
         _context: SourceReaderContext,
         state: &Self::State,
     ) -> anyhow::Result<Box<dyn SourceReader<Output = Self::Output, Split = Self::Split>>> {
-        let cdc_state = state;
-        let mut reader = PostgresCdcReader::new(
-            self.config.clone(),
-            self.schema.clone(),
-        );
-        reader.phase = cdc_state.phase;
-        reader.lsn = cdc_state.lsn;
-        reader.watermark = cdc_state.watermark.clone();
-        // Restore current_idx from offset if available
-        if let Some(idx_str) = cdc_state.offset.get("current_idx") {
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                reader.current_idx.set(idx);
-            }
-        }
+        let mut reader = PostgresCdcReader::new(self.config.clone(), self.schema.clone());
+        reader.apply_state(state.clone());
         Ok(Box::new(reader))
     }
 
@@ -520,20 +493,117 @@ impl Source for PostgresCdcSource {
     }
 }
 
+/// Compute this subtask's disjoint snapshot ranges from the live table:
+/// `[MIN(split_col), MAX(split_col)]` sliced into `subtask_count` intervals,
+/// of which only `subtask_index`'s slice is returned (as [start,end) pairs
+/// further chunked into ≤ SNAPSHOT_BATCH_SIZE spans).
+async fn enumerate_snapshot_ranges(config: &PostgresCdcConfig) -> anyhow::Result<Vec<(i64, i64)>> {
+    let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!("postgres enumeration connection closed: {}", e);
+        }
+    });
+
+    let sql = format!(
+        // Cast to bigint: MIN/MAX over an int4 column would otherwise return
+        // int4 and tokio_postgres refuses cross-type reads.
+        "SELECT MIN(\"{}\")::bigint, MAX(\"{}\")::bigint FROM {}",
+        config.split_column,
+        config.split_column,
+        config.qualified_table()
+    );
+    let row = client
+        .query_one(&sql, &[])
+        .await
+        .map_err(|e| anyhow::anyhow!("snapshot range query failed: {}", e))?;
+    let min_id: Option<i64> = row.get(0);
+    let max_id: Option<i64> = row.get(1);
+
+    let (Some(min_id), Some(max_id)) = (min_id, max_id) else {
+        tracing::info!(
+            "PostgreSQL CDC: table {} is empty; a single empty snapshot split is created",
+            config.qualified_table()
+        );
+        return Ok(vec![(0, 1)]);
+    };
+
+    let count = config.subtask_count.max(1);
+    let span = (max_id - min_id + 1).max(1);
+    let chunk = (span + count as i64 - 1) / count as i64;
+    let idx = config.subtask_index.min(count - 1) as i64;
+    let range_start = min_id + idx * chunk;
+    let range_end = (range_start + chunk).min(max_id + 1);
+    if range_start > max_id {
+        tracing::info!(
+            "PostgreSQL CDC: subtask {}/{} has an empty snapshot range",
+            config.subtask_index,
+            count
+        );
+        return Ok(vec![(0, 1)]);
+    }
+
+    let mut splits = Vec::new();
+    let mut cursor = range_start;
+    while cursor < range_end {
+        let end = (cursor + SNAPSHOT_BATCH_SIZE).min(range_end);
+        splits.push((cursor, end));
+        cursor = end;
+    }
+    tracing::info!(
+        "PostgreSQL CDC: subtask {}/{} enumerated {} split(s) for {} covering ids [{}, {})",
+        config.subtask_index,
+        count,
+        splits.len(),
+        config.qualified_table(),
+        range_start,
+        range_end
+    );
+    Ok(splits)
+}
+
+/// Run an async block even outside a tokio runtime (best-effort).
+fn tokio_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(fut),
+        Err(_) => tokio::runtime::Runtime::new()
+            .expect("spawn tokio runtime")
+            .block_on(fut),
+    }
+}
+
+/// A decoded change row waiting in the replay buffer.
+#[derive(Debug, Clone)]
+struct BufferedChange {
+    row: Row,
+}
+
 /// PostgreSQL CDC Source reader.
 pub struct PostgresCdcReader {
     config: PostgresCdcConfig,
+    #[allow(dead_code)] // retained for future schema-aware serialization
     schema: Option<TableSchema>,
     phase: CdcPhase,
-    splits: Vec<PostgresCdcSplit>,
-    current_idx: std::cell::Cell<usize>,
+    /// Remaining snapshot ranges `[start, end)` with keyset cursors.
+    pending_ranges: VecDeque<(i64, i64)>,
+    last_pk: i64,
+    current_idx: Cell<usize>,
     lsn: Lsn,
     watermark: Watermark,
-    client: Arc<parking_lot::Mutex<Option<Arc<Client>>>>,
+    /// Admin/snapshot connection (also used for publication provisioning).
+    admin_client: Arc<Mutex<Option<Arc<Client>>>>,
+    /// Cached column order so snapshot rows and streamed events align.
+    columns: Vec<String>,
+    column_types: Vec<Type>,
     /// Rustcdc connection for logical replication streaming.
     rustcdc_conn: Option<PostgresConnection>,
     /// Rustcdc stream handle for consuming CDC events.
     stream_handle: Option<Box<dyn StreamHandle>>,
+    /// Changes decoded from stream events awaiting emission (ordered).
+    stream_buffer: VecDeque<BufferedChange>,
+    stream_errors: u32,
+    /// True once the reader has finished its snapshot and should stop.
+    snapshot_only_done: bool,
 }
 
 impl PostgresCdcReader {
@@ -542,14 +612,332 @@ impl PostgresCdcReader {
             config,
             schema,
             phase: CdcPhase::Snapshot,
-            splits: Vec::new(),
-            current_idx: std::cell::Cell::new(0),
+            pending_ranges: VecDeque::new(),
+            last_pk: 0,
+            current_idx: Cell::new(0),
             lsn: Lsn::zero(),
             watermark: Watermark::Min,
-            client: Arc::new(parking_lot::Mutex::new(None)),
+            admin_client: Arc::new(Mutex::new(None)),
+            columns: Vec::new(),
+            column_types: Vec::new(),
             rustcdc_conn: None,
             stream_handle: None,
+            stream_buffer: VecDeque::new(),
+            stream_errors: 0,
+            snapshot_only_done: false,
         }
+    }
+
+    /// Apply previously snapshotted state (checkpoint restore path).
+    pub fn apply_state(&mut self, state: PostgresCdcState) {
+        self.phase = state.phase;
+        self.lsn = state.lsn;
+        self.watermark = state.watermark;
+        if let Some(idx) = state.offset.get("current_idx") {
+            self.current_idx.set(idx.parse().unwrap_or(0));
+        }
+        if let Some(Ok(cols)) = state
+            .offset
+            .get("columns")
+            .map(|s| serde_json::from_str::<Vec<String>>(s))
+        {
+            self.columns = cols;
+        }
+        if let Some(Ok(pk)) = state.offset.get("last_pk").map(|s| s.parse::<i64>()) {
+            self.last_pk = pk;
+        }
+        if let Some(Ok(ranges)) = state
+            .offset
+            .get("ranges")
+            .map(|s| serde_json::from_str::<Vec<(String, String)>>(s))
+        {
+            self.pending_ranges = ranges
+                .into_iter()
+                .map(|(a, b)| (a.parse::<i64>().unwrap_or(0), b.parse::<i64>().unwrap_or(0)))
+                .collect();
+        }
+        if self.phase == CdcPhase::Incremental {
+            self.pending_ranges.clear();
+        }
+        tracing::info!(
+            "PostgreSQL CDC reader: restored state phase={} lsn={} ranges={}",
+            self.phase,
+            self.lsn,
+            self.pending_ranges.len()
+        );
+    }
+
+    /// Deserialize + apply a serialized [`PostgresCdcState`].
+    pub fn restore_from_state_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let state: PostgresCdcState = serde_json::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("bad PG CDC state: {}", e))?;
+        self.apply_state(state);
+        Ok(())
+    }
+
+    async fn connect_admin(&mut self) -> anyhow::Result<Arc<Client>> {
+        if let Some(client) = self.admin_client.lock().clone() {
+            return Ok(client);
+        }
+        let (client, connection) =
+            tokio_postgres::connect(&self.config.connection_string(), NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!("postgres admin connection closed: {}", e);
+            }
+        });
+        let client = Arc::new(client);
+        *self.admin_client.lock() = Some(Arc::clone(&client));
+        Ok(client)
+    }
+
+    /// Ensure the publication exists and covers the captured table.
+    ///
+    /// Parallel subtasks may race here, so check/create runs under a
+    /// session-level advisory lock keyed on the publication name (auto
+    /// released if the session dies).
+    async fn ensure_publication(client: &Client, config: &PostgresCdcConfig) -> anyhow::Result<()> {
+        let lock_key = format!("seatunnel-pub-{}", config.publication_name);
+        client
+            .query_one("SELECT pg_advisory_lock(hashtext($1), 0)", &[&lock_key])
+            .await?;
+
+        let outcome = Self::ensure_publication_locked(client, config).await;
+
+        // Always release, even when the body failed.
+        if let Err(e) = client
+            .query_one("SELECT pg_advisory_unlock(hashtext($1), 0)", &[&lock_key])
+            .await
+        {
+            tracing::warn!("PostgreSQL CDC: failed to release publication lock: {}", e);
+        }
+        outcome
+    }
+
+    async fn ensure_publication_locked(
+        client: &Client,
+        config: &PostgresCdcConfig,
+    ) -> anyhow::Result<()> {
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM pg_catalog.pg_publication WHERE pubname = $1",
+                &[&config.publication_name],
+            )
+            .await?
+            .is_some();
+
+        if !exists {
+            tracing::info!(
+                "PostgreSQL CDC: creating publication '{}' for table {}",
+                config.publication_name,
+                config.qualified_table()
+            );
+            client
+                .execute(
+                    &format!(
+                        "CREATE PUBLICATION \"{}\" FOR TABLE {}",
+                        config.publication_name,
+                        config.qualified_table()
+                    ),
+                    &[],
+                )
+                .await?;
+            return Ok(());
+        }
+
+        // Publication exists — make sure our table is part of it.
+        let member = client
+            .query_opt(
+                "SELECT 1 FROM pg_catalog.pg_publication_tables \
+                 WHERE pubname = $1 AND schemaname = $2 AND tablename = $3",
+                &[
+                    &config.publication_name,
+                    &config.schema_name,
+                    &config.table_name,
+                ],
+            )
+            .await?
+            .is_some();
+        if !member {
+            tracing::info!(
+                "PostgreSQL CDC: adding {} to publication '{}'",
+                config.qualified_table(),
+                config.publication_name
+            );
+            client
+                .execute(
+                    &format!(
+                        "ALTER PUBLICATION \"{}\" ADD TABLE {}",
+                        config.publication_name,
+                        config.qualified_table()
+                    ),
+                    &[],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Cache column names/types so snapshot and streamed rows share layout.
+    async fn cache_columns(&mut self, client: &Client) -> anyhow::Result<()> {
+        let sql = format!("SELECT * FROM {} LIMIT 0", self.config.qualified_table());
+        let stmt = client.prepare(&sql).await?;
+        self.columns = stmt
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        self.column_types = stmt.columns().iter().map(|c| c.type_().clone()).collect();
+        if self.columns.is_empty() {
+            anyhow::bail!("table {} has no columns", self.config.qualified_table());
+        }
+        Ok(())
+    }
+
+    async fn baseline_lsn(&mut self, client: &Client) -> anyhow::Result<()> {
+        let row = client
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await?;
+        let txt: String = row.get(0);
+        if let Some(lsn) = Lsn::from_hex(&txt) {
+            self.lsn = lsn;
+            tracing::info!("PostgreSQL CDC reader: baseline LSN {}", txt);
+        }
+        Ok(())
+    }
+
+    fn build_rustcdc_config(&self) -> PostgresSourceConfig {
+        use rustcdc::core::SecretString;
+        use rustcdc::TransportConfig;
+        PostgresSourceConfig {
+            host: self.config.hostname.clone(),
+            port: self.config.port,
+            user: self.config.username.clone(),
+            password: SecretString::from(self.config.password.clone()),
+            database: self.config.database_name.clone(),
+            replication_slot_name: self.config.slot_name.clone(),
+            publication_name: self.config.publication_name.clone(),
+            // Docker/local PostgreSQL has no TLS; production deployments
+            // should prefer the TLS path (expose via config when needed).
+            transport: TransportConfig::Plaintext,
+            create_replication_slot_if_missing: self.config.auto_create_slot,
+            table_include_list: vec![self.config.qualified_plain()],
+            ..Default::default()
+        }
+    }
+
+    async fn start_stream(&mut self) -> anyhow::Result<()> {
+        let pg_config = self.build_rustcdc_config();
+        let mut conn = PostgresConnection::new(pg_config);
+        conn.connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("rustcdc connect failed: {}", e))?;
+        let handle = conn
+            .start_stream(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("replication stream failed: {}", e))?;
+        self.rustcdc_conn = Some(conn);
+        self.stream_handle = Some(handle);
+        self.stream_errors = 0;
+        tracing::info!(
+            "PostgreSQL CDC reader: stream started (slot={}, publication={})",
+            self.config.slot_name,
+            self.config.publication_name
+        );
+        Ok(())
+    }
+
+    /// Decode one stream event into the replay buffer using the cached
+    /// column order, tracking the LSN for checkpoints.
+    fn absorb_event(&mut self, event: rustcdc::Event) {
+        if !event.source.offset.is_empty() {
+            if let Some(new_lsn) = Lsn::from_hex(&event.source.offset) {
+                self.lsn = new_lsn;
+            }
+        }
+        let image = match event.op {
+            Operation::Insert | Operation::Read => event.after.map(|d| (RowKind::Insert, d)),
+            Operation::Update => event.after.map(|d| (RowKind::UpdateAfter, d)),
+            Operation::Delete => event.before.map(|d| (RowKind::Delete, d)),
+            _ => None,
+        };
+        let Some((kind, data)) = image else {
+            return;
+        };
+        let Some(obj) = data.as_object() else {
+            return;
+        };
+        // Layout identical to snapshot rows: cached column order.
+        let width = self.columns.len().max(obj.len());
+        let mut row = Row::new(kind, width);
+        for (i, col) in self.columns.iter().enumerate() {
+            row.set(
+                i,
+                obj.get(col).map(json_val_to_field).unwrap_or(Field::Null),
+            );
+        }
+        // Columns unknown at cache time (schema drift) are appended.
+        for (i, (key, val)) in obj.iter().enumerate() {
+            if !self.columns.iter().any(|c| c == key) {
+                let idx = self.columns.len() + i;
+                if idx < width {
+                    row.set(idx, json_val_to_field(val));
+                }
+            }
+        }
+        self.stream_buffer.push_back(BufferedChange { row });
+    }
+
+    /// Pull already-available stream events into the replay buffer with a
+    /// small wall-clock budget so snapshot reads are not starved.
+    async fn drain_stream_nonblocking(&mut self) {
+        if self.stream_handle.is_none() || self.stream_buffer.len() >= MAX_BUFFERED_STREAM_ROWS {
+            return;
+        }
+        match self.stream_handle.as_mut().unwrap().next_events(10).await {
+            Ok(events) => {
+                self.stream_errors = 0;
+                for event in events {
+                    self.absorb_event(event);
+                }
+            }
+            Err(e) => {
+                self.stream_errors += 1;
+                tracing::warn!(
+                    "PostgreSQL CDC stream error ({}/{}): {}",
+                    self.stream_errors,
+                    STREAM_ERROR_TOLERANCE,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Blocking-with-budget read used in the incremental phase.
+    async fn pump_stream(&mut self, timeout_ms: u64) -> anyhow::Result<()> {
+        let Some(handle) = self.stream_handle.as_mut() else {
+            return Ok(());
+        };
+        match handle.next_events(timeout_ms).await {
+            Ok(events) => {
+                self.stream_errors = 0;
+                for event in events {
+                    self.absorb_event(event);
+                }
+            }
+            Err(e) => {
+                self.stream_errors += 1;
+                if self.stream_errors >= STREAM_ERROR_TOLERANCE {
+                    anyhow::bail!(
+                        "logical replication stream failed {} times consecutively: {}",
+                        self.stream_errors,
+                        e
+                    );
+                }
+                tracing::warn!("PostgreSQL CDC stream error: {}", e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -557,212 +945,163 @@ impl SourceReader for PostgresCdcReader {
     type Output = PostgresCdcOutput;
     type Split = PostgresCdcSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
-        let config = self.config.clone();
-        let client_arc = Arc::clone(&self.client);
+    fn open(
+        &mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             tracing::info!(
-                "PostgreSQL CDC reader opening: {}.{} slot={}",
-                config.database_name,
-                config.table_name,
-                config.slot_name
+                "PostgreSQL CDC reader opening: {}.{} slot={} mode={:?}",
+                self.config.database_name,
+                self.config.table_name,
+                self.config.slot_name,
+                self.config.startup_mode
             );
 
-            // Build rustcdc PostgresSourceConfig
-            use rustcdc::core::SecretString;
-            let pg_config = PostgresSourceConfig {
-                host: config.hostname.clone(),
-                port: config.port,
-                user: config.username.clone(),
-                password: SecretString::from(config.password.clone()),
-                database: config.database_name.clone(),
-                replication_slot_name: config.slot_name.clone(),
-                publication_name: config.publication_name.clone(),
-                ..Default::default()
-            };
+            let resuming_incremental =
+                self.phase == CdcPhase::Incremental && self.lsn != Lsn::zero();
 
-            let mut conn = PostgresConnection::new(pg_config);
-            match conn.connect().await {
-                Ok(()) => {
-                    tracing::info!("PostgreSQL CDC reader connected via rustcdc");
-                    // Record the current WAL position as the baseline LSN
-                    // so the snapshot→incremental handoff does not skip WAL
-                    // events generated while snapshot reads were in flight.
-                    // (rustcdc records the stream start offset internally;
-                    //  the connector-level Lsn is advanced from event
-                    //  source offsets during the incremental phase.)
-                    match conn.start_stream(None).await {
-                        Ok(stream_handle) => {
-                            self.rustcdc_conn = Some(conn);
-                            self.stream_handle = Some(stream_handle);
-                            tracing::info!("PostgreSQL CDC reader stream started");
-                            Ok(())
-                        }
-                        Err(e) => {
-                            tracing::warn!("PostgreSQL CDC reader stream start failed: {}. Falling back to synthetic rows.", e);
-                            self.rustcdc_conn = Some(conn);
-                            Ok(())
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "PostgreSQL CDC reader failed to connect: {}. Falling back to synthetic rows.",
-                        e
-                    );
-                    // Also try connecting via tokio_postgres for snapshot phase,
-                    // and record the current WAL LSN as the handoff baseline.
-                    let conn_str = config.connection_string();
-                    match tokio_postgres::connect(&conn_str, NoTls).await {
-                        Ok((client, connection)) => {
-                            tokio::spawn(async move {
-                                if let Err(e) = connection.await {
-                                    eprintln!("PostgreSQL connection error: {}", e);
-                                }
-                            });
-                            *client_arc.lock() = Some(Arc::new(client));
-                            Ok(())
-                        }
-                        Err(e2) => {
-                            tracing::warn!("PostgreSQL CDC reader tokio_postgres connect also failed: {}", e2);
-                            Ok(())
-                        }
-                    }
-                }
+            // Admin/snapshot connection — fail loudly when unreachable.
+            let client = self.connect_admin().await?;
+
+            // Provision replication prerequisites (idempotent).
+            Self::ensure_publication(&client, &self.config).await?;
+
+            // Uniform row layout for both phases.
+            self.cache_columns(&client).await?;
+
+            // Baseline WAL position (metadata for observability/state).
+            if !resuming_incremental {
+                self.baseline_lsn(&client).await?;
+            } else {
+                tracing::info!(
+                    "PostgreSQL CDC reader: resuming from checkpoint LSN {}",
+                    self.lsn
+                );
             }
+
+            // Startup-mode shortcuts: streaming-only readers skip snapshot.
+            if !resuming_incremental {
+                match self.config.startup_mode {
+                    PostgresStartupMode::Latest
+                    | PostgresStartupMode::Earliest
+                    | PostgresStartupMode::SpecificLsn { .. } => {
+                        if let PostgresStartupMode::SpecificLsn { .. } = self.config.startup_mode {
+                            tracing::warn!(
+                                "PostgreSQL CDC: startup.mode=specific-lsn delegates resume positioning to the slot"
+                            );
+                        }
+                        self.phase = CdcPhase::Incremental;
+                        self.pending_ranges.clear();
+                    }
+                    PostgresStartupMode::Timestamp { .. } => {
+                        tracing::warn!("PostgreSQL CDC: startup.mode=timestamp not supported yet, using initial");
+                    }
+                    PostgresStartupMode::Initial | PostgresStartupMode::SnapshotOnly => {}
+                }
+            } else {
+                self.phase = CdcPhase::Incremental;
+                self.pending_ranges.clear();
+            }
+
+            let streams_wal = self.config.subtask_index == 0;
+
+            // Start the WAL stream before the snapshot so changes committed
+            // during the scan are buffered and replayed afterwards.
+            if streams_wal && !matches!(self.config.startup_mode, PostgresStartupMode::SnapshotOnly)
+            {
+                self.start_stream().await?;
+            }
+
+            // Seed snapshot splits unless a checkpoint supplied them or we
+            // are streaming-only.
+            if self.phase == CdcPhase::Snapshot && self.pending_ranges.is_empty() {
+                let ranges = enumerate_snapshot_ranges(&self.config).await?;
+                self.pending_ranges.extend(ranges);
+            }
+
+            Ok(())
         })
     }
 
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
-        let phase = self.phase;
-        let current_idx = self.current_idx.get();
-        let splits_clone = self.splits.clone();
-        let db = self.config.database_name.clone();
-        let tbl = self.config.table_name.clone();
-        let lsn_str = self.lsn.fmt_hex();
-        let watermark = self.watermark.clone();
-        let client = self.client.lock().clone();
-        let config_clone = self.config.clone();
-
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>,
+    > {
         Box::pin(async move {
-            if phase == CdcPhase::Incremental {
-                // Incremental phase: use rustcdc stream handle for real logical replication
-                if let Some(ref mut stream) = self.stream_handle {
-                    match stream.next_events(1000).await {
-                        Ok(events) if !events.is_empty() => {
-                            for event in events {
-                                // Convert rustcdc Event to SeatunnelRow.
-                                // INSERT -> Insert (after image)
-                                // UPDATE -> UpdateAfter (after image); the
-                                //           before image may be key-only under
-                                //           REPLICA IDENTITY DEFAULT
-                                // DELETE -> Delete (before image)
-                                let (row_kind, row_data) = match event.op {
-                                    Operation::Insert => (RowKind::Insert, event.after),
-                                    Operation::Update => (RowKind::UpdateAfter, event.after),
-                                    Operation::Delete => (RowKind::Delete, event.before),
-                                    _ => continue,
-                                };
-                                if let Some(data) = row_data {
-                                    if let Some(obj) = data.as_object() {
-                                        let field_count = obj.len();
-                                        let mut row = Row::new(row_kind, field_count + 2);
-                                        row.set(0, Field::String(db.clone()));
-                                        row.set(1, Field::String(tbl.clone()));
-                                        for (i, (_, val)) in obj.iter().enumerate() {
-                                            let field = json_val_to_field(val);
-                                            row.set(i + 2, field);
-                                        }
-                                        // Update LSN from event source offset
-                                        if !event.source.offset.is_empty() {
-                                            if let Some(new_lsn) = Lsn::from_hex(&event.source.offset) {
-                                                self.lsn = new_lsn;
-                                            }
-                                        }
-                                        return Ok(PollResult::Record(PostgresCdcOutput(row)));
-                                    }
-                                }
-                            }
-                        }
-                        Ok(_) => {
-                            // No events available, will emit synthetic watermark
-                        }
-                        Err(e) => {
-                            tracing::warn!("PostgreSQL CDC stream error: {}. Falling back to synthetic.", e);
-                        }
-                    }
-                }
-
-                // Fallback: emit a synthetic watermark row when no WAL changes available
-                let mut row = Row::new(RowKind::Insert, 4);
-                row.set(0, seatunnel_api::Field::String(db));
-                row.set(1, seatunnel_api::Field::String(tbl));
-                row.set(2, seatunnel_api::Field::String(lsn_str));
-                row.set(3, seatunnel_api::Field::Int64(match &watermark { Watermark::Value(v) => *v, _ => 0 }));
-                return Ok(PollResult::Record(PostgresCdcOutput(row)));
+            if self.phase == CdcPhase::Incremental {
+                return self.poll_incremental().await;
             }
 
-            // Snapshot phase
-            if current_idx < splits_clone.len() {
-                let split = &splits_clone[current_idx];
-                if let PostgresCdcSplit::Snapshot(s) = split {
-                    // Try to fetch real data from PostgreSQL
-                    if let Some(ref client) = client {
-                        let sql = format!(
-                            "SELECT * FROM \"{}\".\"{}\" LIMIT 100",
-                            s.database, s.table
-                        );
-                        match client.query(&sql, &[]).await {
-                            Ok(rows) => {
-                                if !rows.is_empty() {
-                                    // Build output row with actual data from the table
-                                    let mut row = Row::new(RowKind::Insert, 4);
-                                    row.set(0, Field::String(s.database.clone()));
-                                    row.set(1, Field::String(s.table.clone()));
-                                    // First column value as identifier from first row
-                                    let first_col_type = rows[0].columns()[0].type_().clone();
-                                    row.set(
-                                        2,
-                                        postgres_row_value_to_field(&rows[0], 0, &first_col_type),
-                                    );
-                                    // Serialize all rows as JSON
-                                    let mut fields_vec = Vec::new();
-                                    for pg_row in &rows {
-                                        let mut col_vals = Vec::new();
-                                        for (j, col) in pg_row.columns().iter().enumerate() {
-                                            col_vals.push(postgres_row_value_to_field(pg_row, j, col.type_()));
-                                        }
-                                        fields_vec.push(Field::Row(col_vals));
-                                    }
-                                    let json_val = serde_json::to_string(&fields_vec)
-                                        .unwrap_or_else(|_| "[]".to_string());
-                                    row.set(3, Field::String(json_val));
-                                    // Advance to next split
-                                    self.current_idx.set(current_idx + 1);
-                                    return Ok(PollResult::Record(PostgresCdcOutput(row)));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "PostgreSQL CDC reader query failed for {}.{}: {}. Falling back to synthetic rows.",
-                                    s.database, s.table, e
-                                );
-                            }
-                        }
-                    }
+            // ---- Snapshot phase ---------------------------------------
+            // Keep the WAL socket drained while chunk-scanning the table.
+            self.drain_stream_nonblocking().await;
 
-                    // Fallback: synthetic rows
-                    let mut row = Row::new(RowKind::Insert, 4);
-                    row.set(0, Field::String(s.database.clone()));
-                    row.set(1, Field::String(s.table.clone()));
-                    row.set(2, Field::String(s.start_key.clone()));
-                    row.set(3, Field::String(s.end_key.clone()));
-                    self.current_idx.set(current_idx + 1);
-                    return Ok(PollResult::Record(PostgresCdcOutput(row)));
-                }
+            // Emit buffered snapshot rows first.
+            if let Some(change) = self.stream_buffer.pop_front() {
+                return Ok(PollResult::Record(PostgresCdcOutput(change.row)));
             }
+
+            if let Some((start, end)) = self.pending_ranges.front().copied() {
+                let client = self.connect_admin().await?;
+                let sql = format!(
+                    "SELECT * FROM {} WHERE \"{}\" >= {} AND \"{}\" < {} AND \"{}\" > {} \
+                     ORDER BY \"{}\" ASC LIMIT {}",
+                    self.config.qualified_table(),
+                    self.config.split_column,
+                    start,
+                    self.config.split_column,
+                    end,
+                    self.config.split_column,
+                    self.last_pk,
+                    self.config.split_column,
+                    SNAPSHOT_BATCH_SIZE,
+                );
+                let rows = client.query(&sql, &[]).await?;
+                if rows.is_empty() {
+                    self.pending_ranges.pop_front();
+                    self.last_pk = 0;
+                    self.current_idx.set(self.current_idx.get() + 1);
+                    return Ok(PollResult::Empty);
+                }
+                let types: Vec<Type> = rows[0]
+                    .columns()
+                    .iter()
+                    .map(|c| c.type_().clone())
+                    .collect();
+                // Split-key cursor: read via the column's real type — int4
+                // ids are common and i64 reads would fail (or panic).
+                let pk_idx = 0;
+                let new_last_pk =
+                    pg_extract_pk(&rows[rows.len() - 1], pk_idx, &types[pk_idx], self.last_pk);
+                for r in rows.iter() {
+                    let field_count = r.columns().len();
+                    let mut row = Row::new(RowKind::Insert, field_count);
+                    for (j, ty) in types.iter().enumerate().take(field_count) {
+                        row.set(j, postgres_row_value_to_field(r, j, ty));
+                    }
+                    self.stream_buffer.push_back(BufferedChange { row });
+                }
+                self.last_pk = new_last_pk;
+                if let Some(change) = self.stream_buffer.pop_front() {
+                    return Ok(PollResult::Record(PostgresCdcOutput(change.row)));
+                }
+                return Ok(PollResult::Empty);
+            }
+
+            // All snapshot splits consumed.
+            if self.config.subtask_index != 0
+                || matches!(self.config.startup_mode, PostgresStartupMode::SnapshotOnly)
+            {
+                tracing::info!(
+                    "PostgreSQL CDC reader: subtask {}/{} snapshot complete, EOF (streaming handled by subtask 0)",
+                    self.config.subtask_index,
+                    self.config.subtask_count
+                );
+                self.snapshot_only_done = true;
+                return Ok(PollResult::EOF);
+            }
+            self.handle_no_more_splits();
             Ok(PollResult::Empty)
         })
     }
@@ -773,42 +1112,85 @@ impl SourceReader for PostgresCdcReader {
         let mut offset = HashMap::new();
         offset.insert("lsn".to_string(), self.lsn.fmt_hex());
         offset.insert("slot_name".to_string(), self.config.slot_name.clone());
-        offset.insert("current_idx".to_string(), self.current_idx.get().to_string());
+        offset.insert(
+            "current_idx".to_string(),
+            self.current_idx.get().to_string(),
+        );
+        offset.insert("last_pk".to_string(), self.last_pk.to_string());
+        if !self.columns.is_empty() {
+            if let Ok(json) = serde_json::to_string(&self.columns) {
+                offset.insert("columns".to_string(), json);
+            }
+        }
+        let ranges: Vec<(String, String)> = self
+            .pending_ranges
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        if !ranges.is_empty() {
+            if let Ok(json) = serde_json::to_string(&ranges) {
+                offset.insert("ranges".to_string(), json);
+            }
+        }
         let state = PostgresCdcState {
             phase: self.phase,
             lsn: self.lsn,
-            watermark: self.watermark.clone(),
+            watermark: self.watermark,
             offset,
         };
-        Box::pin(async move {
-            let bytes = serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e))?;
-            Ok(bytes)
-        })
+        Box::pin(async move { serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e)) })
     }
 
     fn add_splits(&mut self, splits: Vec<Self::Split>) {
         tracing::info!("PostgreSQL CDC reader: adding {} splits", splits.len());
-        self.splits.extend(splits);
+        for split in splits {
+            if let PostgresCdcSplit::Snapshot(s) = split {
+                if let (Ok(a), Ok(b)) = (s.start_key.parse::<i64>(), s.end_key.parse::<i64>()) {
+                    self.pending_ranges.push_back((a, b));
+                }
+            }
+        }
     }
 
     fn handle_no_more_splits(&mut self) {
         self.phase = CdcPhase::Incremental;
-        // Watermark transition: snapshot phase is complete. The incremental
-        // stream resumes from the current LSN recorded during open() (it is
-        // NOT reset here, so the handoff does not skip or duplicate WAL
-        // events produced while the snapshot was being read).
         self.watermark = match self.watermark {
-            Watermark::Min => Watermark::Value(1),
+            Watermark::Min => Watermark::Value(self.last_pk.max(0)),
             w => w,
         };
-        tracing::info!("PostgreSQL CDC reader: transitioning to incremental phase");
+        tracing::info!(
+            "PostgreSQL CDC reader: transitioning to incremental phase (replay buffer={})",
+            self.stream_buffer.len()
+        );
     }
 
-    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn close(
+        &mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
-            tracing::info!("PostgreSQL CDC reader closing");
+            self.stream_handle = None;
+            self.rustcdc_conn = None;
+            tracing::info!("PostgreSQL CDC reader closed");
             Ok(())
         })
+    }
+}
+
+impl PostgresCdcReader {
+    /// Incremental phase pump: replay buffer → live WAL stream → Empty.
+    async fn poll_incremental(&mut self) -> anyhow::Result<PollResult<PostgresCdcOutput>> {
+        if let Some(change) = self.stream_buffer.pop_front() {
+            return Ok(PollResult::Record(PostgresCdcOutput(change.row)));
+        }
+        if self.snapshot_only_done {
+            return Ok(PollResult::EOF);
+        }
+        // Bounded block keeps latency low without busy-spinning the loop.
+        self.pump_stream(250).await?;
+        if let Some(change) = self.stream_buffer.pop_front() {
+            return Ok(PollResult::Record(PostgresCdcOutput(change.row)));
+        }
+        Ok(PollResult::Empty)
     }
 }
 
@@ -818,25 +1200,48 @@ fn json_val_to_field(val: &serde_json::Value) -> Field {
         serde_json::Value::Null => Field::Null,
         serde_json::Value::Bool(b) => Field::Bool(*b),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { Field::Int64(i) }
-            else if let Some(u) = n.as_u64() { Field::UInt64(u) }
-            else if let Some(f) = n.as_f64() { Field::Float64(f) }
-            else { Field::Null }
+            if let Some(i) = n.as_i64() {
+                Field::Int64(i)
+            } else if let Some(u) = n.as_u64() {
+                Field::UInt64(u)
+            } else if let Some(f) = n.as_f64() {
+                Field::Float64(f)
+            } else {
+                Field::Null
+            }
         }
         serde_json::Value::String(s) => Field::String(s.clone()),
         serde_json::Value::Array(arr) => {
             let fields: Vec<Field> = arr.iter().map(json_val_to_field).collect();
             Field::Row(fields)
         }
-        serde_json::Value::Object(_) => {
-            Field::String(val.to_string())
-        }
+        serde_json::Value::Object(_) => Field::String(val.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config() -> PostgresCdcConfig {
+        PostgresCdcConfig {
+            hostname: "127.0.0.1".into(),
+            port: 1, // loopback port 1 is never our database
+            username: "postgres".into(),
+            password: "postgres".into(),
+            database_name: "seatunnel".into(),
+            schema_name: "public".into(),
+            table_name: "users".into(),
+            split_column: "id".into(),
+            publication_name: "seatunnel_pub".into(),
+            slot_name: "seatunnel_slot".into(),
+            auto_create_slot: true,
+            startup_mode: PostgresStartupMode::Initial,
+            parallelism: 1,
+            subtask_index: 0,
+            subtask_count: 1,
+        }
+    }
 
     #[test]
     fn test_lsn_operations() {
@@ -847,6 +1252,8 @@ mod tests {
         assert_eq!(hex, "12345678/ABCDEF01");
         let parsed = Lsn::from_hex(&hex).unwrap();
         assert_eq!(parsed.datum, lsn.datum);
+        // Lowercase + short forms parse too.
+        assert_eq!(Lsn::from_hex("0/16b6a70").unwrap().datum, 0x16B6A70);
     }
 
     #[test]
@@ -864,18 +1271,23 @@ mod tests {
         props.insert("hostname".to_string(), "pg-host".to_string());
         props.insert("port".to_string(), "5433".to_string());
         props.insert("database-name".to_string(), "mydb".to_string());
+        props.insert("schema-name".to_string(), "myschema".to_string());
         props.insert("table-name".to_string(), "users".to_string());
         props.insert("publication-name".to_string(), "my_pub".to_string());
         props.insert("slot-name".to_string(), "my_slot".to_string());
-        props.insert("wal-plugin".to_string(), "pgoutput".to_string());
+        props.insert("auto-create-slot".to_string(), "false".to_string());
+        props.insert("split.column".to_string(), "order_id".to_string());
         let config = ConnectorConfig::new(props);
         let pg_config = PostgresCdcConfig::from_config(&config);
         assert_eq!(pg_config.hostname, "pg-host");
         assert_eq!(pg_config.port, 5433);
         assert_eq!(pg_config.database_name, "mydb");
+        assert_eq!(pg_config.schema_name, "myschema");
         assert_eq!(pg_config.publication_name, "my_pub");
         assert_eq!(pg_config.slot_name, "my_slot");
-        assert_eq!(pg_config.wal_plugin, WalOutputPlugin::PgOutput);
+        assert!(!pg_config.auto_create_slot);
+        assert_eq!(pg_config.split_column, "order_id");
+        assert_eq!(pg_config.qualified_table(), "\"myschema\".\"users\"");
     }
 
     #[test]
@@ -894,34 +1306,67 @@ mod tests {
         assert!(conn_str.contains("mydb"));
     }
 
-    #[test]
-    fn test_postgres_cdc_enumerate_splits() {
-        let source = PostgresCdcSource::new(
-            PostgresCdcConfig {
-                parallelism: 3,
-                ..PostgresCdcConfig::default()
-            },
-            None,
-        );
-        let ctx = SourceSplitEnumeratorContext::new(4, "job-postgres");
-        let splits = source.enumerate_splits(&ctx).unwrap();
-        assert_eq!(splits.len(), 3);
+    #[tokio::test]
+    async fn open_fails_without_database() {
+        // No synthetic fallbacks: an unreachable database must fail the task.
+        let mut reader = PostgresCdcReader::new(test_config(), None);
+        let result = reader.open().await;
+        assert!(result.is_err(), "expected error, got {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn incremental_restore_skips_snapshot() {
+        let mut reader = PostgresCdcReader::new(test_config(), None);
+        reader.pending_ranges.push_back((0, 100));
+
+        let mut offset = HashMap::new();
+        offset.insert("lsn".to_string(), "0/16B6A70".to_string());
+        let state = PostgresCdcState {
+            phase: CdcPhase::Incremental,
+            lsn: Lsn::from_hex("0/16B6A70").unwrap(),
+            watermark: Watermark::Min,
+            offset,
+        };
+        reader.apply_state(state);
+        assert_eq!(reader.phase, CdcPhase::Incremental);
+        assert!(reader.pending_ranges.is_empty());
+        assert_eq!(reader.lsn.fmt_hex(), "00000000/016B6A70");
+    }
+
+    #[tokio::test]
+    async fn state_roundtrip_preserves_progress() {
+        let mut reader = PostgresCdcReader::new(test_config(), None);
+        reader.pending_ranges.push_back((100, 200));
+        reader.last_pk = 150;
+        reader.lsn = Lsn::from_hex("1/AB").unwrap();
+        reader.columns = vec!["id".into(), "name".into()];
+        let bytes = reader.snapshot_state().await.unwrap();
+
+        let mut restored = PostgresCdcReader::new(test_config(), None);
+        restored.restore_from_state_bytes(&bytes).unwrap();
+        assert_eq!(restored.last_pk, 150);
+        assert_eq!(restored.pending_ranges.front(), Some(&(100, 200)));
+        assert_eq!(restored.columns, vec!["id".to_string(), "name".to_string()]);
     }
 
     #[test]
-    fn test_postgres_cdc_state_serialization() {
-        let state = PostgresCdcState::new(CdcPhase::Incremental, Lsn::new(0, 1000))
-            .with_watermark(Watermark::Value(42));
-        let bytes = serde_json::to_vec(&state).unwrap();
-        let decoded: PostgresCdcState = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded.phase, CdcPhase::Incremental);
-        assert_eq!(decoded.lsn.datum, 1000);
-        assert_eq!(decoded.watermark, Watermark::Value(42));
-    }
+    fn absorb_event_uses_cached_column_order() {
+        let mut reader = PostgresCdcReader::new(test_config(), None);
+        reader.columns = vec!["id".into(), "name".into()];
 
-    #[test]
-    fn test_wal_plugin_display() {
-        assert_eq!(format!("{}", WalOutputPlugin::PgOutput), "pgoutput");
-        assert_eq!(format!("{}", WalOutputPlugin::Wal2Json), "wal2json");
+        let payload = serde_json::json!({"name": "bob", "id": 7});
+        let event = rustcdc::Event::builder("users", Operation::Insert)
+            .after(payload)
+            .source(rustcdc::SourceMetadata::new("postgres", "0/16B6A70", 1))
+            .build();
+        reader.absorb_event(event);
+
+        let change = reader.stream_buffer.pop_front().expect("buffered row");
+        assert_eq!(change.row.kind, RowKind::Insert);
+        assert_eq!(change.row.field_count(), 2);
+        // Column order follows the cached list, not JSON map ordering.
+        assert_eq!(change.row.get(0), &Field::Int64(7));
+        assert_eq!(change.row.get(1), &Field::String("bob".into()));
+        assert_eq!(reader.lsn.datum, 0x16B6A70);
     }
 }

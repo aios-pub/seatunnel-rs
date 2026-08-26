@@ -25,36 +25,39 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion, BatchSize};
-use rand::{Rng, SeedableRng};
+use criterion::{criterion_group, criterion_main, Criterion};
 use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use seatunnel_api::{
     row::{Row, RowKind},
-    schema::{TableSchema, ColumnDef},
+    schema::{ColumnDef, TableSchema},
     ColumnType,
 };
 use seatunnel_formats::MessageFormat;
 
 fn make_schema() -> TableSchema {
-    TableSchema::new("users", vec![
-        ColumnDef::new("id".to_string(), ColumnType::Int64),
-        ColumnDef::new("name".to_string(), ColumnType::String),
-        ColumnDef::new("email".to_string(), ColumnType::String),
-        ColumnDef::new("score".to_string(), ColumnType::Float64),
-        ColumnDef::new("active".to_string(), ColumnType::Bool),
-    ])
+    TableSchema::new(
+        "users",
+        vec![
+            ColumnDef::new("id".to_string(), ColumnType::Int64),
+            ColumnDef::new("name".to_string(), ColumnType::String),
+            ColumnDef::new("email".to_string(), ColumnType::String),
+            ColumnDef::new("score".to_string(), ColumnType::Float64),
+            ColumnDef::new("active".to_string(), ColumnType::Bool),
+        ],
+    )
 }
 
 fn make_row(rng: &mut SmallRng) -> Row {
     let mut row = Row::new(RowKind::Insert, 5);
     row.set(0, seatunnel_api::Field::Int64(rng.gen_range(0..1_000_000)));
-    row.set(1, seatunnel_api::Field::String(format!("user_{}", rng.gen_range(0..10_000))));
+    row.set(
+        1,
+        seatunnel_api::Field::String(format!("user_{}", rng.gen_range(0..10_000))),
+    );
     row.set(
         2,
-        seatunnel_api::Field::String(format!(
-            "{}@example.com",
-            rng.gen_range(0..100_000)
-        )),
+        seatunnel_api::Field::String(format!("{}@example.com", rng.gen_range(0..100_000))),
     );
     row.set(3, seatunnel_api::Field::Float64(rng.gen_range(0.0..100.0)));
     row.set(4, seatunnel_api::Field::Bool(rng.gen()));
@@ -100,7 +103,13 @@ fn bench_json_deserialization(c: &mut Criterion) {
     let bytes = seatunnel_formats::serialize(MessageFormat::Json, &schema, &row).unwrap();
     let mut group = c.benchmark_group("json_deserialization");
     group.bench_function("json_deserialize", |b| {
-        b.iter(|| black_box(seatunnel_formats::deserialize(MessageFormat::Json, &bytes, &schema)))
+        b.iter(|| {
+            black_box(seatunnel_formats::deserialize(
+                MessageFormat::Json,
+                &bytes,
+                &schema,
+            ))
+        })
     });
     group.finish();
 }
@@ -139,13 +148,21 @@ fn bench_text_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("text_serialization");
     group.bench_function("text_serialize", |b| {
         b.iter(|| {
-            black_box(seatunnel_formats::serialize(MessageFormat::Text, &schema, &row))
+            black_box(seatunnel_formats::serialize(
+                MessageFormat::Text,
+                &schema,
+                &row,
+            ))
         })
     });
     let bytes = seatunnel_formats::serialize(MessageFormat::Text, &schema, &row).unwrap();
     group.bench_function("text_deserialize", |b| {
         b.iter(|| {
-            black_box(seatunnel_formats::deserialize(MessageFormat::Text, &bytes, &schema))
+            black_box(seatunnel_formats::deserialize(
+                MessageFormat::Text,
+                &bytes,
+                &schema,
+            ))
         })
     });
     group.finish();

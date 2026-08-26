@@ -10,10 +10,8 @@
 //! - Persist checkpoint (resolved_ts) and provide retry with backoff
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::cdc_client::{CdcClient, RegionCdcStream};
@@ -63,6 +61,24 @@ pub struct CdcEngineConfig {
     pub checkpoint_ts: u64,
     /// Whether snapshot data still needs to be read (phase).
     pub request_snapshot: bool,
+    /// Store-address rewrites applied to leader addresses reported by PD
+    /// (host part only, first match wins). Typical use: a TiKV advertised on
+    /// `host.docker.internal` is rewritten to `127.0.0.1` for workers running
+    /// on the host, where that DNS name does not resolve.
+    pub address_rewrite: Vec<(String, String)>,
+}
+
+/// Apply the configured host rewrites to `addr` ("host:port").
+fn rewrite_address(addr: &str, rules: &[(String, String)]) -> String {
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return addr.to_string();
+    };
+    for (from, to) in rules {
+        if host == from {
+            return format!("{}:{}", to, port);
+        }
+    }
+    addr.to_string()
 }
 
 /// The TiKV CDC engine.
@@ -98,7 +114,34 @@ impl CdcEngine {
     pub async fn start(&mut self) -> anyhow::Result<()> {
         let pd_addr = self.config.pd_addrs.first().cloned().unwrap_or_default();
         let pd = PdClient::connect(&pd_addr).await?;
+        // Real PD rejects requests whose header carries a wrong cluster id —
+        // propagate the resolved id into every CDC request as well.
+        let resolved = pd.cluster_id();
+        if self.config.cluster_id != 0 && self.config.cluster_id != resolved {
+            tracing::warn!(
+                "TiKV CDC: configured cluster_id {} differs from PD-resolved {}; using {}",
+                self.config.cluster_id,
+                resolved,
+                resolved
+            );
+        }
+        self.config.cluster_id = resolved;
+        self.cdc = CdcClient::new(resolved);
+
+        // TiKV's CDC service rejects checkpoint_ts=0; resolve a real TSO so
+        // the stream starts "from now" (the snapshot overlap window is then
+        // replayed from the engine buffer — no loss).
+        let mut pd = pd;
+        if self.config.checkpoint_ts == 0 {
+            let tso = pd.get_tso().await?;
+            tracing::info!("TiKV CDC: resolved starting TSO {}", tso);
+            self.config.checkpoint_ts = tso;
+            self.global_resolved_ts = tso;
+        } else {
+            self.global_resolved_ts = self.config.checkpoint_ts;
+        }
         self.pd = Some(pd);
+
         self.discover_regions().await
     }
 
@@ -127,7 +170,7 @@ impl CdcEngine {
         }
         let start_key = ri.region.start_key.clone();
         let end_key = ri.region.end_key.clone();
-        let epoch = ri.region.region_epoch.clone();
+        let epoch = ri.region.region_epoch;
         // Resolve the leader store address via PD GetStore.
         let leader_addr = if let Some(pd) = self.pd.as_mut() {
             match pd.leader_address(&ri).await {
@@ -144,7 +187,7 @@ impl CdcEngine {
             epoch,
             stream: None,
             resolved_ts: 0,
-            leader_addr,
+            leader_addr: leader_addr.map(|a| rewrite_address(&a, &self.config.address_rewrite)),
             failures: 0,
         };
         self.regions.insert(region_id, state);
@@ -198,18 +241,11 @@ impl CdcEngine {
         let addr = region.leader_addr.clone().unwrap_or_default();
         let start_key = region.start_key.clone();
         let end_key = region.end_key.clone();
-        let epoch = region.epoch.clone();
+        let epoch = region.epoch;
         let checkpoint = self.config.checkpoint_ts;
         let stream = self
             .cdc
-            .open_region_stream(
-                &addr,
-                region_id,
-                epoch,
-                &start_key,
-                &end_key,
-                checkpoint,
-            )
+            .open_region_stream(&addr, region_id, epoch, &start_key, &end_key, checkpoint)
             .await?;
         if let Some(s) = self.regions.get_mut(&region_id) {
             s.stream = Some(stream);
@@ -218,13 +254,20 @@ impl CdcEngine {
         Ok(())
     }
 
-    /// Poll all region streams once, feeding events into the tracker.
-    /// Returns the number of events consumed.
+    /// Poll all region streams once with a bounded per-event wait, feeding
+    /// events into the tracker. Returns the number of events consumed.
     pub async fn poll(&mut self) -> anyhow::Result<usize> {
+        self.poll_with_budget(250).await
+    }
+
+    /// Like [`poll`](Self::poll) but each region read waits at most
+    /// `budget_ms` — used by snapshot-phase draining so table scans are not
+    /// starved by idle streams.
+    pub async fn poll_with_budget(&mut self, budget_ms: u64) -> anyhow::Result<usize> {
         // Periodically re-check PD for region split/merge (every 128 polls).
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_no = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if poll_no % 128 == 0 {
+        if poll_no.is_multiple_of(128) {
             if let Err(e) = self.refresh_regions().await {
                 tracing::warn!("TiKV CDC: region refresh failed: {}", e);
             }
@@ -233,6 +276,12 @@ impl CdcEngine {
         let mut consumed = 0usize;
         let mut had_event = false;
         let region_ids: Vec<u64> = self.regions.keys().copied().collect();
+        tracing::debug!(
+            "TiKV CDC: poll_with_budget({}ms) over {} region(s): {:?}",
+            budget_ms,
+            region_ids.len(),
+            region_ids
+        );
 
         for region_id in region_ids {
             // Open stream if needed.
@@ -265,14 +314,31 @@ impl CdcEngine {
                 }
             }
 
-            // Read one event batch from the region's stream.
+            // Read one event batch from the region's stream (bounded wait).
             let res = {
                 let region = self.regions.get(&region_id).unwrap();
                 match &region.stream {
-                    Some(stream) => stream.next_event().await,
+                    Some(stream) => match tokio::time::timeout(
+                        Duration::from_millis(budget_ms.max(1)),
+                        stream.next_event(),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            tracing::trace!("TiKV CDC: region {} poll budget expired", region_id);
+                            // Budget exhausted for this round — not an error.
+                            continue;
+                        }
+                    },
                     None => continue,
                 }
             };
+            match &res {
+                Ok(Some(_)) => tracing::debug!("TiKV CDC: region {} delivered an event", region_id),
+                Ok(None) => tracing::debug!("TiKV CDC: region {} stream ended (None)", region_id),
+                Err(e) => tracing::debug!("TiKV CDC: region {} read error: {}", region_id, e),
+            }
             match res {
                 Ok(Some(change_event)) => {
                     had_event = true;
@@ -303,8 +369,27 @@ impl CdcEngine {
     /// Handle one ChangeDataEvent from a region: ingest rows into the tracker
     /// and update the region's resolved_ts.
     fn handle_change_event(&mut self, region_id: u64, event: ChangeDataEvent) -> usize {
+        tracing::debug!(
+            "TiKV CDC: region {} change event ({} sub-events, resolved_ts={:?})",
+            region_id,
+            event.events.len(),
+            event.resolved_ts.as_ref().map(|t| t.ts)
+        );
+        let my_request_id = match self.regions.get(&region_id).and_then(|r| r.stream.as_ref()) {
+            Some(stream) => stream.request_id,
+            None => return 0,
+        };
         let mut row_count = 0;
         for ev in event.events {
+            // Another subscriber's events (different request_id) are not ours.
+            if ev.request_id != my_request_id {
+                tracing::debug!(
+                    "TiKV CDC: dropping sub-event for foreign request_id {} (ours {})",
+                    ev.request_id,
+                    my_request_id
+                );
+                continue;
+            }
             match ev.event {
                 Some(CdcEvent::Entries(entries)) => {
                     // `entries.entries` is Vec<cdcpb::event::Row> (i.e. CdcRow)
@@ -323,20 +408,24 @@ impl CdcEngine {
                     self.mark_for_reconnect(region_id);
                 }
                 Some(CdcEvent::Error(err)) => {
-                    tracing::warn!(
-                        "TiKV CDC: region {} reported error: {:?}",
-                        region_id,
-                        err
-                    );
+                    tracing::warn!("TiKV CDC: region {} reported error: {:?}", region_id, err);
                     self.mark_for_reconnect(region_id);
                 }
                 _ => {}
             }
         }
-        // Also update resolved_ts from the top-level ChangeDataEvent.resolved_ts
+        // Top-level resolved_ts is also scoped by request_id.
+        tracing::trace!(
+            "TiKV CDC: top-level resolved_ts={:?} rt.request_id={:?} ours={}",
+            event.resolved_ts.as_ref().map(|t| t.ts),
+            event.resolved_ts.as_ref().map(|t| t.request_id),
+            my_request_id
+        );
         if let Some(rt) = event.resolved_ts {
-            if let Some(r) = self.regions.get_mut(&region_id) {
-                r.resolved_ts = r.resolved_ts.max(rt.ts);
+            if rt.request_id == my_request_id {
+                if let Some(r) = self.regions.get_mut(&region_id) {
+                    r.resolved_ts = r.resolved_ts.max(rt.ts);
+                }
             }
         }
         row_count
@@ -407,7 +496,10 @@ impl CdcEngine {
     /// Persist the current checkpoint (resolved_ts) as a (key, value) offset map.
     pub fn checkpoint(&self) -> HashMap<String, String> {
         let mut m = HashMap::new();
-        m.insert("resolved_ts".to_string(), self.global_resolved_ts.to_string());
+        m.insert(
+            "resolved_ts".to_string(),
+            self.global_resolved_ts.to_string(),
+        );
         m.insert("table_id".to_string(), self.config.table_id.to_string());
         m
     }
@@ -428,7 +520,7 @@ impl CdcEngine {
 
     /// Close all region streams.
     pub async fn close(&mut self) {
-        for (_id, region) in self.regions.iter_mut() {
+        for region in self.regions.values_mut() {
             if let Some(stream) = region.stream.take() {
                 stream.close().await;
             }

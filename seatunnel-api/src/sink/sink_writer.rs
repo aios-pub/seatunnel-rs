@@ -19,6 +19,9 @@ use crate::row::Row;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Boxed future returned by async [`SinkWriter`] operations.
+pub type WriterFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
 pub trait SinkWriter: Send {
     type Input: Into<Row> + Send;
     type WriterState: serde::Serialize + Send + Sync;
@@ -27,17 +30,12 @@ pub trait SinkWriter: Send {
     /// Open the writer and initialize any lazily-created resources
     /// (e.g. a Kafka producer, JDBC connection pool). Called once
     /// before the first `write`. Mirrors `SourceReader::open`.
-    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn open(&mut self) -> WriterFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 
-    fn write(
-        &mut self,
-        record: Self::Input,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
-    fn prepare_commit(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>>;
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>>;
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
+    fn write(&mut self, record: Self::Input) -> WriterFuture<'_, ()>;
+    fn prepare_commit(&mut self) -> WriterFuture<'_, Vec<Self::CommitInfo>>;
+    fn snapshot_state(&mut self) -> WriterFuture<'_, Vec<u8>>;
+    fn close(&mut self) -> WriterFuture<'_, ()>;
 }

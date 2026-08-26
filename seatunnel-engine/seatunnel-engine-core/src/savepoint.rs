@@ -69,6 +69,12 @@ pub struct SavepointManager {
     savepoints: HashMap<String, Vec<Savepoint>>,
 }
 
+impl Default for SavepointManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SavepointManager {
     pub fn new() -> Self {
         SavepointManager {

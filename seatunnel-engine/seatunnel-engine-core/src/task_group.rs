@@ -26,26 +26,22 @@
 //!   1. `sink.prepare_commit()` — downstream data is flushed **first**
 //!   2. `reader.snapshot_state()` — source offset captured after the flush
 //!   3. listener notified with the serialized state (persist + report)
-//! Because the sink is flushed before the offset is recorded, a restart from
-//! any completed checkpoint replays at least once without losing records.
+//!      Because the sink is flushed before the offset is recorded, a restart from
+//!      any completed checkpoint replays at least once without losing records.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use seatunnel_api::row::Row;
 use seatunnel_api::schema::TableSchema;
-use seatunnel_api::source::source_reader::{PollResult, SourceReader};
-use seatunnel_api::transform::Transform;
-use seatunnel_api::sink::SinkWriter;
+use seatunnel_api::source::source_reader::PollResult;
 
 use crate::barrier::{BarrierTracker, CheckpointBarrier, StreamElement};
 use crate::checkpoint::CheckpointConfig;
 use crate::checkpoint_listener::CheckpointListener;
-use crate::connector_factory::{AnySplit, BoxedSinkWriter, BoxedSourceReader, BoxedTransform};
-use crate::task::{TaskId, TaskStatus};
+use crate::connector_factory::{BoxedSinkWriter, BoxedSourceReader, BoxedTransform};
 use crate::state::TaskState;
+use crate::task::{TaskId, TaskStatus};
 
 /// Context passed to each task during execution.
 #[derive(Clone)]
@@ -92,10 +88,7 @@ impl TaskContext {
         self
     }
 
-    pub fn with_checkpoint_listener(
-        mut self,
-        listener: Arc<dyn CheckpointListener>,
-    ) -> Self {
+    pub fn with_checkpoint_listener(mut self, listener: Arc<dyn CheckpointListener>) -> Self {
         self.checkpoint_listener = Some(listener);
         self
     }
@@ -161,10 +154,8 @@ impl TaskGroup {
         self.reader.open().await?;
         self.sink.open().await?;
 
-        let mut barrier_tracker = BarrierTracker::new(
-            self.context.task_id.clone(),
-            self.context.parallelism,
-        );
+        let mut barrier_tracker =
+            BarrierTracker::new(self.context.task_id.clone(), self.context.parallelism);
 
         let mut terminal_state = TaskState::Completed;
 
@@ -204,7 +195,9 @@ impl TaskGroup {
                 }
                 Ok(PollResult::EOF) => break,
                 Err(e) => {
-                    terminal_state = TaskState::Failed { error: e.to_string() };
+                    terminal_state = TaskState::Failed {
+                        error: e.to_string(),
+                    };
                     tracing::error!("Task {} failed in poll loop: {}", self.context.task_id, e);
                     break;
                 }
@@ -214,9 +207,15 @@ impl TaskGroup {
         if terminal_state == TaskState::Completed || terminal_state == TaskState::Cancelled {
             // Final flush of whatever the sink still buffers.
             if let Err(e) = self.sink.prepare_commit().await {
-                tracing::error!("Task {} final prepare_commit failed: {}", self.context.task_id, e);
+                tracing::error!(
+                    "Task {} final prepare_commit failed: {}",
+                    self.context.task_id,
+                    e
+                );
                 if terminal_state == TaskState::Completed {
-                    terminal_state = TaskState::Failed { error: format!("final sink flush failed: {}", e) };
+                    terminal_state = TaskState::Failed {
+                        error: format!("final sink flush failed: {}", e),
+                    };
                 }
             }
         }
@@ -271,14 +270,22 @@ impl TaskGroup {
         self.sink.prepare_commit().await?;
 
         // 2. Capture the source state after the flush.
-        let state = self.reader.snapshot_state().await.map_err(|e| {
-            anyhow::anyhow!("reader snapshot_state failed: {}", e)
-        })?;
+        let state = self
+            .reader
+            .snapshot_state()
+            .await
+            .map_err(|e| anyhow::anyhow!("reader snapshot_state failed: {}", e))?;
 
         // 3. Persist + report via the listener.
         if let Some(listener) = &self.context.checkpoint_listener {
             listener
-                .on_checkpoint(&self.context.job_id, &self.context.task_id, cp_id, now, state)
+                .on_checkpoint(
+                    &self.context.job_id,
+                    &self.context.task_id,
+                    cp_id,
+                    now,
+                    state,
+                )
                 .await;
         }
 

@@ -36,24 +36,20 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::Message as RdkafkaMessage;
-use serde::{Deserialize, Serialize};
 use seatunnel_api::{
     row::{Row, RowKind},
     schema::TableSchema,
+    sink::{sink_committer::SinkCommitter, sink_writer::SinkWriter, Sink, SinkWriterContext},
     source::{
         source_reader::{PollResult, SourceReader, SourceReaderContext},
         source_split::SourceSplit,
         source_split_enum::SourceSplitEnumeratorContext,
-        Source, Boundedness,
-    },
-    sink::{
-        sink_committer::SinkCommitter,
-        sink_writer::SinkWriter,
-        Sink, SinkWriterContext,
+        Boundedness, Source,
     },
 };
 use seatunnel_connector_common::ConnectorConfig;
 use seatunnel_formats::MessageFormat;
+use serde::{Deserialize, Serialize};
 
 /// The source data type produced by Kafka Source.
 #[derive(Debug, Clone)]
@@ -100,26 +96,36 @@ pub struct KafkaSourceState {
     pub offsets: HashMap<String, i64>,
 }
 
+impl Default for KafkaSourceState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KafkaSourceState {
     pub fn new() -> Self {
-        KafkaSourceState { offsets: HashMap::new() }
+        KafkaSourceState {
+            offsets: HashMap::new(),
+        }
     }
 }
 
 /// Startup mode for Kafka consumer offset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum KafkaStartupMode {
+    #[default]
     Earliest,
     Latest,
-    Timestamp { ts: i64 },
-    GroupOffset { group: String },
-    SpecificOffset { partition: i32, offset: i64 },
-}
-
-impl Default for KafkaStartupMode {
-    fn default() -> Self {
-        KafkaStartupMode::Earliest
-    }
+    Timestamp {
+        ts: i64,
+    },
+    GroupOffset {
+        group: String,
+    },
+    SpecificOffset {
+        partition: i32,
+        offset: i64,
+    },
 }
 
 /// Kafka Source configuration.
@@ -225,7 +231,10 @@ impl Source for KafkaSource {
         &self,
         _context: SourceReaderContext,
     ) -> anyhow::Result<Box<dyn SourceReader<Output = Self::Output, Split = Self::Split>>> {
-        Ok(Box::new(KafkaSourceReader::new(self.config.clone(), self.schema.clone())))
+        Ok(Box::new(KafkaSourceReader::new(
+            self.config.clone(),
+            self.schema.clone(),
+        )))
     }
 
     fn restore_reader(
@@ -233,7 +242,10 @@ impl Source for KafkaSource {
         _context: SourceReaderContext,
         _state: &Self::State,
     ) -> anyhow::Result<Box<dyn SourceReader<Output = Self::Output, Split = Self::Split>>> {
-        Ok(Box::new(KafkaSourceReader::new(self.config.clone(), self.schema.clone())))
+        Ok(Box::new(KafkaSourceReader::new(
+            self.config.clone(),
+            self.schema.clone(),
+        )))
     }
 
     fn get_output_schema(&self) -> Option<TableSchema> {
@@ -248,6 +260,7 @@ impl Source for KafkaSource {
 /// Kafka Source reader.
 pub struct KafkaSourceReader {
     config: KafkaSourceConfig,
+    #[allow(dead_code)] // retained for future schema-aware serialization
     schema: Option<TableSchema>,
     splits: Vec<KafkaSourceSplit>,
     /// Highest consumed offset per `topic-partition`, captured at checkpoint.
@@ -358,6 +371,12 @@ pub struct KafkaSinkSplit {
     pub id: String,
 }
 
+impl Default for KafkaSinkSplit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KafkaSinkSplit {
     pub fn new() -> Self {
         KafkaSinkSplit {
@@ -432,16 +451,13 @@ impl KafkaSinkConfig {
             acks: config.get_string("acks", "all"),
             batch_size: config.get_int("batch.size", 1000).max(1) as usize,
             transactions_enabled: tx_enabled,
-            transactional_id: config
-                .get("transactional.id")
-                .cloned()
-                .or_else(|| {
-                    if tx_enabled {
-                        Some(format!("seatunnel-sink-{}", uuid::Uuid::new_v4()))
-                    } else {
-                        None
-                    }
-                }),
+            transactional_id: config.get("transactional.id").cloned().or_else(|| {
+                if tx_enabled {
+                    Some(format!("seatunnel-sink-{}", uuid::Uuid::new_v4()))
+                } else {
+                    None
+                }
+            }),
             message_timeout_ms: config.get_int("message.timeout.ms", 30_000) as u64,
         }
     }
@@ -476,7 +492,15 @@ impl Sink for KafkaSink {
     fn create_writer(
         &self,
         _ctx: &SinkWriterContext,
-    ) -> anyhow::Result<Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>> {
+    ) -> anyhow::Result<
+        Box<
+            dyn SinkWriter<
+                Input = Self::Input,
+                WriterState = Self::WriterState,
+                CommitInfo = Self::CommitInfo,
+            >,
+        >,
+    > {
         Ok(Box::new(KafkaSinkWriter::new(self.config.clone())))
     }
 
@@ -484,7 +508,15 @@ impl Sink for KafkaSink {
         &self,
         _ctx: &SinkWriterContext,
         _states: &[Vec<u8>],
-    ) -> anyhow::Result<Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>> {
+    ) -> anyhow::Result<
+        Box<
+            dyn SinkWriter<
+                Input = Self::Input,
+                WriterState = Self::WriterState,
+                CommitInfo = Self::CommitInfo,
+            >,
+        >,
+    > {
         Ok(Box::new(KafkaSinkWriter::new(self.config.clone())))
     }
 
@@ -494,7 +526,14 @@ impl Sink for KafkaSink {
 
     fn create_committer(
         &self,
-    ) -> Option<Box<dyn SinkCommitter<CommitInfo = Self::CommitInfo, AggregatedCommitInfo = Self::AggregatedCommitInfo>>> {
+    ) -> Option<
+        Box<
+            dyn SinkCommitter<
+                CommitInfo = Self::CommitInfo,
+                AggregatedCommitInfo = Self::AggregatedCommitInfo,
+            >,
+        >,
+    > {
         Some(Box::new(KafkaSinkCommitter::new()))
     }
 }
@@ -531,7 +570,10 @@ impl KafkaSinkWriter {
         let mut builder = ClientConfig::new();
         builder
             .set("bootstrap.servers", &self.config.bootstrap_servers)
-            .set("message.timeout.ms", &self.config.message_timeout_ms.to_string())
+            .set(
+                "message.timeout.ms",
+                self.config.message_timeout_ms.to_string(),
+            )
             .set("acks", &self.config.acks);
         if self.config.transactions_enabled {
             let tx_id = self
@@ -578,10 +620,13 @@ impl KafkaSinkWriter {
         let mut failures = Vec::new();
         for record in &records {
             let payload = encode_row(record, &self.config.format);
-            match producer.send(
-                FutureRecord::<str, str>::to(&topic).payload(&payload),
-                Duration::from_millis(self.config.message_timeout_ms),
-            ).await {
+            match producer
+                .send(
+                    FutureRecord::<str, str>::to(&topic).payload(&payload),
+                    Duration::from_millis(self.config.message_timeout_ms),
+                )
+                .await
+            {
                 Ok(_) => sent += 1,
                 Err((e, _)) => failures.push(e.to_string()),
             }
@@ -636,7 +681,10 @@ impl SinkWriter for KafkaSinkWriter {
         })
     }
 
-    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         // Buffer the record; delivery happens at batch size or prepare_commit.
         self.batch.push(record);
         let full = self.batch.len() >= self.config.batch_size;
@@ -675,9 +723,7 @@ impl SinkWriter for KafkaSinkWriter {
             "total_written": self.total_written,
             "pending": self.batch.len(),
         });
-        Box::pin(async move {
-            serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e))
-        })
+        Box::pin(async move { serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e)) })
     }
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
@@ -693,7 +739,10 @@ impl SinkWriter for KafkaSinkWriter {
             if let Some(producer) = &self.producer {
                 producer.poll(Duration::from_secs(5));
             }
-            tracing::info!("KafkaSinkWriter: closed, total written: {}", self.total_written);
+            tracing::info!(
+                "KafkaSinkWriter: closed, total written: {}",
+                self.total_written
+            );
             Ok(())
         })
     }
@@ -739,8 +788,12 @@ fn field_to_json_value(field: &seatunnel_api::Field) -> serde_json::Value {
         Field::UInt16(v) => serde_json::Value::Number(serde_json::Number::from(*v as u64)),
         Field::UInt32(v) => serde_json::Value::Number(serde_json::Number::from(*v as u64)),
         Field::UInt64(v) => serde_json::Value::Number(serde_json::Number::from(*v)),
-        Field::Float32(v) => serde_json::Value::Number(serde_json::Number::from_f64(*v as f64).unwrap_or_else(|| serde_json::Number::from(0))),
-        Field::Float64(v) => serde_json::Value::Number(serde_json::Number::from_f64(*v).unwrap_or_else(|| serde_json::Number::from(0))),
+        Field::Float32(v) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*v as f64).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
+        Field::Float64(v) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*v).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
         Field::String(v) => serde_json::Value::String(v.clone()),
         Field::Bytes(v) => serde_json::Value::String(base64_encode(v)),
         Field::Decimal(v) => serde_json::Value::String(v.to_string()),
@@ -752,7 +805,9 @@ fn field_to_json_value(field: &seatunnel_api::Field) -> serde_json::Value {
         Field::Duration(v) => serde_json::Value::Number(serde_json::Number::from(*v)),
         Field::Array(v) => serde_json::Value::Array(v.iter().map(field_to_json_value).collect()),
         Field::Row(v) => {
-            let obj: serde_json::Map<String, serde_json::Value> = v.iter().enumerate()
+            let obj: serde_json::Map<String, serde_json::Value> = v
+                .iter()
+                .enumerate()
                 .map(|(i, f)| (i.to_string(), field_to_json_value(f)))
                 .collect();
             serde_json::Value::Object(obj)
@@ -789,9 +844,17 @@ pub struct KafkaSinkCommitter {
     completed: Vec<KafkaCommitInfo>,
 }
 
+impl Default for KafkaSinkCommitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KafkaSinkCommitter {
     pub fn new() -> Self {
-        KafkaSinkCommitter { completed: Vec::new() }
+        KafkaSinkCommitter {
+            completed: Vec::new(),
+        }
     }
 }
 
@@ -857,12 +920,18 @@ mod tests {
     fn test_kafka_sink_committer() {
         let mut committer = KafkaSinkCommitter::new();
         let infos = vec![
-            KafkaCommitInfo { transaction_id: "t1".to_string(), messages_count: 10 },
-            KafkaCommitInfo { transaction_id: "t2".to_string(), messages_count: 5 },
+            KafkaCommitInfo {
+                transaction_id: "t1".to_string(),
+                messages_count: 10,
+            },
+            KafkaCommitInfo {
+                transaction_id: "t2".to_string(),
+                messages_count: 5,
+            },
         ];
         let mut future = committer.commit(infos);
         let waker = std::task::Waker::noop();
-        let ctx = &mut std::task::Context::from_waker(&waker);
+        let ctx = &mut std::task::Context::from_waker(waker);
         let result = match std::pin::Pin::new(&mut future).poll(ctx) {
             std::task::Poll::Ready(r) => r.unwrap(),
             _ => panic!("unexpected pending"),

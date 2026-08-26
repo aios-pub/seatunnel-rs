@@ -12,15 +12,14 @@ use seatunnel_engine_comm::{
     CancelJobRequest, ClientServiceClient, ClusterInfo, JobList, JobStatus, JobStatusRequest,
     SubmitJobRequest, SubmitJobResponse,
 };
-use std::collections::HashMap;
-use tokio::sync::mpsc;
 use tonic::Request;
-use tracing::{error, info};
+use tracing::info;
 
 /// Engine client for submitting and managing jobs.
 pub struct EngineClient {
     grpc_address: String,
     rest_address: String,
+    #[allow(dead_code)] // reserved for REST-based fallback operations
     http: HttpClient,
 }
 

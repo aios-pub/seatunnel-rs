@@ -19,6 +19,7 @@
 //!
 //! Mirrors Java's `SeaTunnelSink`, `SinkWriter`, and `SinkCommitter`.
 
+#[allow(clippy::module_inception)] // public path `sink::sink` is part of the API
 pub mod sink;
 pub mod sink_committer;
 pub mod sink_writer;

@@ -25,8 +25,8 @@
 //! - [SelectTransform]: column projection
 
 use seatunnel_api::{
-    row::{Row, RowKind},
-    schema::{TableSchema, ColumnDef},
+    row::Row,
+    schema::{ColumnDef, TableSchema},
     transform::Transform,
 };
 
@@ -157,9 +157,7 @@ impl Transform for FanoutTransform {
 
     fn process(&mut self, record: Self::Input) -> anyhow::Result<Vec<Self::Output>> {
         match &self.mode {
-            FanoutMode::All => {
-                Ok(vec![record; self.fan_count])
-            }
+            FanoutMode::All => Ok(vec![record; self.fan_count]),
             FanoutMode::First { index } => {
                 if *index < self.fan_count {
                     Ok(vec![record])
@@ -281,6 +279,12 @@ pub struct TransformPipeline {
     transforms: Vec<Box<dyn Transform<Input = Row, Output = Row>>>,
 }
 
+impl Default for TransformPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransformPipeline {
     pub fn new() -> Self {
         TransformPipeline {
@@ -306,7 +310,6 @@ impl TransformPipeline {
     }
 }
 
-
 /// SQL transform powered by Apache DataFusion.
 ///
 /// Allows filtering, aggregation, and projection via SQL:
@@ -317,14 +320,10 @@ impl TransformPipeline {
 pub mod sql {
     use std::sync::Arc;
 
-    use datafusion::{
-        execution::context::SessionContext,
-        dataframe::DataFrame,
-        prelude::*,
-    };
+    use datafusion::{dataframe::DataFrame, execution::context::SessionContext, prelude::*};
     use seatunnel_api::{
         row::{Row, RowKind},
-        schema::{TableSchema, ColumnDef},
+        schema::{ColumnDef, TableSchema},
         transform::Transform,
         ColumnType,
     };
@@ -352,11 +351,7 @@ pub mod sql {
             ctx: &SessionContext,
             df: &DataFrame,
         ) -> datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
-            df.clone()
-                .sql(&self.sql)
-                .await
-                .collect()
-                .await
+            df.clone().sql(&self.sql).await.collect().await
         }
     }
 
@@ -389,18 +384,21 @@ pub mod sql {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seatunnel_api::row::RowKind;
     use seatunnel_api::ColumnType;
 
     fn make_schema() -> TableSchema {
-        TableSchema::new("test", vec![
-            ColumnDef::new("id".to_string(), ColumnType::Int64),
-            ColumnDef::new("name".to_string(), ColumnType::String),
-            ColumnDef::new("active".to_string(), ColumnType::Bool),
-        ])
+        TableSchema::new(
+            "test",
+            vec![
+                ColumnDef::new("id".to_string(), ColumnType::Int64),
+                ColumnDef::new("name".to_string(), ColumnType::String),
+                ColumnDef::new("active".to_string(), ColumnType::Bool),
+            ],
+        )
     }
 
     struct EvenIdFilter;
@@ -488,7 +486,10 @@ mod tests {
         row.set(1, seatunnel_api::Field::String("test".to_string()));
         let result = t.process(row).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(*result[0].get(0), seatunnel_api::Field::String("test".to_string()));
+        assert_eq!(
+            *result[0].get(0),
+            seatunnel_api::Field::String("test".to_string())
+        );
         assert_eq!(*result[0].get(1), seatunnel_api::Field::Int64(42));
     }
 

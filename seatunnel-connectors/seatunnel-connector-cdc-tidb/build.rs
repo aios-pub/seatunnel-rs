@@ -69,11 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Include paths: proto dir for inter-proto imports, proto/include for
     // gogoproto/gogo.proto and rustproto.proto custom options.
-    let includes = [
-        "proto",
-        "proto/include",
-    ]
-    .map(|p| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(p));
+    let includes =
+        ["proto", "proto/include"].map(|p| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(p));
 
     tonic_build::configure()
         .build_server(false)

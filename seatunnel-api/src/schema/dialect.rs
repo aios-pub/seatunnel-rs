@@ -29,20 +29,19 @@ pub trait DatabaseDialect: Send + Sync {
 
 /// Async schema discovery (returned as Pin<Box<dyn Future>> for dyn compatibility).
 pub trait SchemaDiscovery: Send + Sync {
-    fn discover_columns(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Vec<ColumnDef>, Box<dyn std::error::Error + Send + Sync>>>
-                + '_,
-        >,
-    >;
+    fn discover_columns(&self, database: &str, table: &str) -> DiscoverColumnsFuture<'_>;
 }
 
+/// Boxed future returned by [`SchemaDiscovery::discover_columns`].
+pub type DiscoverColumnsFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<ColumnDef>, Box<dyn std::error::Error + Send + Sync>>> + 'a>,
+>;
+
+#[allow(dead_code)]
 pub struct MySqlDialect;
+#[allow(dead_code)]
 pub struct PostgresDialect;
+#[allow(dead_code)]
 pub struct TiDbDialect;
 
 impl DatabaseDialect for MySqlDialect {
@@ -111,16 +110,7 @@ impl DatabaseDialect for MySqlDialect {
 }
 
 impl SchemaDiscovery for MySqlDialect {
-    fn discover_columns(
-        &self,
-        _database: &str,
-        _table: &str,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Vec<ColumnDef>, Box<dyn std::error::Error + Send + Sync>>>
-                + '_,
-        >,
-    > {
+    fn discover_columns(&self, _database: &str, _table: &str) -> DiscoverColumnsFuture<'_> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -190,16 +180,7 @@ impl DatabaseDialect for PostgresDialect {
 }
 
 impl SchemaDiscovery for PostgresDialect {
-    fn discover_columns(
-        &self,
-        _database: &str,
-        _table: &str,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Vec<ColumnDef>, Box<dyn std::error::Error + Send + Sync>>>
-                + '_,
-        >,
-    > {
+    fn discover_columns(&self, _database: &str, _table: &str) -> DiscoverColumnsFuture<'_> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -217,16 +198,7 @@ impl DatabaseDialect for TiDbDialect {
 }
 
 impl SchemaDiscovery for TiDbDialect {
-    fn discover_columns(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Vec<ColumnDef>, Box<dyn std::error::Error + Send + Sync>>>
-                + '_,
-        >,
-    > {
+    fn discover_columns(&self, database: &str, table: &str) -> DiscoverColumnsFuture<'_> {
         MySqlDialect.discover_columns(database, table)
     }
 }

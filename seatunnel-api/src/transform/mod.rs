@@ -19,7 +19,6 @@
 //!
 //! Mirrors Java's `SeaTunnelTransform`.
 
-use crate::row::Row;
 use crate::schema::TableSchema;
 
 /// A transform that processes data records.

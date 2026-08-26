@@ -8,8 +8,6 @@
 //! This is the foundational data model for the distributed engine.
 
 use chrono::Utc;
-use std::collections::HashMap;
-use std::fmt;
 use uuid::Uuid;
 
 pub mod barrier;
@@ -32,19 +30,19 @@ pub mod task_group;
 // Re-export key types
 pub use barrier::{BarrierTracker, CheckpointBarrier, StreamElement};
 pub use checkpoint::{
-    CheckpointConfig, CheckpointId, CheckpointState, CompletedCheckpoint, TaskCheckpointState,
-    CheckpointStorage,
+    CheckpointConfig, CheckpointId, CheckpointState, CheckpointStorage, CompletedCheckpoint,
+    TaskCheckpointState,
 };
 pub use checkpoint_coordinator::CheckpointCoordinator;
 pub use checkpoint_listener::{CheckpointListener, NopCheckpointListener};
+pub use checkpoint_storage::{
+    CheckpointStorageBackend, CheckpointStorageError, HDFSCheckpointStorage,
+    InMemoryCheckpointStorage, LocalCheckpointStorage, S3CheckpointStorage,
+};
 #[cfg(feature = "connectors")]
 pub use connector_factory::{
     create_sink, create_source, create_transforms, AnySplit, BoxedSinkWriter, BoxedSourceReader,
     BoxedTransform, ConsoleSinkWriter, FakeSeqSource,
-};
-pub use checkpoint_storage::{
-    CheckpointStorageBackend, CheckpointStorageError, HDFSCheckpointStorage,
-    InMemoryCheckpointStorage, LocalCheckpointStorage, S3CheckpointStorage,
 };
 pub use dag::{Pipeline, Stage, StageType};
 pub use execution::ExecutionMode;

@@ -44,6 +44,7 @@ impl<Split: SourceSplit> SourceSplitEnumeratorContext<Split> {
 /// 2. `run()` — main loop: assign splits, handle requests
 /// 3. `snapshot_state()` — checkpoint state
 /// 4. `close()` — cleanup
+#[allow(async_fn_in_trait)]
 pub trait SourceSplitEnumerator: Send {
     /// The split type.
     type Split: SourceSplit;

@@ -20,10 +20,10 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use seatunnel_api::{row::Row, source::source_split::SourceSplit, schema::TableSchema};
+use seatunnel_api::{row::Row, schema::TableSchema, source::source_split::SourceSplit};
 
 /// Configuration for any connector with typed accessors.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectorConfig {
     props: HashMap<String, String>,
 }
@@ -36,22 +36,22 @@ impl ConnectorConfig {
         self.props.get(key)
     }
     pub fn get_string(&self, key: &str, default: &str) -> String {
-        self.props.get(key).map(|v| v.clone()).unwrap_or(default.to_string())
+        self.props.get(key).cloned().unwrap_or(default.to_string())
     }
     pub fn get_int(&self, key: &str, default: i64) -> i64 {
-        self.props.get(key).and_then(|v| v.parse::<i64>().ok()).unwrap_or(default)
+        self.props
+            .get(key)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(default)
     }
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
-        self.props.get(key).and_then(|v| v.parse::<bool>().ok()).unwrap_or(default)
+        self.props
+            .get(key)
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(default)
     }
     pub fn to_hashmap(&self) -> HashMap<String, String> {
         self.props.clone()
-    }
-}
-
-impl Default for ConnectorConfig {
-    fn default() -> Self {
-        ConnectorConfig { props: HashMap::new() }
     }
 }
 
@@ -87,7 +87,12 @@ impl SourceSplit for BaseSourceSplit {
 pub fn row_from_map(schema: &TableSchema, data: &HashMap<String, seatunnel_api::Field>) -> Row {
     let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
     for (i, col) in schema.columns.iter().enumerate() {
-        row.set(i, data.get(&col.name).cloned().unwrap_or(seatunnel_api::Field::Null));
+        row.set(
+            i,
+            data.get(&col.name)
+                .cloned()
+                .unwrap_or(seatunnel_api::Field::Null),
+        );
     }
     row
 }

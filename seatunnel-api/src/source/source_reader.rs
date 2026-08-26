@@ -27,19 +27,20 @@ pub struct SourceReaderContext {
     pub job_id: String,
 }
 
+/// Boxed future returned by async [`SourceReader`] operations.
+pub type ReaderFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
 /// A source reader that produces data from splits.
 pub trait SourceReader: Send {
     type Output: Into<Row> + Send;
     type Split: SourceSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
-    fn poll_next(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>>;
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>>;
+    fn open(&mut self) -> ReaderFuture<'_, ()>;
+    fn poll_next(&mut self) -> ReaderFuture<'_, PollResult<Self::Output>>;
+    fn snapshot_state(&mut self) -> ReaderFuture<'_, Vec<u8>>;
     fn add_splits(&mut self, splits: Vec<Self::Split>);
     fn handle_no_more_splits(&mut self);
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
+    fn close(&mut self) -> ReaderFuture<'_, ()>;
 }
 
 #[derive(Debug)]

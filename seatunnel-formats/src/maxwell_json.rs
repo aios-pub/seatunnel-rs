@@ -1,36 +1,54 @@
 use seatunnel_api::{Row, TableSchema};
-use serde_json::{Value};
+use serde_json::Value;
 use std::error::Error;
 
 pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(bytes)?;
     let obj = value.as_object().ok_or("Expected JSON object")?;
     let kind_str = obj.get("type").and_then(|v| v.as_str()).unwrap_or("insert");
-    let data = obj.get("data").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-    let old = obj.get("old").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let data = obj
+        .get("data")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let old = obj
+        .get("old")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
     let mut rows = Vec::new();
     match kind_str {
         "insert" | "bootstrap-insert" => {
             let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
-            for (i, col) in schema.columns.iter().enumerate() { row.set(i, json_to_field(data.get(&col.name))?); }
+            for (i, col) in schema.columns.iter().enumerate() {
+                row.set(i, json_to_field(data.get(&col.name))?);
+            }
             rows.push(row);
         }
         "update" => {
             let mut br = Row::new(seatunnel_api::RowKind::UpdateBefore, schema.column_count());
-            for (i, col) in schema.columns.iter().enumerate() { br.set(i, json_to_field(old.get(&col.name))?); }
+            for (i, col) in schema.columns.iter().enumerate() {
+                br.set(i, json_to_field(old.get(&col.name))?);
+            }
             rows.push(br);
             let mut ar = Row::new(seatunnel_api::RowKind::UpdateAfter, schema.column_count());
-            for (i, col) in schema.columns.iter().enumerate() { ar.set(i, json_to_field(data.get(&col.name))?); }
+            for (i, col) in schema.columns.iter().enumerate() {
+                ar.set(i, json_to_field(data.get(&col.name))?);
+            }
             rows.push(ar);
         }
         "delete" => {
             let mut row = Row::new(seatunnel_api::RowKind::Delete, schema.column_count());
-            for (i, col) in schema.columns.iter().enumerate() { row.set(i, json_to_field(data.get(&col.name))?); }
+            for (i, col) in schema.columns.iter().enumerate() {
+                row.set(i, json_to_field(data.get(&col.name))?);
+            }
             rows.push(row);
         }
         _ => {
             let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
-            for (i, col) in schema.columns.iter().enumerate() { row.set(i, json_to_field(data.get(&col.name))?); }
+            for (i, col) in schema.columns.iter().enumerate() {
+                row.set(i, json_to_field(data.get(&col.name))?);
+            }
             rows.push(row);
         }
     }
@@ -40,7 +58,10 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<d
 pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut obj = serde_json::Map::<String, Value>::default();
     obj.insert("database".to_string(), Value::String("default".to_string()));
-    obj.insert("table".to_string(), Value::String(schema.table_identifier.clone()));
+    obj.insert(
+        "table".to_string(),
+        Value::String(schema.table_identifier.clone()),
+    );
     let ts = match row.kind {
         seatunnel_api::RowKind::Delete => "delete",
         seatunnel_api::RowKind::UpdateBefore => "update",
@@ -52,7 +73,9 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
     obj.insert("commit".to_string(), Value::Bool(true));
     let mut data = serde_json::Map::<String, Value>::default();
     for (i, col) in schema.columns.iter().enumerate() {
-        if i < row.field_count() { data.insert(col.name.clone(), field_to_json(row.get(i))?); }
+        if i < row.field_count() {
+            data.insert(col.name.clone(), field_to_json(row.get(i))?);
+        }
     }
     // For UpdateBefore, clone data for both data and old fields
     let is_update_before = row.kind == seatunnel_api::RowKind::UpdateBefore;
@@ -64,10 +87,23 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
 }
 
 fn json_to_field(value: Option<&Value>) -> Result<seatunnel_api::Field, Box<dyn Error>> {
-    let value = match value { Some(v) => v, None => return Ok(seatunnel_api::Field::Null) };
+    let value = match value {
+        Some(v) => v,
+        None => return Ok(seatunnel_api::Field::Null),
+    };
     match value {
         Value::Bool(b) => Ok(seatunnel_api::Field::Bool(*b)),
-        Value::Number(n) => { if let Some(i) = n.as_i64() { Ok(seatunnel_api::Field::Int64(i)) } else if let Some(u) = n.as_u64() { Ok(seatunnel_api::Field::UInt64(u)) } else if let Some(f) = n.as_f64() { Ok(seatunnel_api::Field::Float64(f)) } else { Ok(seatunnel_api::Field::Null) } }
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(seatunnel_api::Field::Int64(i))
+            } else if let Some(u) = n.as_u64() {
+                Ok(seatunnel_api::Field::UInt64(u))
+            } else if let Some(f) = n.as_f64() {
+                Ok(seatunnel_api::Field::Float64(f))
+            } else {
+                Ok(seatunnel_api::Field::Null)
+            }
+        }
         Value::String(s) => Ok(seatunnel_api::Field::String(s.clone())),
         Value::Null => Ok(seatunnel_api::Field::Null),
         _ => Ok(seatunnel_api::Field::Null),
@@ -89,10 +125,13 @@ mod tests {
     use super::*;
     use seatunnel_api::{ColumnDef, ColumnType};
     fn make_schema() -> TableSchema {
-        TableSchema::new("users", vec![
-            ColumnDef::new("id".to_string(), ColumnType::Int64),
-            ColumnDef::new("name".to_string(), ColumnType::String),
-        ])
+        TableSchema::new(
+            "users",
+            vec![
+                ColumnDef::new("id".to_string(), ColumnType::Int64),
+                ColumnDef::new("name".to_string(), ColumnType::String),
+            ],
+        )
     }
     #[test]
     fn test_maxwell_insert() {

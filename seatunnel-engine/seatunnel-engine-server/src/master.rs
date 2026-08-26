@@ -213,7 +213,11 @@ impl MasterService for MasterHandler {
             &report.task_id,
             state_str,
             report.processed_records.max(0) as u64,
-            if report.error_message.is_empty() { None } else { Some(report.error_message) },
+            if report.error_message.is_empty() {
+                None
+            } else {
+                Some(report.error_message)
+            },
         );
 
         Ok(Response::new(Empty {}))
@@ -261,7 +265,10 @@ mod tests {
         assert!(registry_snapshot(&registry).is_empty());
         registry.write().unwrap().insert(
             "w1".into(),
-            WorkerEntry { address: "127.0.0.1:5001".into(), last_heartbeat_ms: 0 },
+            WorkerEntry {
+                address: "127.0.0.1:5001".into(),
+                last_heartbeat_ms: 0,
+            },
         );
         assert_eq!(
             registry_snapshot(&registry),

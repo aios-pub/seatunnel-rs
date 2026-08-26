@@ -20,12 +20,13 @@
 //! Mirrors Java's `SeaTunnelSource`, `SourceReader`, and `SourceSplitEnumerator`
 //! but adapted for Rust's async model.
 
+#[allow(clippy::module_inception)] // public path `source::source` is part of the API
 pub mod source;
 pub mod source_reader;
 pub mod source_split;
 pub mod source_split_enum;
 
-pub use source::{Source, Boundedness};
+pub use source::{Boundedness, Source};
 pub use source_reader::SourceReader;
 pub use source_split::SourceSplit;
 pub use source_split_enum::SourceSplitEnumerator;

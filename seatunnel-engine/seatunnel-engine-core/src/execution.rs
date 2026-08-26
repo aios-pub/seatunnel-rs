@@ -6,10 +6,11 @@
 use std::fmt;
 
 /// Execution mode for the engine.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ExecutionMode {
     /// Single process: Master and Workers co-located in one JVM-equivalent.
     /// No network serialization overhead; tasks run in the same process.
+    #[default]
     Local,
 
     /// Cluster mode: connect to external Master node(s).
@@ -47,12 +48,6 @@ impl ExecutionMode {
             ExecutionMode::Cluster { addresses, .. } => addresses.clone(),
             ExecutionMode::Local => vec!["127.0.0.1:5000".to_string()],
         }
-    }
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        ExecutionMode::Local
     }
 }
 

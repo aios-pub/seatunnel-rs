@@ -1,24 +1,27 @@
-version: "3.8"
 services:
-  # ===== Kafka Source (for CDC/Source connectors) =====
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-    ports:
-      - "2181:2181"
-
+  # ===== Kafka (KRaft mode — no ZooKeeper) =====
   kafka:
     image: confluentinc/cp-kafka:7.6.0
-    depends_on:
-      - zookeeper
     ports:
       - "9092:9092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      # Single-node KRaft: one process acts as both broker and controller.
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT
+      # Dual listeners: HOST for the host (advertised as localhost),
+      # DOCKER for other containers (advertised as kafka).
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,DOCKER://0.0.0.0:29094,CONTROLLER://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:29094
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 10s
@@ -29,11 +32,16 @@ services:
   mysql:
     image: mysql:8.0
     ports:
-      - "3306:3306"
+      - "13306:3306"
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: seatunnel
-    command: --binlog-format=row --binlog-checksum=none --gtid-mode=ON --enforce-gtid-consistency=true
+    command:
+      - "--binlog-format=row"
+      - "--binlog-row-image=full"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=true"
+      - "--server-id=1"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 5s
@@ -43,7 +51,7 @@ services:
   postgres:
     image: postgres:16
     ports:
-      - "5432:5432"
+      - "15432:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -61,21 +69,57 @@ services:
       interval: 5s
       retries: 5
 
-  # ===== SeaTunnel Engine =====
-  seatunnel:
-    build:
-      context: .
-      dockerfile: Dockerfile
+  # ===== TiDB cluster (profile "tidb"): pd + tikv + tidb =====
+  # Minimal CDC-capable stack. TiKV advertises host.docker.internal so the
+  # TiDB SQL container can reach it through Docker's NAT gateway; workers on
+  # the HOST rewrite that host to 127.0.0.1 via the connector's
+  # `store-address-rewrite` option (see examples/tidb-cdc-to-kafka.yaml).
+  #   PD gRPC -> localhost:2379   TiKV -> localhost:30160   TiDB SQL -> localhost:14000
+  tidb-pd:
+    image: pingcap/pd:v8.1.0
+    profiles: ["tidb"]
     ports:
-      - "5000:5000"
+      - "2379:2379"
+    command:
+      - "--name=pd"
+      - "--data-dir=/data"
+      - "--client-urls=http://0.0.0.0:2379"
+      - "--advertise-client-urls=http://host.docker.internal:2379"
+      - "--peer-urls=http://0.0.0.0:2380"
+      - "--advertise-peer-urls=http://tidb-pd:2380"
+      - "--initial-cluster=pd=http://tidb-pd:2380"
+      - "--log-level=warn"
+
+  tidb-tikv:
+    image: pingcap/tikv:v8.1.0
+    profiles: ["tidb"]
+    ports:
+      - "30160:30160"
     depends_on:
-      kafka:
-        condition: service_healthy
-      mysql:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      - tidb-pd
     volumes:
-      - ./config:/opt/seatunnel/config
-      - ./data:/opt/seatunnel/data
-    command: ["run", "-c", "/opt/seatunnel/config/v2.stream.template.conf", "-m", "local"]
+      - tidb-tikv-data:/data
+    command:
+      - "--pd-endpoints=http://tidb-pd:2379"
+      - "--addr=0.0.0.0:30160"
+      - "--advertise-addr=host.docker.internal:30160"
+      - "--status-addr=0.0.0.0:20180"
+      - "--data-dir=/data"
+      - "--log-level=warn"
+
+  tidb:
+    image: pingcap/tidb:v8.1.0
+    profiles: ["tidb"]
+    ports:
+      - "14000:4000"
+    depends_on:
+      - tidb-tikv
+    command:
+      - "--store=tikv"
+      - "--path=host.docker.internal:2379"
+      - "-P=4000"
+      - "--status=10080"
+      - "-L=warn"
+
+volumes:
+  tidb-tikv-data:

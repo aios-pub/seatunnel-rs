@@ -155,11 +155,11 @@ impl ColumnType {
             ColumnType::Float32 => "FLOAT",
             ColumnType::Float64 => "DOUBLE",
             ColumnType::Decimal { precision, scale } => {
-                return if *scale == 0 {
+                if *scale == 0 {
                     Box::leak(format!("DECIMAL({precision})").into_boxed_str())
                 } else {
                     Box::leak(format!("DECIMAL({precision},{scale})").into_boxed_str())
-                };
+                }
             }
             ColumnType::String => "STRING",
             ColumnType::Bytes => "BYTES",
@@ -171,7 +171,7 @@ impl ColumnType {
             ColumnType::Duration => "INTERVAL",
             ColumnType::Array { .. } => "ARRAY",
             ColumnType::Map { .. } => "MAP",
-            ColumnType::Nullable(inner) => return inner.type_name(),
+            ColumnType::Nullable(inner) => inner.type_name(),
         }
     }
 }

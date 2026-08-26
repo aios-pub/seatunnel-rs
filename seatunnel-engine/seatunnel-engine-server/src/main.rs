@@ -18,7 +18,7 @@
 //! SeaTunnel Engine Server — gRPC Master + Worker node.
 //!
 //! Usage:
-//!   seatunnel-engine-server --role master --addr 0.0.0.0:5000
+//!   seatunnel-engine-server --role master --addr 0.0.0.0:5800
 //!   seatunnel-engine-server --role worker --master <master-address> [--worker-id w1]
 
 use clap::Parser;
@@ -33,16 +33,19 @@ use tokio::net::TcpListener;
 use tokio::time::{interval, Duration};
 use tracing_subscriber::{fmt::Layer, prelude::*, EnvFilter};
 
-use seatunnel_engine_comm::generated::master_service_server::MasterServiceServer;
 use seatunnel_engine_comm::generated::client_service_server::ClientServiceServer;
+use seatunnel_engine_comm::generated::master_service_server::MasterServiceServer;
 
 #[derive(Parser, Debug)]
-#[command(name = "seatunnel-engine-server", about = "SeaTunnel Engine Server (Master/Worker)")]
+#[command(
+    name = "seatunnel-engine-server",
+    about = "SeaTunnel Engine Server (Master/Worker)"
+)]
 struct Args {
     #[arg(long, default_value = "master")]
     role: String,
 
-    #[arg(long, default_value = "0.0.0.0:5000")]
+    #[arg(long, default_value = "0.0.0.0:5800")]
     addr: String,
 
     /// Master address (required for workers).
@@ -95,10 +98,12 @@ async fn run_master(addr: &str) -> anyhow::Result<()> {
         shutdown_signal.cancel();
     });
 
+    // Hand the already-bound listener to tonic — no re-bind, no race.
+    use tokio_stream::wrappers::TcpListenerStream;
     tonic::transport::Server::builder()
         .add_service(MasterServiceServer::new(master_handler))
         .add_service(ClientServiceServer::new(client_handler))
-        .serve_with_shutdown(local_addr, shutdown.cancelled())
+        .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
 
     Ok(())
@@ -115,7 +120,11 @@ async fn run_worker(
         .ok_or_else(|| anyhow::anyhow!("--master is required for worker role"))?;
 
     let state_store = Arc::new(LocalStateStore::new(state_dir));
-    let worker = Arc::new(WorkerNode::new(worker_id.to_string(), addr.to_string(), state_store));
+    let worker = Arc::new(WorkerNode::new(
+        worker_id.to_string(),
+        addr.to_string(),
+        state_store,
+    ));
 
     tracing::info!(
         "Worker '{}' starting at {} → master {} (state dir: {})",
@@ -191,7 +200,10 @@ async fn run_worker(
                         worker_for_hb.cancel_jobs(&response.cancel_jobs).await;
                     }
                     if !response.pending_tasks.is_empty() {
-                        tracing::info!("Received {} task(s) from master", response.pending_tasks.len());
+                        tracing::info!(
+                            "Received {} task(s) from master",
+                            response.pending_tasks.len()
+                        );
                         for task in response.pending_tasks {
                             worker_for_hb.assign_task(task).await;
                         }

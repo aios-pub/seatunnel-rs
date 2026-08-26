@@ -18,6 +18,10 @@
 use crate::row::Row;
 use crate::schema::TableSchema;
 
+/// Boxed dyn-compatible [`SinkWriter`] bound to a [`Sink`]'s associated types.
+pub type BoxedSinkWriter<I, WS, CI> =
+    Box<dyn SinkWriter<Input = I, WriterState = WS, CommitInfo = CI>>;
+
 /// A sink connector that writes data from the pipeline.
 ///
 /// Mirrors Java's `SeaTunnelSink<IN, StateT, CommitInfoT, AggregatedCommitInfoT>`.
@@ -39,30 +43,14 @@ pub trait Sink: Send + Sync {
     fn create_writer(
         &self,
         writer_context: &SinkWriterContext,
-    ) -> anyhow::Result<
-        Box<
-            dyn SinkWriter<
-                Input = Self::Input,
-                WriterState = Self::WriterState,
-                CommitInfo = Self::CommitInfo,
-            >,
-        >,
-    >;
+    ) -> anyhow::Result<BoxedSinkWriter<Self::Input, Self::WriterState, Self::CommitInfo>>;
 
     /// Restore a writer from checkpoint state.
     fn restore_writer(
         &self,
         writer_context: &SinkWriterContext,
         states: &[Vec<u8>],
-    ) -> anyhow::Result<
-        Box<
-            dyn SinkWriter<
-                Input = Self::Input,
-                WriterState = Self::WriterState,
-                CommitInfo = Self::CommitInfo,
-            >,
-        >,
-    >;
+    ) -> anyhow::Result<BoxedSinkWriter<Self::Input, Self::WriterState, Self::CommitInfo>>;
 
     /// Get the schema of data this sink consumes.
     fn get_input_schema(&self) -> Option<TableSchema>;

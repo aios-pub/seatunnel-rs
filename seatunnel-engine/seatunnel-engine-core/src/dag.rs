@@ -11,7 +11,7 @@ use std::fmt;
 ///
 /// A Pipeline is a linear sequence of stages connected by data channels.
 /// Each Stage contains one or more parallel Tasks (source, transform, or sink).
-
+///
 /// Top-level pipeline for a job.
 #[derive(Debug, Clone)]
 pub struct Pipeline {

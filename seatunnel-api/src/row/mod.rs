@@ -25,6 +25,7 @@
 
 mod column_type;
 mod field;
+#[allow(clippy::module_inception)] // public path `row::row` is part of the API
 mod row;
 mod row_kind;
 

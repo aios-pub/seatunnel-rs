@@ -200,7 +200,9 @@ fn set_dot_path(map: &mut JsonMap, path: &[String], value: Value) {
                 current.insert(seg, value);
                 return;
             }
-            let entry = current.entry(seg).or_insert_with(|| Value::Object(JsonMap::new()));
+            let entry = current
+                .entry(seg)
+                .or_insert_with(|| Value::Object(JsonMap::new()));
             let val_ptr = entry as *mut Value;
             if let Some(obj) = (*val_ptr).as_object_mut() {
                 current_raw = obj as *mut JsonMap;
@@ -225,7 +227,11 @@ pub fn parse_hocon(content: &str) -> Result<Value, String> {
     let mut root: JsonMap = JsonMap::new();
     parse_block(&tokens, 0, &mut root).map(|_| Value::Object(root))
 }
-fn parse_block(tokens: &[Token], pos: usize, current: &mut JsonMap) -> Result<(usize, usize), String> {
+fn parse_block(
+    tokens: &[Token],
+    pos: usize,
+    current: &mut JsonMap,
+) -> Result<(usize, usize), String> {
     let mut p = pos;
 
     while p < tokens.len() {
@@ -257,12 +263,11 @@ fn parse_block(tokens: &[Token], pos: usize, current: &mut JsonMap) -> Result<(u
                         let value = if val_p < tokens.len() {
                             match &tokens[val_p] {
                                 Token::StringLit(s) => Value::String(s.clone()),
-                                Token::NumberLit(n) => {
-                                    n.parse::<i64>()
-                                        .ok()
-                                        .map(Value::from)
-                                        .unwrap_or(Value::String(n.clone()))
-                                }
+                                Token::NumberLit(n) => n
+                                    .parse::<i64>()
+                                    .ok()
+                                    .map(Value::from)
+                                    .unwrap_or(Value::String(n.clone())),
                                 Token::BoolLit(b) => Value::Bool(*b),
                                 _ => Value::Null,
                             }
@@ -300,7 +305,10 @@ mod tests {
         let input = r#"source { kafka { bootstrap.servers = "localhost:9092" topic = "my-topic" format = "json" } }"#;
         let result = parse_hocon(input).unwrap();
         assert_eq!(result["source"]["kafka"]["topic"], "my-topic");
-        assert_eq!(result["source"]["kafka"]["bootstrap"]["servers"], "localhost:9092");
+        assert_eq!(
+            result["source"]["kafka"]["bootstrap"]["servers"],
+            "localhost:9092"
+        );
     }
     #[test]
     fn test_parse_full_config() {

@@ -26,12 +26,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use seatunnel_api::{schema::TableSchema, source::source_split::SourceSplit};
 use serde::{Deserialize, Serialize};
-use seatunnel_api::{
-    row::{Row, RowKind},
-    schema::TableSchema,
-    source::source_split::SourceSplit,
-};
 
 /// The two phases of a CDC source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,8 +46,9 @@ impl fmt::Display for CdcPhase {
 }
 
 /// A watermark value used to track exactly-once processing boundaries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Watermark {
+    #[default]
     Min,
     Max,
     Value(i64),
@@ -74,12 +71,6 @@ impl Ord for Watermark {
             (_, Watermark::Max) => std::cmp::Ordering::Less,
             (Watermark::Value(a), Watermark::Value(b)) => a.cmp(b),
         }
-    }
-}
-
-impl Default for Watermark {
-    fn default() -> Self {
-        Watermark::Min
     }
 }
 
@@ -139,7 +130,12 @@ pub struct IncrementalSplit {
 impl IncrementalSplit {
     pub fn new(database: &str, table: &str) -> Self {
         IncrementalSplit {
-            id: format!("incremental-{}-{}-{}", database, table, uuid::Uuid::new_v4()),
+            id: format!(
+                "incremental-{}-{}-{}",
+                database,
+                table,
+                uuid::Uuid::new_v4()
+            ),
             database: database.to_string(),
             table: table.to_string(),
             offset: HashMap::new(),
@@ -194,10 +190,24 @@ impl CdcState {
 /// Schema change event for CDC.
 #[derive(Debug, Clone)]
 pub enum SchemaChangeEvent {
-    AddColumn { table: String, column: seatunnel_api::ColumnDef },
-    DropColumn { table: String, column_name: String },
-    RenameColumn { table: String, old_name: String, new_name: String },
-    AlterType { table: String, column_name: String, new_type: seatunnel_api::ColumnType },
+    AddColumn {
+        table: String,
+        column: seatunnel_api::ColumnDef,
+    },
+    DropColumn {
+        table: String,
+        column_name: String,
+    },
+    RenameColumn {
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterType {
+        table: String,
+        column_name: String,
+        new_type: seatunnel_api::ColumnType,
+    },
 }
 
 /// Common CDC configuration.
@@ -213,7 +223,14 @@ pub struct CdcConfig {
 }
 
 impl CdcConfig {
-    pub fn new(hostname: &str, port: u16, username: &str, password: &str, database: &str, table: &str) -> Self {
+    pub fn new(
+        hostname: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+        table: &str,
+    ) -> Self {
         CdcConfig {
             hostname: hostname.to_string(),
             port,
@@ -229,7 +246,9 @@ impl CdcConfig {
 /// Marker trait for CDC connectors.
 pub trait CdcSource {
     fn config(&self) -> &CdcConfig;
-    fn schema(&self) -> Option<&TableSchema> { None }
+    fn schema(&self) -> Option<&TableSchema> {
+        None
+    }
 }
 
 /// Watermark buffer for exactly-once deduplication.
@@ -294,14 +313,17 @@ mod tests {
 
     #[test]
     fn test_incremental_split() {
-        let split = IncrementalSplit::new("mydb", "users").with_offset("file", "binlog.000001").with_offset("pos", "12345");
+        let split = IncrementalSplit::new("mydb", "users")
+            .with_offset("file", "binlog.000001")
+            .with_offset("pos", "12345");
         assert!(split.split_id().starts_with("incremental-"));
         assert_eq!(split.offset.get("file"), Some(&"binlog.000001".to_string()));
     }
 
     #[test]
     fn test_cdc_state() {
-        let state = CdcState::new(CdcPhase::Incremental, HashMap::new()).with_watermark(Watermark::Value(42));
+        let state = CdcState::new(CdcPhase::Incremental, HashMap::new())
+            .with_watermark(Watermark::Value(42));
         assert_eq!(state.phase, CdcPhase::Incremental);
         assert_eq!(state.watermark, Watermark::Value(42));
     }
@@ -322,7 +344,10 @@ mod tests {
     fn test_schema_change_event() {
         let event = SchemaChangeEvent::AddColumn {
             table: "users".to_string(),
-            column: seatunnel_api::ColumnDef::new("email".to_string(), seatunnel_api::ColumnType::String),
+            column: seatunnel_api::ColumnDef::new(
+                "email".to_string(),
+                seatunnel_api::ColumnType::String,
+            ),
         };
         match event {
             SchemaChangeEvent::AddColumn { table, column } => {

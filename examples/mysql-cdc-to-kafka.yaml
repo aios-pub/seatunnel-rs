@@ -1,0 +1,39 @@
+# MySQL CDC → Kafka real-time sync job.
+#
+# Flow: the master schedules `parallelism` chained pipeline tasks; every
+# worker task runs  MySQL binlog CDC → Kafka sink  and checkpoints its
+# binlog position every `checkpoint.interval` ms.
+#
+# Submit:
+#   seatunnel job submit -c examples/mysql-cdc-to-kafka.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: mysql-cdc-to-kafka
+  parallelism: 2
+  # Snapshot + stream; persist the binlog offset every 10 s.
+  checkpoint.interval: 10000
+
+source:
+  MySQL-CDC:
+    hostname: "127.0.0.1"
+    port: 13306
+    username: root
+    password: root
+    database-name: seatunnel
+    table-name: users
+    # initial = full snapshot then stream; latest = stream only
+    startup.mode: initial
+    # Primary key column used for snapshot chunking & dedup
+    split.column: id
+    # Unique replication pseudo-server-id (optional, auto-derived otherwise)
+    # server-id: 65001
+
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    topic: users-cdc
+    format: json
+    acks: all
+    batch.size: 256
+    # Exactly-once downstream (Kafka >= 0.11 + read_committed consumers):
+    # transactions.enabled: true

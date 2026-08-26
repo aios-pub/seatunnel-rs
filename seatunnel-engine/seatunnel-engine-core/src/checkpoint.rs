@@ -37,17 +37,15 @@ impl Default for CheckpointConfig {
 }
 
 /// Checkpoint storage backend selector.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum CheckpointStorage {
+    #[default]
     Local,
     HDFS(String),
-    S3 { bucket: String, region: String },
-}
-
-impl Default for CheckpointStorage {
-    fn default() -> Self {
-        CheckpointStorage::Local
-    }
+    S3 {
+        bucket: String,
+        region: String,
+    },
 }
 
 /// Unique checkpoint identifier within a job.

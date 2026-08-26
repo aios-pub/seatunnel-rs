@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Validation rules for connector configuration.
 ///

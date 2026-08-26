@@ -2,14 +2,19 @@
 
 A Rust implementation of Apache SeaTunnel — a distributed data integration engine.
 
+**Verified end-to-end**: MySQL binlog CDC → cluster submit → master scheduling →
+worker execution → Kafka sink → periodic checkpoints, exercised continuously by
+`scripts/e2e-cdc-kafka.sh` and the `seatunnel-e2e` test crate.
+
 ## Features
 
 - **Dual Execution Modes**: Local (embedded) and Cluster (gRPC-based Master/Worker)
-- **Checkpoint Fault Tolerance**: Barrier-based alignment, 2PC commit, exactly-once semantics
-- **CDC Connectors**: MySQL (binlog+GTID), TiDB (TiKV CDC), PostgreSQL (logical replication)
-- **Kafka Source/Sink**: Partition splits, 5 startup modes, format-based serialization
+- **Chained Pipelines**: Source → Transform → Sink executed per subtask with real dataflow
+- **Checkpoint Fault Tolerance**: sink flush before offset capture (at-least-once), durable local state store, automatic resume from the last binlog position
+- **Real CDC Connectors**: MySQL (binlog+GTID, keyset-paginated snapshot, partitioned ranges), TiDB (TiKV CDC), PostgreSQL (logical replication)
+- **Kafka Source/Sink**: consumer groups, optional transactional producer, batch flush at checkpoint boundaries (KRaft-mode compose stack, no ZooKeeper)
 - **11 Data Formats**: JSON, Text, Canal JSON, Debezium JSON, Compatible Debezium, Kafka Connect, OGG JSON, Maxwell JSON, Avro, Protobuf, Native
-- **Type-Safe Data Model**: Field enum (21 variants), Row, ColumnType, TableSchema
+- **Type-Safe Data Model**: Field enum, Row, ColumnType, TableSchema
 
 ## Project Structure
 
@@ -32,9 +37,11 @@ seatunnel-rs/
 │   ├── seatunnel-connector-cdc-postgres/ # PostgreSQL CDC
 │   └── seatunnel-connector-jdbc/       # JDBC source
 ├── seatunnel-transforms/           # Filter, Map, Fanout, Rename, Select
-├── seatunnel-cli/                  # CLI with clap + ratatui
+├── seatunnel-cli/                  # CLI: local runs + cluster job management
 ├── seatunnel-macros/               # Factory registration macros
 ├── seatunnel-benchmarks/           # Criterion benchmarks
+├── seatunnel-e2e/                    # Docker-based end-to-end tests
+├── scripts/e2e-cdc-kafka.sh         # Automated CDC→Kafka verification
 ├── Dockerfile
 ├── docker-compose.yml
 ├── config/
@@ -49,39 +56,31 @@ seatunnel-rs/
 cargo build --release
 ```
 
+### MySQL CDC → Kafka in 5 commands
+
+```bash
+docker compose up -d kafka mysql
+seatunnel-engine-server --role master --addr 0.0.0.0:5800 &
+SEATUNNEL_STATE_DIR=./state seatunnel-engine-server --role worker \
+  --master 127.0.0.1:5800 --worker-id w1 --addr 0.0.0.0:5001 &
+seatunnel job submit -c examples/mysql-cdc-to-kafka.yaml -a 127.0.0.1:5800
+```
+
+See [Quick Start](docs/en/quickstart.md) for the full walkthrough, and
+`scripts/e2e-cdc-kafka.sh` for an automated verification of the whole loop.
+
 ### Run Tests
 
 ```bash
 cargo test --workspace
-# 114 tests pass across 23 crates
 ```
 
-### Run Benchmarks
+The docker-based closed-loop test (Kafka + MySQL required):
 
 ```bash
-cargo bench
+docker compose up -d kafka mysql
+cargo test -p seatunnel-e2e --test e2e
 ```
-
-### Run CLI (Local Mode)
-
-```bash
-cargo run --bin seatunnel -- run -c config/v2.stream.template.conf -m local
-```
-
-### Docker
-
-```bash
-docker build -t seatunnel-rust .
-docker run -p 5000:5000 seatunnel-rust run -c /opt/seatunnel/config/v2.stream.template.conf -m local
-```
-
-### Docker Compose (Full Stack)
-
-```bash
-docker-compose up -d
-```
-
-Spawns: Zookeeper + Kafka + MySQL + PostgreSQL + SeaTunnel Engine
 
 ## Architecture
 
@@ -94,29 +93,39 @@ Spawns: Zookeeper + Kafka + MySQL + PostgreSQL + SeaTunnel Engine
 
 ### Checkpoint Protocol
 
-1. Master sends Barrier to all source readers
-2. Readers forward barrier through pipeline
-3. Sinks ack barrier → Master collects checkpoints
-4. 2PC commit (prepare → commit/abort)
+1. Worker task reaches its checkpoint interval
+2. Sink `prepare_commit` flushes buffered records downstream first
+3. Source state (binlog file/position/GTID) is captured after the flush
+4. State persists to the worker's local store and reports to the master;
+   a restarted task resumes from the newest checkpoint
+
+Delivery semantics: **at-least-once** (bounded duplicate window across the
+snapshot/stream overlap). The Kafka sink additionally supports an optional
+transactional producer (`transactions.enabled: true`) for read_committed
+consumers.
 
 ### Data Flow
 
 ```
-Source (Kafka/MySQL/TiDB/PostgreSQL)
-  → Transform (Filter/Map/Fanout)
-  → Sink (Kafka/Console/JDBC)
+Source (MySQL CDC / Kafka / TiDB / PostgreSQL)
+  → Transform (Filter)
+  → Sink (Kafka / JDBC / Console)
 ```
+
+Each subtask chains all three stages in one TaskGroup; parallelism splits the
+source (e.g. disjoint MySQL id ranges) across subtasks distributed over workers.
 
 ## Connectors
 
 | Connector | Type | Features |
 |-----------|------|----------|
-| Kafka Source | Source | Partition splits, 5 startup modes, all formats |
-| Kafka Sink | Sink | 2PC commit, batch flush, all formats |
-| MySQL CDC | Source | Binlog streaming, GTID, snapshot+incremental |
+| MySQL CDC | Source | Binlog streaming + GTID, keyset snapshot with partitioned ranges, checkpoint resume |
+| Kafka Source | Source | Consumer groups, startup modes, offset checkpoints |
+| Kafka Sink | Sink | Batching, optional transactional producer, format encoding |
 | TiDB CDC | Source | TiKV key range, resolved_ts, CDC client |
 | PostgreSQL CDC | Source | Logical replication, LSN, publication/slot |
-| JDBC | Source | Generic JDBC-compatible |
+| JDBC | Source/Sink | MySQL/PostgreSQL dialects, batched reads, prepared writes |
+| Console | Sink | JSON lines to stdout (local runs / smoke tests) |
 
 ## Documentation
 

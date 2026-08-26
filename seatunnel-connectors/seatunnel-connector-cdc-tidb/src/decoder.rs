@@ -12,6 +12,7 @@ const TABLE_PREFIX: u8 = b't';
 /// Record key separator: 'r'.
 const RECORD_PREFIX: u8 = b'r';
 /// Index key separator: 'i'.
+#[allow(dead_code)] // part of the documented TiDB key encoding
 const INDEX_PREFIX: u8 = b'i';
 
 /// Row format version markers.
@@ -153,7 +154,9 @@ pub fn decode_row_value(value: &[u8]) -> Result<Vec<ColumnValue>, String> {
                 }
                 let data = body[i..i + len as usize].to_vec();
                 i += len as usize;
-                columns.push(ColumnValue::Text(String::from_utf8_lossy(&data).into_owned()));
+                columns.push(ColumnValue::Text(
+                    String::from_utf8_lossy(&data).into_owned(),
+                ));
             }
             FLAG_JSON => {
                 let (len, consumed) = decode_uvarint(&body[i..])?;
@@ -163,7 +166,9 @@ pub fn decode_row_value(value: &[u8]) -> Result<Vec<ColumnValue>, String> {
                 }
                 let data = body[i..i + len as usize].to_vec();
                 i += len as usize;
-                columns.push(ColumnValue::Json(String::from_utf8_lossy(&data).into_owned()));
+                columns.push(ColumnValue::Json(
+                    String::from_utf8_lossy(&data).into_owned(),
+                ));
             }
             other => {
                 return Err(format!("unknown column flag {:02x}", other));
@@ -217,7 +222,9 @@ fn decode_uvarint(bytes: &[u8]) -> Result<(u64, usize), String> {
         Ok((n as u64, 5))
     } else if first == 254 {
         let n = u64::from_be_bytes(
-            bytes[1..9].try_into().map_err(|_| "truncated uvarint".to_string())?,
+            bytes[1..9]
+                .try_into()
+                .map_err(|_| "truncated uvarint".to_string())?,
         );
         Ok((n, 9))
     } else if first <= 250 {
@@ -309,8 +316,10 @@ impl TransactionTracker {
             }
             4 => {
                 // COMMITTED — carries full row; register both prewrite and commit
-                self.prewrites
-                    .insert(RowKeyWithTs::of_start(handle, row.start_ts), pending.clone());
+                self.prewrites.insert(
+                    RowKeyWithTs::of_start(handle, row.start_ts),
+                    pending.clone(),
+                );
                 self.commits.insert(
                     RowKeyWithTs::of_commit(handle, row.commit_ts),
                     pending.clone(),
