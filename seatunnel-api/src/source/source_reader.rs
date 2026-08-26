@@ -29,17 +29,17 @@ pub struct SourceReaderContext {
 
 /// A source reader that produces data from splits.
 pub trait SourceReader: Send {
-    type Output: Into<Row>;
+    type Output: Into<Row> + Send;
     type Split: SourceSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>>;
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + '_>>;
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + '_>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>>;
+    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>>;
     fn add_splits(&mut self, splits: Vec<Self::Split>);
     fn handle_no_more_splits(&mut self);
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>>;
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
 }
 
 #[derive(Debug)]

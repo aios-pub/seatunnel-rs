@@ -22,6 +22,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 regex = "1"
-# pg-walstream: PostgreSQL WAL streaming via logical replication
-# TODO: Add when available on crates.io or switch to alternative
-# pg-walstream = "0.3"
+rustcdc = { workspace = true }

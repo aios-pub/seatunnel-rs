@@ -30,6 +30,8 @@ use seatunnel_api::source::source_reader::{PollResult, SourceReader, SourceReade
 use seatunnel_api::source::source_split::SourceSplit;
 use seatunnel_api::source::source_split_enum::SourceSplitEnumeratorContext;
 use seatunnel_api::source::{Boundedness, Source};
+use seatunnel_api::sink::{Sink, SinkWriter, SinkWriterContext};
+use seatunnel_api::sink::SinkCommitter;
 use seatunnel_api::TableSchema;
 use seatunnel_api::{Field, Row, RowKind};
 use seatunnel_connector_common::ConnectorConfig;
@@ -228,7 +230,7 @@ impl SourceReader for JdbcSourceReader {
     type Output = Row;
     type Split = JdbcSourceSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         let config = self.config.clone();
         Box::pin(async move {
             tracing::info!(
@@ -246,7 +248,7 @@ impl SourceReader for JdbcSourceReader {
 
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
         let phase = self.phase;
         let schema = self.schema.clone();
         let current_idx = self.current_idx;
@@ -292,9 +294,11 @@ impl SourceReader for JdbcSourceReader {
                     if let Some(ref sch) = schema {
                         for mr in rows {
                             let row = JdbcSourceReader::row_from_mysql(&mr, sch);
+                            self.current_idx += 1;
                             return Ok(PollResult::Record(row));
                         }
                     }
+                    self.current_idx += 1;
                 } else if let Err(e) = result {
                     tracing::warn!("JDBC query error: {}", e);
                 }
@@ -306,7 +310,7 @@ impl SourceReader for JdbcSourceReader {
 
     fn snapshot_state(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         use seatunnel_connector_cdc_base::CdcState;
         let state = JdbcSourceState {
             phase_str: match self.phase {
@@ -330,7 +334,7 @@ impl SourceReader for JdbcSourceReader {
         self.splits.extend(splits);
     }
 
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         Box::pin(async move { Ok(()) })
     }
 
@@ -414,6 +418,7 @@ impl Source for JdbcSource {
         );
         reader.phase = if state.phase_str == "incremental" { CdcPhase::Incremental } else { CdcPhase::Snapshot };
         reader.watermark = Watermark::Value(state.watermark_val);
+        reader.current_idx = state.watermark_val as usize;
         Ok(Box::new(reader))
     }
 
@@ -537,5 +542,270 @@ mod tests {
         let source = JdbcSource::new(config, None);
         assert_eq!(source.boundedness(), Boundedness::Bounded);
         assert!(source.get_output_schema().is_none());
+    }
+}
+
+// ===== JDBC Sink =====
+
+/// JDBC sink configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JdbcSinkConfig {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub table: String,
+    pub batch_size: usize,
+    #[serde(default)]
+    pub upsert_mode: bool,
+    // Parsed URL components (populated from url)
+    #[serde(skip)]
+    pub hostname: String,
+    #[serde(skip)]
+    pub port: u16,
+    #[serde(skip)]
+    pub db_name: String,
+}
+
+impl JdbcSinkConfig {
+    pub fn from_config(config: &ConnectorConfig) -> Self {
+        let props = config.to_hashmap();
+        let url = props.get("url").cloned().unwrap_or_default();
+        let parsed = parse_mysql_url(&url).unwrap_or_else(|_| ParsedUrl {
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            db: "default_db".to_string(),
+        });
+        JdbcSinkConfig {
+            url: url.clone(),
+            username: props.get("username").cloned().unwrap_or_default(),
+            password: props.get("password").cloned().unwrap_or_default(),
+            table: props.get("table").cloned().unwrap_or_default(),
+            batch_size: props
+                .get("batch.size")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            upsert_mode: props.get("upsert.mode").map(|v| v == "true").unwrap_or(false),
+            hostname: parsed.host,
+            port: parsed.port,
+            db_name: parsed.db,
+        }
+    }
+}
+
+/// JDBC sink writer that writes rows to a database table.
+pub struct JdbcSinkWriter {
+    config: JdbcSinkConfig,
+    schema: Option<TableSchema>,
+}
+
+impl JdbcSinkWriter {
+    pub fn new(config: JdbcSinkConfig, schema: Option<TableSchema>) -> Self {
+        JdbcSinkWriter { config, schema }
+    }
+}
+
+impl SinkWriter for JdbcSinkWriter {
+    type Input = Row;
+    type WriterState = Vec<u8>;
+    type CommitInfo = String;
+
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
+        let config = self.config.clone();
+        let schema = self.schema.clone();
+        let kind = record.kind;
+
+        Box::pin(async move {
+            let cols: Vec<String> = match &schema {
+                Some(s) => s.columns.iter().map(|c| c.name.clone()).collect(),
+                None => return Ok(()),
+            };
+            let field_count = cols.len();
+            let placeholders: Vec<String> = vec!["?".to_string(); field_count];
+
+            let sql = match kind {
+                RowKind::Insert | RowKind::UpdateAfter => {
+                    if config.upsert_mode {
+                        format!(
+                            "INSERT INTO `{}` ({}) VALUES ({}) ON DUPLICATE KEY UPDATE {}",
+                            config.table,
+                            cols.join(", "),
+                            placeholders.join(", "),
+                            cols[1..].iter().map(|c| format!("`{}`=VALUES(`{}`)", c, c)).collect::<Vec<_>>().join(", ")
+                        )
+                    } else {
+                        format!(
+                            "INSERT INTO `{}` ({}) VALUES ({})",
+                            config.table,
+                            cols.join(", "),
+                            placeholders.join(", ")
+                        )
+                    }
+                }
+                RowKind::Delete => {
+                    let where_parts: Vec<String> = cols.iter().map(|c| {
+                        format!("`{}` = ?", c)
+                    }).collect();
+                    format!(
+                        "DELETE FROM `{}` WHERE {}",
+                        config.table, where_parts.join(" AND ")
+                    )
+                }
+                RowKind::UpdateBefore => {
+                    // Skip UpdateBefore rows - sinks typically don't write them
+                    return Ok(());
+                }
+                _ => {
+                    format!(
+                        "INSERT INTO `{}` ({}) VALUES ({})",
+                        config.table,
+                        cols.join(", "),
+                        placeholders.join(", ")
+                    )
+                }
+            };
+
+            let values: Vec<mysql_async::Value> = (0..field_count)
+                .map(|i| field_to_mysql_value(record.get(i)))
+                .collect();
+
+            let opts = OptsBuilder::default()
+                .ip_or_hostname(&config.hostname)
+                .tcp_port(config.port)
+                .user(Some(&config.username))
+                .pass(Some(&config.password))
+                .db_name(Some(&config.db_name));
+            let pool = Pool::new(opts);
+            let mut conn = pool.get_conn().await?;
+            use mysql_async::prelude::*;
+            // Bind parameters and execute
+            let query_with_params = sql.with(values);
+            query_with_params.ignore(&mut conn).await?;
+            drop(conn);
+            Ok(())
+        })
+    }
+
+    fn prepare_commit(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn close(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// JDBC Sink connector.
+#[derive(Debug, Clone)]
+pub struct JdbcSink {
+    config: JdbcSinkConfig,
+    schema: Option<TableSchema>,
+}
+
+impl JdbcSink {
+    pub fn new(config: JdbcSinkConfig, schema: Option<TableSchema>) -> Self {
+        JdbcSink { config, schema }
+    }
+
+    pub fn from_config(config: &ConnectorConfig, schema: Option<TableSchema>) -> Self {
+        JdbcSink {
+            config: JdbcSinkConfig::from_config(config),
+            schema,
+        }
+    }
+}
+
+impl Sink for JdbcSink {
+    type Input = Row;
+    type WriterState = Vec<u8>;
+    type CommitInfo = String;
+    type AggregatedCommitInfo = Vec<String>;
+
+    fn create_writer(
+        &self,
+        _writer_context: &SinkWriterContext,
+    ) -> anyhow::Result<Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>> {
+        Ok(Box::new(JdbcSinkWriter::new(self.config.clone(), self.schema.clone())))
+    }
+
+    fn restore_writer(
+        &self,
+        _writer_context: &SinkWriterContext,
+        _states: &[Vec<u8>],
+    ) -> anyhow::Result<Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>> {
+        Ok(Box::new(JdbcSinkWriter::new(self.config.clone(), self.schema.clone())))
+    }
+
+    fn get_input_schema(&self) -> Option<TableSchema> {
+        self.schema.clone()
+    }
+
+    fn create_committer(
+        &self,
+    ) -> Option<Box<dyn SinkCommitter<CommitInfo = Self::CommitInfo, AggregatedCommitInfo = Self::AggregatedCommitInfo>>> {
+        None
+    }
+}
+
+/// Helper: convert Field to mysql_async Value.
+fn field_to_mysql_value(field: &seatunnel_api::Field) -> mysql_async::Value {
+    use seatunnel_api::Field;
+    match field {
+        Field::Null => mysql_async::Value::NULL,
+        Field::Bool(b) => mysql_async::Value::Int(*b as i64),
+        Field::Int8(v) => mysql_async::Value::Int(*v as i64),
+        Field::Int16(v) => mysql_async::Value::Int(*v as i64),
+        Field::Int32(v) => mysql_async::Value::Int(*v as i64),
+        Field::Int64(v) => mysql_async::Value::Int(*v),
+        Field::UInt8(v) => mysql_async::Value::Int(*v as i64),
+        Field::UInt16(v) => mysql_async::Value::Int(*v as i64),
+        Field::UInt32(v) => mysql_async::Value::Int(*v as i64),
+        Field::UInt64(v) => mysql_async::Value::UInt(*v),
+        Field::Float32(v) => mysql_async::Value::Float(*v),
+        Field::Float64(v) => mysql_async::Value::Double(*v),
+        Field::String(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
+        Field::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
+        Field::Date(d) => {
+            use chrono::Datelike;
+            mysql_async::Value::Date(
+                d.year() as u16, d.month() as u8, d.day() as u8, 0, 0, 0, 0
+            )
+        }
+        Field::Time(t) => {
+            use chrono::Timelike;
+            mysql_async::Value::Time(false, 0, t.hour() as u8, t.minute() as u8, t.second() as u8, t.nanosecond() / 1000)
+        }
+        Field::DateTime(dt) => {
+            use chrono::{Datelike, Timelike};
+            mysql_async::Value::Date(
+                dt.year() as u16, dt.month() as u8, dt.day() as u8,
+                dt.hour() as u8, dt.minute() as u8, dt.second() as u8, dt.nanosecond() / 1000
+            )
+        }
+        Field::Decimal(_) => mysql_async::Value::Bytes(format!("{}", field).into_bytes()),
+        Field::Row(_) => mysql_async::Value::Bytes(format!("{}", field).into_bytes()),
+        _ => mysql_async::Value::NULL,
+    }
+}
+
+impl JdbcSinkConfig {
+    fn parse_url(&self) -> ParsedUrl {
+        parse_mysql_url(&self.url).unwrap_or_else(|_| ParsedUrl {
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            db: "default_db".to_string(),
+        })
     }
 }

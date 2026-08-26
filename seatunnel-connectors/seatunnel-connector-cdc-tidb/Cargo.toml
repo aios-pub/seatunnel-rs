@@ -20,3 +20,11 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 mysql_async = { workspace = true }
+futures = { workspace = true }
+tikv-client = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+prost-build = { workspace = true }

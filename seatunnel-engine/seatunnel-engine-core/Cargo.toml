@@ -9,6 +9,7 @@ description = "Apache SeaTunnel Rust - Engine Core: DAG, Plan, Task model"
 [dependencies]
 seatunnel-api = { path = "../../seatunnel-api" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
@@ -18,3 +19,29 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
+hex = { workspace = true }
+
+# Optional connectors for the built-in connector factory.
+seatunnel-connector-common = { path = "../../seatunnel-connectors/seatunnel-connector-common", optional = true }
+seatunnel-connector-cdc-mysql = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-mysql", optional = true }
+seatunnel-connector-cdc-postgres = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-postgres", optional = true }
+seatunnel-connector-cdc-tidb = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-tidb", optional = true }
+seatunnel-connector-jdbc = { path = "../../seatunnel-connectors/seatunnel-connector-jdbc", optional = true }
+seatunnel-connector-kafka = { path = "../../seatunnel-connectors/seatunnel-connector-kafka", optional = true }
+
+[features]
+default = ["connectors"]
+connectors = [
+    "dep:seatunnel-connector-common",
+    "dep:seatunnel-connector-cdc-mysql",
+    "dep:seatunnel-connector-cdc-postgres",
+    "dep:seatunnel-connector-cdc-tidb",
+    "dep:seatunnel-connector-jdbc",
+    "dep:seatunnel-connector-kafka",
+]
+connector-mysql = ["connectors"]
+connector-postgres = ["connectors"]
+connector-tidb = ["connectors"]
+connector-kafka = ["connectors"]
+connector-jdbc = ["connectors"]

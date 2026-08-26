@@ -30,12 +30,11 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::Message as RdkafkaMessage;
 use serde::{Deserialize, Serialize};
 use seatunnel_api::{
@@ -168,6 +167,15 @@ impl KafkaSourceConfig {
                 .unwrap_or(KafkaStartupMode::Earliest),
         }
     }
+
+    /// `auto.offset.reset` value matching the startup mode.
+    fn auto_offset_reset(&self) -> &'static str {
+        match self.startup_mode {
+            KafkaStartupMode::Earliest => "earliest",
+            KafkaStartupMode::Latest => "latest",
+            _ => "earliest",
+        }
+    }
 }
 
 /// Kafka Source connector.
@@ -242,10 +250,8 @@ pub struct KafkaSourceReader {
     config: KafkaSourceConfig,
     schema: Option<TableSchema>,
     splits: Vec<KafkaSourceSplit>,
-    current_split_idx: usize,
-    current_offset: i64,
-    closed: bool,
-    buffered_records: Mutex<Vec<KafkaSourceOutput>>,
+    /// Highest consumed offset per `topic-partition`, captured at checkpoint.
+    last_offsets: HashMap<String, i64>,
     consumer: Option<StreamConsumer>,
 }
 
@@ -255,10 +261,7 @@ impl KafkaSourceReader {
             config,
             schema,
             splits: Vec::new(),
-            current_split_idx: 0,
-            current_offset: 0,
-            closed: false,
-            buffered_records: Mutex::new(Vec::new()),
+            last_offsets: HashMap::new(),
             consumer: None,
         }
     }
@@ -268,15 +271,19 @@ impl SourceReader for KafkaSourceReader {
     type Output = KafkaSourceOutput;
     type Split = KafkaSourceSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         Box::pin(async move {
             tracing::info!(
-                "Opening Kafka source reader for topic={}",
-                self.config.topic
+                "Opening Kafka source reader for topic={} (auto.offset.reset={})",
+                self.config.topic,
+                self.config.auto_offset_reset()
             );
             let consumer: StreamConsumer = ClientConfig::new()
                 .set("bootstrap.servers", &self.config.bootstrap_servers)
                 .set("group.id", &self.config.group_id)
+                .set("auto.offset.reset", self.config.auto_offset_reset())
+                .set("enable.auto.commit", "false")
+                .set("enable.partition.eof", "false")
                 .create()
                 .map_err(|e| anyhow::anyhow!("Failed to create Kafka consumer: {}", e))?;
             consumer
@@ -289,30 +296,19 @@ impl SourceReader for KafkaSourceReader {
 
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + '_>> {
-        let split = if self.current_split_idx < self.splits.len() {
-            Some(self.splits[self.current_split_idx].clone())
-        } else {
-            None
-        };
-        let offset = self.current_offset;
-        let current_topic = self.config.topic.clone();
-
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
+        let _ = &self.splits;
         Box::pin(async move {
-            // First check the buffer for pre-buffered records.
-            if let Some(row) = {
-                let mut buf = self.buffered_records.lock().unwrap();
-                buf.pop()
-            } {
-                return Ok(PollResult::Record(row));
-            }
-
             // Try to poll from the real Kafka consumer with a short timeout.
             if let Some(consumer) = &self.consumer {
-                match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
+                match tokio::time::timeout(Duration::from_millis(250), consumer.recv()).await {
                     Ok(Ok(msg)) => {
                         if let Some(payload) = msg.payload() {
                             let s = String::from_utf8_lossy(payload).to_string();
+                            self.last_offsets.insert(
+                                format!("{}-{}", msg.topic(), msg.partition()),
+                                msg.offset(),
+                            );
                             let mut row = Row::new(RowKind::Insert, 3);
                             row.set(0, seatunnel_api::Field::String(s));
                             row.set(1, seatunnel_api::Field::Int64(msg.offset()));
@@ -328,32 +324,18 @@ impl SourceReader for KafkaSourceReader {
                     }
                 }
             }
-
-            // Fallback to synthetic rows while no consumer is available.
-            if let Some(s) = split {
-                let mut row2 = Row::new(RowKind::Insert, 3);
-                row2.set(0, seatunnel_api::Field::String(current_topic));
-                row2.set(1, seatunnel_api::Field::Int64(s.partition as i64));
-                row2.set(2, seatunnel_api::Field::Int64(offset));
-                let out = KafkaSourceOutput(row2);
-                self.current_offset += 1;
-                return Ok(PollResult::Record(out));
-            }
             Ok(PollResult::Empty)
         })
     }
 
     fn snapshot_state(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         Box::pin(async move {
             let state = KafkaSourceState {
-                offsets: self.splits.iter().map(|s| {
-                    (format!("{}-p{}", s.topic, s.partition), self.current_offset)
-                }).collect(),
+                offsets: self.last_offsets.clone(),
             };
-            let json = serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e.to_string()))?;
-            Ok(json)
+            serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e))
         })
     }
 
@@ -362,12 +344,9 @@ impl SourceReader for KafkaSourceReader {
         self.splits.extend(splits);
     }
 
-    fn handle_no_more_splits(&mut self) {
-        self.closed = true;
-    }
+    fn handle_no_more_splits(&mut self) {}
 
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
-        self.closed = true;
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         self.consumer.take();
         Box::pin(async move { Ok(()) })
     }
@@ -414,7 +393,15 @@ pub struct KafkaSinkConfig {
     pub format: MessageFormat,
     pub acks: String,
     pub batch_size: usize,
+    /// When true a transactional producer is used: records are produced
+    /// inside `begin_transaction()` … `commit_transaction()` windows aligned
+    /// with checkpoint boundaries (exactly-once for downstream consumers
+    /// configured with `read_committed`).
     pub transactions_enabled: bool,
+    /// Transactional id; required when `transactions_enabled` is true.
+    pub transactional_id: Option<String>,
+    /// Delivery timeout per record.
+    pub message_timeout_ms: u64,
 }
 
 impl Default for KafkaSinkConfig {
@@ -425,13 +412,16 @@ impl Default for KafkaSinkConfig {
             format: MessageFormat::Json,
             acks: "all".to_string(),
             batch_size: 100,
-            transactions_enabled: true,
+            transactions_enabled: false,
+            transactional_id: None,
+            message_timeout_ms: 30_000,
         }
     }
 }
 
 impl KafkaSinkConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
+        let tx_enabled = config.get_bool("transactions.enabled", false);
         KafkaSinkConfig {
             bootstrap_servers: config.get_string("bootstrap.servers", "localhost:9092"),
             topic: config.get_string("topic", "seatunnel-sink"),
@@ -440,8 +430,19 @@ impl KafkaSinkConfig {
                 .and_then(|f| MessageFormat::from_str(f))
                 .unwrap_or(MessageFormat::Json),
             acks: config.get_string("acks", "all"),
-            batch_size: config.get_int("batch.size", 100) as usize,
-            transactions_enabled: config.get_bool("transactions.enabled", true),
+            batch_size: config.get_int("batch.size", 1000).max(1) as usize,
+            transactions_enabled: tx_enabled,
+            transactional_id: config
+                .get("transactional.id")
+                .cloned()
+                .or_else(|| {
+                    if tx_enabled {
+                        Some(format!("seatunnel-sink-{}", uuid::Uuid::new_v4()))
+                    } else {
+                        None
+                    }
+                }),
+            message_timeout_ms: config.get_int("message.timeout.ms", 30_000) as u64,
         }
     }
 }
@@ -498,7 +499,12 @@ impl Sink for KafkaSink {
     }
 }
 
-/// Kafka Sink writer with batching.
+/// Kafka Sink writer with batching and optional transactions.
+///
+/// Records are buffered by `write()` and delivered either when the batch
+/// reaches `batch_size` or during `prepare_commit()` (checkpoint boundary).
+/// With `transactions.enabled=true` the batch is produced inside a Kafka
+/// transaction committed in the same window.
 pub struct KafkaSinkWriter {
     config: KafkaSinkConfig,
     batch: Vec<Row>,
@@ -515,6 +521,102 @@ impl KafkaSinkWriter {
             producer: None,
         }
     }
+
+    /// Lazily initialize the rdkafka producer from `bootstrap.servers`.
+    /// Safe to call multiple times; only builds once.
+    fn ensure_producer(&mut self) -> anyhow::Result<()> {
+        if self.producer.is_some() {
+            return Ok(());
+        }
+        let mut builder = ClientConfig::new();
+        builder
+            .set("bootstrap.servers", &self.config.bootstrap_servers)
+            .set("message.timeout.ms", &self.config.message_timeout_ms.to_string())
+            .set("acks", &self.config.acks);
+        if self.config.transactions_enabled {
+            let tx_id = self
+                .config
+                .transactional_id
+                .clone()
+                .unwrap_or_else(|| format!("seatunnel-sink-{}", uuid::Uuid::new_v4()));
+            tracing::info!("Kafka sink: transactional producer id={}", tx_id);
+            builder.set("transactional.id", &tx_id);
+        }
+        let producer: FutureProducer = builder
+            .create()
+            .map_err(|e| anyhow::anyhow!("Failed to create Kafka producer: {}", e))?;
+        if self.config.transactions_enabled {
+            producer
+                .init_transactions(std::time::Duration::from_secs(30))
+                .map_err(|e| anyhow::anyhow!("init_transactions failed: {}", e))?;
+        }
+        self.producer = Some(producer);
+        Ok(())
+    }
+
+    /// Deliver buffered records to Kafka, optionally inside a transaction.
+    async fn flush_batch(&mut self) -> anyhow::Result<usize> {
+        self.ensure_producer()?;
+        let producer = match &self.producer {
+            Some(p) => p.clone(),
+            None => anyhow::bail!("kafka producer unavailable"),
+        };
+        let records: Vec<Row> = std::mem::take(&mut self.batch);
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let transactional = self.config.transactions_enabled;
+        if transactional {
+            producer
+                .begin_transaction()
+                .map_err(|e| anyhow::anyhow!("begin_transaction failed: {}", e))?;
+        }
+
+        let topic = self.config.topic.clone();
+        let mut sent = 0usize;
+        let mut failures = Vec::new();
+        for record in &records {
+            let payload = encode_row(record, &self.config.format);
+            match producer.send(
+                FutureRecord::<str, str>::to(&topic).payload(&payload),
+                Duration::from_millis(self.config.message_timeout_ms),
+            ).await {
+                Ok(_) => sent += 1,
+                Err((e, _)) => failures.push(e.to_string()),
+            }
+        }
+
+        if transactional && !failures.is_empty() {
+            let _ = producer.abort_transaction(Duration::from_secs(10));
+            anyhow::bail!(
+                "transactional produce failed for {} record(s): {}",
+                failures.len(),
+                failures.first().map(String::as_str).unwrap_or("unknown")
+            );
+        }
+        if !failures.is_empty() {
+            // At-least-once delivery contract: surface partial failures so
+            // the engine can retry from the last checkpoint.
+            anyhow::bail!(
+                "failed to deliver {} record(s): {}",
+                failures.len(),
+                failures.first().map(String::as_str).unwrap_or("unknown")
+            );
+        }
+
+        if transactional {
+            producer
+                .commit_transaction(Duration::from_secs(30))
+                .map_err(|e| {
+                    let _ = producer.abort_transaction(Duration::from_secs(10));
+                    anyhow::anyhow!("commit_transaction failed: {}", e)
+                })?;
+        }
+
+        self.total_written += sent;
+        Ok(sent)
+    }
 }
 
 impl SinkWriter for KafkaSinkWriter {
@@ -522,91 +624,97 @@ impl SinkWriter for KafkaSinkWriter {
     type WriterState = serde_json::Value;
     type CommitInfo = KafkaCommitInfo;
 
-    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
-        let producer = self.producer.clone();
-        let topic = self.config.topic.clone();
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
-            if let Some(producer) = producer {
-                let payload = row_to_json_string(&record);
-                match producer.send(
-                    FutureRecord::<str, str>::to(&topic).payload(&payload),
-                    Duration::from_secs(5),
-                ).await {
-                    Ok((partition, offset)) => {
-                        tracing::trace!("KafkaSinkWriter: delivered message partition={} offset={}", partition, offset);
-                        Ok(())
-                    }
-                    Err((e, _)) => {
-                        anyhow::bail!("Kafka producer error: {}", e)
-                    }
-                }
-            } else {
-                // Fallback when producer is not yet initialized (tests).
-                Ok(())
+            self.ensure_producer()?;
+            tracing::info!(
+                "KafkaSinkWriter: producer ready for topic {} via {}",
+                self.config.topic,
+                self.config.bootstrap_servers
+            );
+            Ok(())
+        })
+    }
+
+    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
+        // Buffer the record; delivery happens at batch size or prepare_commit.
+        self.batch.push(record);
+        let full = self.batch.len() >= self.config.batch_size;
+        Box::pin(async move {
+            if full {
+                self.flush_batch().await?;
             }
+            Ok(())
         })
     }
 
     fn prepare_commit(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + '_>> {
-        // Flush any remaining buffered records.
-        let producer = self.producer.clone();
-        let pending = self.batch.len();
-        let topic = self.config.topic.clone();
-        let records: Vec<Row> = std::mem::take(&mut self.batch);
-        let total_written = self.total_written;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let mut sent = 0usize;
-            if let Some(producer) = producer {
-                for record in records {
-                    let payload = row_to_json_string(&record);
-                    match producer.send(
-                        FutureRecord::<str, str>::to(&topic).payload(&payload),
-                        Duration::from_secs(5),
-                    ).await {
-                        Ok(_) => sent += 1,
-                        Err((e, _)) => {
-                            tracing::warn!("Failed to send record during commit: {}", e);
-                        }
-                    }
-                }
-            } else {
-                sent = pending;
-            }
-            let batch_size = pending;
-            let total = total_written + sent;
+            let pending = self.batch.len();
+            let delivered = self.flush_batch().await?;
             let info = KafkaCommitInfo {
                 transaction_id: format!("txn-{}", uuid::Uuid::new_v4()),
-                messages_count: batch_size,
+                messages_count: delivered,
             };
-            tracing::info!("KafkaSinkWriter: prepared commit of {} messages (total: {})", batch_size, total);
+            tracing::info!(
+                "KafkaSinkWriter: checkpoint commit flushed {} record(s) (pending={}, total={})",
+                delivered,
+                pending,
+                self.total_written
+            );
             Ok(vec![info])
         })
     }
 
     fn snapshot_state(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let state = serde_json::json!({
             "total_written": self.total_written,
             "pending": self.batch.len(),
         });
         Box::pin(async move {
-            let bytes = serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e.to_string()))?;
-            Ok(bytes)
+            serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e))
         })
     }
 
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         Box::pin(async move {
+            // Deliver anything still buffered — never silently drop records.
+            if !self.batch.is_empty() {
+                tracing::info!(
+                    "KafkaSinkWriter: flushing {} buffered record(s) on close",
+                    self.batch.len()
+                );
+                self.flush_batch().await?;
+            }
             if let Some(producer) = &self.producer {
                 producer.poll(Duration::from_secs(5));
             }
-            tracing::info!("KafkaSinkWriter: closing, total written: {}", self.total_written);
-            self.batch.clear();
+            tracing::info!("KafkaSinkWriter: closed, total written: {}", self.total_written);
             Ok(())
         })
+    }
+}
+
+/// Serialize a `Row` into a Kafka payload according to the configured format.
+fn encode_row(row: &Row, format: &MessageFormat) -> String {
+    match format {
+        MessageFormat::Text => row
+            .fields
+            .first()
+            .map(|f| match f {
+                seatunnel_api::Field::String(s) => s.clone(),
+                other => format!("{}", other),
+            })
+            .unwrap_or_default(),
+        // The JSON-family encoders all fall back to the positional array
+        // encoding here because CDC rows arrive positionally without column
+        // names attached. Canal/Debezium envelopes are produced by the
+        // dedicated formats crate when schemas are available.
+        _ => row_to_json_string(row),
     }
 }
 

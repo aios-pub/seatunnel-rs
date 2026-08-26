@@ -1,7 +1,7 @@
 use seatunnel_api::{Row, TableSchema};
 use std::error::Error;
 
-pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Error>> {
+pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     if bytes.len() < 5 { return Err("Avro too short".into()); }
     let payload = &bytes[5..];
     let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
@@ -26,7 +26,7 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Er
         row.set(i, field);
         pos += consumed;
     }
-    Ok(row)
+    Ok(vec![row])
 }
 
 pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -75,11 +75,15 @@ mod tests {
         let mut row = Row::new(seatunnel_api::RowKind::Insert, 2);
         row.set(0, seatunnel_api::Field::Int64(42));
         row.set(1, seatunnel_api::Field::String("hello".to_string()));
-        let bytes = serialize(&schema, &row).unwrap();
+        let bytes = serialize(&schema, &row)
+.unwrap();
+
         assert_eq!(bytes[0], 0x00);
-        let decoded = deserialize(&bytes, &schema).unwrap();
-        assert_eq!(*decoded.get(0), seatunnel_api::Field::Int64(42));
-        assert_eq!(*decoded.get(1), seatunnel_api::Field::String("hello".to_string()));
+        let rows = deserialize(&bytes, &schema)
+.unwrap();
+
+        assert_eq!(*rows[0].get(0), seatunnel_api::Field::Int64(42));
+        assert_eq!(*rows[0].get(1), seatunnel_api::Field::String("hello".to_string()));
     }
     #[test]
     fn test_avro_invalid() {

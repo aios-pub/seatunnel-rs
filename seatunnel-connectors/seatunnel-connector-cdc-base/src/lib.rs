@@ -260,7 +260,7 @@ impl WatermarkBuffer {
     }
 
     pub fn should_emit(&self, event_watermark: &Watermark) -> bool {
-        !event_watermark.is_min() && event_watermark < &self.low_watermark
+        !event_watermark.is_min() && event_watermark >= &self.low_watermark
     }
 
     pub fn low_watermark(&self) -> &Watermark {
@@ -313,8 +313,8 @@ mod tests {
         assert_eq!(*buf.high_watermark(), Watermark::Value(100));
         buf.advance_low_watermark(Watermark::Value(50));
         assert_eq!(*buf.low_watermark(), Watermark::Value(50));
-        assert!(buf.should_emit(&Watermark::Value(49)));
-        assert!(!buf.should_emit(&Watermark::Value(51)));
+        assert!(buf.should_emit(&Watermark::Value(51))); // 51 >= 50, should emit
+        assert!(!buf.should_emit(&Watermark::Value(49))); // 49 < 50, already emitted
         assert!(!buf.should_emit(&Watermark::Min));
     }
 

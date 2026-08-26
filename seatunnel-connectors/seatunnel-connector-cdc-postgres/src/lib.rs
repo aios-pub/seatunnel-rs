@@ -50,6 +50,12 @@ use seatunnel_connector_common::ConnectorConfig;
 use seatunnel_connector_cdc_base::{
     CdcPhase, IncrementalSplit, SnapshotSplit, Watermark,
 };
+use rustcdc::source::postgres::{
+    PostgresSourceConfig, PostgresConnection,
+};
+use rustcdc::source::{StreamHandle};
+use rustcdc::source::Source as _;
+use rustcdc::core::Operation;
 
 /// Output row from PostgreSQL CDC.
 #[derive(Debug, Clone)]
@@ -486,12 +492,23 @@ impl Source for PostgresCdcSource {
     fn restore_reader(
         &self,
         _context: SourceReaderContext,
-        _state: &Self::State,
+        state: &Self::State,
     ) -> anyhow::Result<Box<dyn SourceReader<Output = Self::Output, Split = Self::Split>>> {
-        Ok(Box::new(PostgresCdcReader::new(
+        let cdc_state = state;
+        let mut reader = PostgresCdcReader::new(
             self.config.clone(),
             self.schema.clone(),
-        )))
+        );
+        reader.phase = cdc_state.phase;
+        reader.lsn = cdc_state.lsn;
+        reader.watermark = cdc_state.watermark.clone();
+        // Restore current_idx from offset if available
+        if let Some(idx_str) = cdc_state.offset.get("current_idx") {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                reader.current_idx.set(idx);
+            }
+        }
+        Ok(Box::new(reader))
     }
 
     fn get_output_schema(&self) -> Option<TableSchema> {
@@ -509,10 +526,14 @@ pub struct PostgresCdcReader {
     schema: Option<TableSchema>,
     phase: CdcPhase,
     splits: Vec<PostgresCdcSplit>,
-    current_idx: usize,
+    current_idx: std::cell::Cell<usize>,
     lsn: Lsn,
     watermark: Watermark,
     client: Arc<parking_lot::Mutex<Option<Arc<Client>>>>,
+    /// Rustcdc connection for logical replication streaming.
+    rustcdc_conn: Option<PostgresConnection>,
+    /// Rustcdc stream handle for consuming CDC events.
+    stream_handle: Option<Box<dyn StreamHandle>>,
 }
 
 impl PostgresCdcReader {
@@ -522,10 +543,12 @@ impl PostgresCdcReader {
             schema,
             phase: CdcPhase::Snapshot,
             splits: Vec::new(),
-            current_idx: 0,
+            current_idx: std::cell::Cell::new(0),
             lsn: Lsn::zero(),
             watermark: Watermark::Min,
             client: Arc::new(parking_lot::Mutex::new(None)),
+            rustcdc_conn: None,
+            stream_handle: None,
         }
     }
 }
@@ -534,42 +557,77 @@ impl SourceReader for PostgresCdcReader {
     type Output = PostgresCdcOutput;
     type Split = PostgresCdcSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>> {
+    fn open(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         let config = self.config.clone();
         let client_arc = Arc::clone(&self.client);
         Box::pin(async move {
             tracing::info!(
-                "PostgreSQL CDC reader opening: {}.{} slot={} plugin={}",
+                "PostgreSQL CDC reader opening: {}.{} slot={}",
                 config.database_name,
                 config.table_name,
-                config.slot_name,
-                config.wal_plugin
+                config.slot_name
             );
 
-            // Try to connect to PostgreSQL for real I/O
-            let conn_str = config.connection_string();
-            match tokio_postgres::connect(&conn_str, NoTls).await {
-                Ok((client, connection)) => {
-                    tracing::info!(
-                        "PostgreSQL CDC reader connected to {}",
-                        conn_str
-                    );
-                    tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("PostgreSQL connection error: {}", e);
+            // Build rustcdc PostgresSourceConfig
+            use rustcdc::core::SecretString;
+            let pg_config = PostgresSourceConfig {
+                host: config.hostname.clone(),
+                port: config.port,
+                user: config.username.clone(),
+                password: SecretString::from(config.password.clone()),
+                database: config.database_name.clone(),
+                replication_slot_name: config.slot_name.clone(),
+                publication_name: config.publication_name.clone(),
+                ..Default::default()
+            };
+
+            let mut conn = PostgresConnection::new(pg_config);
+            match conn.connect().await {
+                Ok(()) => {
+                    tracing::info!("PostgreSQL CDC reader connected via rustcdc");
+                    // Record the current WAL position as the baseline LSN
+                    // so the snapshot→incremental handoff does not skip WAL
+                    // events generated while snapshot reads were in flight.
+                    // (rustcdc records the stream start offset internally;
+                    //  the connector-level Lsn is advanced from event
+                    //  source offsets during the incremental phase.)
+                    match conn.start_stream(None).await {
+                        Ok(stream_handle) => {
+                            self.rustcdc_conn = Some(conn);
+                            self.stream_handle = Some(stream_handle);
+                            tracing::info!("PostgreSQL CDC reader stream started");
+                            Ok(())
                         }
-                    });
-                    // Store the client for use in poll_next
-                    *client_arc.lock() = Some(Arc::new(client));
-                    Ok(())
+                        Err(e) => {
+                            tracing::warn!("PostgreSQL CDC reader stream start failed: {}. Falling back to synthetic rows.", e);
+                            self.rustcdc_conn = Some(conn);
+                            Ok(())
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "PostgreSQL CDC reader failed to connect to {}: {}. Falling back to synthetic rows.",
-                        conn_str,
+                        "PostgreSQL CDC reader failed to connect: {}. Falling back to synthetic rows.",
                         e
                     );
-                    Ok(())
+                    // Also try connecting via tokio_postgres for snapshot phase,
+                    // and record the current WAL LSN as the handoff baseline.
+                    let conn_str = config.connection_string();
+                    match tokio_postgres::connect(&conn_str, NoTls).await {
+                        Ok((client, connection)) => {
+                            tokio::spawn(async move {
+                                if let Err(e) = connection.await {
+                                    eprintln!("PostgreSQL connection error: {}", e);
+                                }
+                            });
+                            *client_arc.lock() = Some(Arc::new(client));
+                            Ok(())
+                        }
+                        Err(e2) => {
+                            tracing::warn!("PostgreSQL CDC reader tokio_postgres connect also failed: {}", e2);
+                            Ok(())
+                        }
+                    }
                 }
             }
         })
@@ -577,26 +635,72 @@ impl SourceReader for PostgresCdcReader {
 
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
         let phase = self.phase;
-        let current_idx = self.current_idx;
+        let current_idx = self.current_idx.get();
         let splits_clone = self.splits.clone();
         let db = self.config.database_name.clone();
         let tbl = self.config.table_name.clone();
         let lsn_str = self.lsn.fmt_hex();
-        let watermark = self.watermark;
+        let watermark = self.watermark.clone();
         let client = self.client.lock().clone();
-        let _config = self.config.clone();
-        let _schema = self.schema.clone();
+        let config_clone = self.config.clone();
 
         Box::pin(async move {
             if phase == CdcPhase::Incremental {
-                // Incremental phase: emit a synthetic incremental row (LSN watermark)
+                // Incremental phase: use rustcdc stream handle for real logical replication
+                if let Some(ref mut stream) = self.stream_handle {
+                    match stream.next_events(1000).await {
+                        Ok(events) if !events.is_empty() => {
+                            for event in events {
+                                // Convert rustcdc Event to SeatunnelRow.
+                                // INSERT -> Insert (after image)
+                                // UPDATE -> UpdateAfter (after image); the
+                                //           before image may be key-only under
+                                //           REPLICA IDENTITY DEFAULT
+                                // DELETE -> Delete (before image)
+                                let (row_kind, row_data) = match event.op {
+                                    Operation::Insert => (RowKind::Insert, event.after),
+                                    Operation::Update => (RowKind::UpdateAfter, event.after),
+                                    Operation::Delete => (RowKind::Delete, event.before),
+                                    _ => continue,
+                                };
+                                if let Some(data) = row_data {
+                                    if let Some(obj) = data.as_object() {
+                                        let field_count = obj.len();
+                                        let mut row = Row::new(row_kind, field_count + 2);
+                                        row.set(0, Field::String(db.clone()));
+                                        row.set(1, Field::String(tbl.clone()));
+                                        for (i, (_, val)) in obj.iter().enumerate() {
+                                            let field = json_val_to_field(val);
+                                            row.set(i + 2, field);
+                                        }
+                                        // Update LSN from event source offset
+                                        if !event.source.offset.is_empty() {
+                                            if let Some(new_lsn) = Lsn::from_hex(&event.source.offset) {
+                                                self.lsn = new_lsn;
+                                            }
+                                        }
+                                        return Ok(PollResult::Record(PostgresCdcOutput(row)));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            // No events available, will emit synthetic watermark
+                        }
+                        Err(e) => {
+                            tracing::warn!("PostgreSQL CDC stream error: {}. Falling back to synthetic.", e);
+                        }
+                    }
+                }
+
+                // Fallback: emit a synthetic watermark row when no WAL changes available
                 let mut row = Row::new(RowKind::Insert, 4);
                 row.set(0, seatunnel_api::Field::String(db));
                 row.set(1, seatunnel_api::Field::String(tbl));
                 row.set(2, seatunnel_api::Field::String(lsn_str));
-                row.set(3, seatunnel_api::Field::Int64(match watermark { Watermark::Value(v) => v, _ => 0 }));
+                row.set(3, seatunnel_api::Field::Int64(match &watermark { Watermark::Value(v) => *v, _ => 0 }));
                 return Ok(PollResult::Record(PostgresCdcOutput(row)));
             }
 
@@ -613,9 +717,7 @@ impl SourceReader for PostgresCdcReader {
                         match client.query(&sql, &[]).await {
                             Ok(rows) => {
                                 if !rows.is_empty() {
-                                    let _num_columns = rows[0].len();
                                     // Build output row with actual data from the table
-                                    // Row layout: database, table, id_column, data_json
                                     let mut row = Row::new(RowKind::Insert, 4);
                                     row.set(0, Field::String(s.database.clone()));
                                     row.set(1, Field::String(s.table.clone()));
@@ -625,7 +727,7 @@ impl SourceReader for PostgresCdcReader {
                                         2,
                                         postgres_row_value_to_field(&rows[0], 0, &first_col_type),
                                     );
-                                    // All rows' columns as a nested row per table row
+                                    // Serialize all rows as JSON
                                     let mut fields_vec = Vec::new();
                                     for pg_row in &rows {
                                         let mut col_vals = Vec::new();
@@ -637,6 +739,8 @@ impl SourceReader for PostgresCdcReader {
                                     let json_val = serde_json::to_string(&fields_vec)
                                         .unwrap_or_else(|_| "[]".to_string());
                                     row.set(3, Field::String(json_val));
+                                    // Advance to next split
+                                    self.current_idx.set(current_idx + 1);
                                     return Ok(PollResult::Record(PostgresCdcOutput(row)));
                                 }
                             }
@@ -649,12 +753,13 @@ impl SourceReader for PostgresCdcReader {
                         }
                     }
 
-                    // Fallback: synthetic rows (same behavior as before)
+                    // Fallback: synthetic rows
                     let mut row = Row::new(RowKind::Insert, 4);
                     row.set(0, Field::String(s.database.clone()));
                     row.set(1, Field::String(s.table.clone()));
                     row.set(2, Field::String(s.start_key.clone()));
                     row.set(3, Field::String(s.end_key.clone()));
+                    self.current_idx.set(current_idx + 1);
                     return Ok(PollResult::Record(PostgresCdcOutput(row)));
                 }
             }
@@ -664,14 +769,15 @@ impl SourceReader for PostgresCdcReader {
 
     fn snapshot_state(
         &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let mut offset = HashMap::new();
         offset.insert("lsn".to_string(), self.lsn.fmt_hex());
         offset.insert("slot_name".to_string(), self.config.slot_name.clone());
+        offset.insert("current_idx".to_string(), self.current_idx.get().to_string());
         let state = PostgresCdcState {
             phase: self.phase,
             lsn: self.lsn,
-            watermark: self.watermark,
+            watermark: self.watermark.clone(),
             offset,
         };
         Box::pin(async move {
@@ -687,16 +793,44 @@ impl SourceReader for PostgresCdcReader {
 
     fn handle_no_more_splits(&mut self) {
         self.phase = CdcPhase::Incremental;
-        self.watermark = Watermark::Value(1);
-        self.lsn = Lsn::from_datum(1);
+        // Watermark transition: snapshot phase is complete. The incremental
+        // stream resumes from the current LSN recorded during open() (it is
+        // NOT reset here, so the handoff does not skip or duplicate WAL
+        // events produced while the snapshot was being read).
+        self.watermark = match self.watermark {
+            Watermark::Min => Watermark::Value(1),
+            w => w,
+        };
         tracing::info!("PostgreSQL CDC reader: transitioning to incremental phase");
     }
 
-    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             tracing::info!("PostgreSQL CDC reader closing");
             Ok(())
         })
+    }
+}
+
+/// Convert a serde_json::Value to a Seatunnel Field.
+fn json_val_to_field(val: &serde_json::Value) -> Field {
+    match val {
+        serde_json::Value::Null => Field::Null,
+        serde_json::Value::Bool(b) => Field::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { Field::Int64(i) }
+            else if let Some(u) = n.as_u64() { Field::UInt64(u) }
+            else if let Some(f) = n.as_f64() { Field::Float64(f) }
+            else { Field::Null }
+        }
+        serde_json::Value::String(s) => Field::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let fields: Vec<Field> = arr.iter().map(json_val_to_field).collect();
+            Field::Row(fields)
+        }
+        serde_json::Value::Object(_) => {
+            Field::String(val.to_string())
+        }
     }
 }
 

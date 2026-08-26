@@ -75,13 +75,21 @@ impl Engine {
             sink_type
         );
 
-        let field_count = 3;
+        let field_count = get_field_count(config);
         let mut total_rows = 0usize;
         for i in 0..source_rows {
             let mut row = Row::new(RowKind::Insert, field_count);
-            row.set(0, Field::Int64(i as i64));
-            row.set(1, Field::String(format!("row_{}", i)));
-            row.set(2, Field::Bool(i % 2 == 0));
+            for f in 0..field_count {
+                if f == 0 {
+                    row.set(f, Field::Int64(i as i64));
+                } else if f == 1 {
+                    row.set(f, Field::String(format!("row_{}", i)));
+                } else if f == 2 {
+                    row.set(f, Field::Bool(i % 2 == 0));
+                } else {
+                    row.set(f, Field::Null);
+                }
+            }
 
             let outputs = apply_transforms(row, &transforms);
             for out_row in outputs {
@@ -116,6 +124,23 @@ fn get_source_rows(config: &serde_json::Value) -> usize {
         }
     }
     get_i64_at(config, &["env", "source.rows"]).unwrap_or(100) as usize
+}
+
+/// Read the field count from the source config's field.defs.
+fn get_field_count(config: &serde_json::Value) -> usize {
+    if let Some(src_obj) = config.get("source") {
+        if let Some(obj) = src_obj.as_object() {
+            for (_, val) in obj {
+                if let Some(defs) = val.get("field.defs") {
+                    if let Some(arr) = defs.as_array() {
+                        return arr.len();
+                    }
+                }
+            }
+        }
+    }
+    // Default: read from env.source.field.count or fall back to 3
+    get_i64_at(config, &["env", "source", "field", "count"]).unwrap_or(3) as usize
 }
 
 /// Build transform objects from the config's transform section.

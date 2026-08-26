@@ -2,14 +2,14 @@ use seatunnel_api::{Row, TableSchema};
 use serde_json::{Value};
 use std::error::Error;
 
-pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Error>> {
+pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(bytes)?;
     let obj = value.as_object().ok_or("Expected JSON object")?;
     let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
     for (i, col) in schema.columns.iter().enumerate() {
         row.set(i, json_to_field(obj.get(&col.name))?);
     }
-    Ok(row)
+    Ok(vec![row])
 }
 
 pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -79,7 +79,9 @@ mod tests {
     #[test]
     fn test_json_deserialize() {
         let schema = make_schema();
-        let row = deserialize(b"{\"id\":42,\"name\":\"hello\",\"active\":true}", &schema).unwrap();
+        let rows = deserialize(b"{\"id\":42,\"name\":\"hello\",\"active\":true}", &schema)
+.unwrap();
+        let row = &rows[0];
         assert_eq!(*row.get(0), seatunnel_api::Field::Int64(42));
         assert_eq!(*row.get(1), seatunnel_api::Field::String("hello".to_string()));
         assert_eq!(*row.get(2), seatunnel_api::Field::Bool(true));
@@ -91,8 +93,12 @@ mod tests {
         row.set(0, seatunnel_api::Field::Int64(99));
         row.set(1, seatunnel_api::Field::String("world".to_string()));
         row.set(2, seatunnel_api::Field::Bool(false));
-        let bytes = serialize(&schema, &row).unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let bytes = serialize(&schema, &row)
+.unwrap();
+
+        let value: Value = serde_json::from_slice(&bytes)
+.unwrap();
+
         assert_eq!(value["id"].as_i64(), Some(99));
         assert_eq!(value["name"].as_str(), Some("world"));
     }

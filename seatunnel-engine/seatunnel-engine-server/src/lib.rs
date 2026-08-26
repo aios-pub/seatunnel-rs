@@ -5,15 +5,17 @@
 
 //! Engine Server: Master node + Worker node implementation.
 //!
-//! - Master: leader election, job scheduling, worker registration, heartbeat handling
-//! - Worker: task execution, heartbeat reporting, status reporting
+//! - Master: worker registry, job scheduling, heartbeat-driven task dispatch
+//! - Worker: connector execution, checkpointing, status reporting
 
-pub mod job_manager;
-pub mod leader_election;
-pub mod master;
-pub mod resource_manager;
-pub mod worker;
-pub use client_handler::ClientHandler;
-pub use job_manager::JobManager;
-pub use master::MasterHandler;
 pub mod client_handler;
+pub mod job_coordinator;
+pub mod master;
+pub mod state_store;
+pub mod worker;
+
+pub use client_handler::ClientHandler;
+pub use job_coordinator::JobCoordinator;
+pub use master::{new_worker_registry, MasterHandler, WorkerEntry, WorkerRegistry};
+pub use state_store::LocalStateStore;
+pub use worker::WorkerNode;

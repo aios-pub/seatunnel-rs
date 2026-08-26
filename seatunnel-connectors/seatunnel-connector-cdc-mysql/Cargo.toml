@@ -11,7 +11,7 @@ seatunnel-api = { path = "../../seatunnel-api" }
 seatunnel-connector-common = { path = "../seatunnel-connector-common" }
 seatunnel-connector-cdc-base = { path = "../seatunnel-connector-cdc-base" }
 seatunnel-formats = { path = "../../seatunnel-formats" }
-mysql_async = { workspace = true }
+mysql_async.workspace = true
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -22,6 +22,7 @@ uuid = { workspace = true }
 parking_lot = { workspace = true }
 bigdecimal = { workspace = true }
 regex = "1"
+futures = { workspace = true }
 # mysql-binlog-connector: async MySQL binlog parser
 # TODO: Pin to specific version when available on crates.io
 # mysql_binlog_connector = { git = "https://github.com/apecloud/mysql-binlog-connector-rust", version = "0.21" }

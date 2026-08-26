@@ -21,3 +21,20 @@ prometheus = { workspace = true, optional = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-util = { workspace = true }
+serde_json = { workspace = true }
+seatunnel-api = { path = "../../seatunnel-api" }
+async-trait = { workspace = true }
+
+pin-project = "1"
+seatunnel-connector-cdc-mysql = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-mysql", optional = true }
+seatunnel-connector-cdc-postgres = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-postgres", optional = true }
+seatunnel-connector-cdc-tidb = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-tidb", optional = true }
+seatunnel-connector-jdbc = { path = "../../seatunnel-connectors/seatunnel-connector-jdbc", optional = true }
+seatunnel-connector-kafka = { path = "../../seatunnel-connectors/seatunnel-connector-kafka", optional = true }
+seatunnel-formats = { path = "../../seatunnel-formats", optional = true }
+
+seatunnel-connector-common = { path = "../../seatunnel-connectors/seatunnel-connector-common" }
+
+[features]
+default = ["connectors"]
+connectors = ["seatunnel-connector-cdc-mysql", "seatunnel-connector-cdc-postgres", "seatunnel-connector-cdc-tidb", "seatunnel-connector-jdbc", "seatunnel-connector-kafka", "seatunnel-formats"]

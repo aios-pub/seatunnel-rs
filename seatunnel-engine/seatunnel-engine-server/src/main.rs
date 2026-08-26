@@ -19,23 +19,22 @@
 //!
 //! Usage:
 //!   seatunnel-engine-server --role master --addr 0.0.0.0:5000
-//!   seatunnel-engine-server --role worker --master <master-address>
+//!   seatunnel-engine-server --role worker --master <master-address> [--worker-id w1]
 
 use clap::Parser;
-use seatunnel_engine_server::{ClientHandler, JobManager, MasterHandler};
+use seatunnel_engine_comm::{
+    generated::master_service_client::MasterServiceClient, HeartbeatRequest, WorkerRegistration,
+};
+use seatunnel_engine_server::{
+    new_worker_registry, ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode,
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::time::{interval, Duration};
 use tracing_subscriber::{fmt::Layer, prelude::*, EnvFilter};
 
 use seatunnel_engine_comm::generated::master_service_server::MasterServiceServer;
 use seatunnel_engine_comm::generated::client_service_server::ClientServiceServer;
-
-mod client_handler;
-mod job_manager;
-mod leader_election;
-mod master;
-mod resource_manager;
-mod worker;
 
 #[derive(Parser, Debug)]
 #[command(name = "seatunnel-engine-server", about = "SeaTunnel Engine Server (Master/Worker)")]
@@ -46,8 +45,16 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:5000")]
     addr: String,
 
+    /// Master address (required for workers).
     #[arg(long)]
     master: Option<String>,
+
+    #[arg(long, default_value = "worker-1")]
+    worker_id: String,
+
+    /// Directory for durable checkpoint state (workers).
+    #[arg(long, env = "SEATUNNEL_STATE_DIR", default_value = ".seatunnel-state")]
+    state_dir: String,
 }
 
 #[tokio::main]
@@ -61,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.role.as_str() {
         "master" => run_master(&args.addr).await?,
-        "worker" => run_worker(&args.addr, &args.master).await?,
+        "worker" => run_worker(&args.addr, &args.master, &args.worker_id, &args.state_dir).await?,
         other => {
             eprintln!("Unknown role: {}. Use 'master' or 'worker'.", other);
             std::process::exit(1);
@@ -72,53 +79,141 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_master(addr: &str) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    let job_manager = Arc::new(JobManager::new());
-    let master_handler = MasterHandler::new();
-    let client_handler = ClientHandler::new(job_manager);
+    let coordinator = Arc::new(JobCoordinator::new());
+    let registry = new_worker_registry();
+    let master_handler = MasterHandler::new(coordinator.clone(), registry.clone());
+    let client_handler = ClientHandler::new(coordinator, registry);
 
-    tracing::info!("Starting master on {}", addr);
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    tracing::info!("Master listening on {}", local_addr);
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     let shutdown_signal = shutdown.clone();
-
-    // Spawn shutdown on Ctrl+C
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_signal.cancel();
     });
 
-    let local_addr = listener.local_addr()?;
-    // Spawn the server on the bound address
-    let server = tonic::transport::Server::builder()
+    tonic::transport::Server::builder()
         .add_service(MasterServiceServer::new(master_handler))
-        .add_service(ClientServiceServer::new(client_handler));
-
-    // Drop the original listener, let the server bind to local_addr
-    drop(listener);
-    server
+        .add_service(ClientServiceServer::new(client_handler))
         .serve_with_shutdown(local_addr, shutdown.cancelled())
         .await?;
 
     Ok(())
 }
 
-async fn run_worker(addr: &str, master_addr: &Option<String>) -> anyhow::Result<()> {
+async fn run_worker(
+    addr: &str,
+    master_addr: &Option<String>,
+    worker_id: &str,
+    state_dir: &str,
+) -> anyhow::Result<()> {
     let master = master_addr
         .as_ref()
-        .expect("--master is required for worker role");
+        .ok_or_else(|| anyhow::anyhow!("--master is required for worker role"))?;
+
+    let state_store = Arc::new(LocalStateStore::new(state_dir));
+    let worker = Arc::new(WorkerNode::new(worker_id.to_string(), addr.to_string(), state_store));
+
     tracing::info!(
-        "Starting worker on {}, connecting to master at {}",
+        "Worker '{}' starting at {} → master {} (state dir: {})",
+        worker_id,
         addr,
-        master
+        master,
+        state_dir
     );
 
-    println!("Worker ready at {}. Connect to master at {}.", addr, master);
-    println!("Worker will register and wait for task assignments.");
+    // Connect (with retry so the master can be started first).
+    let master_url = format!("http://{}", master);
+    let mut client = loop {
+        match MasterServiceClient::connect(master_url.clone()).await {
+            Ok(c) => break c,
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot reach master at {} yet ({}); retrying in 2s",
+                    master,
+                    e
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
 
-    // Block until shutdown
-    tokio::signal::ctrl_c().await?;
-    println!("Worker shutting down.");
+    worker.set_master_client(client.clone()).await;
+
+    // Register with the master.
+    let reg_request = tonic::Request::new(WorkerRegistration {
+        worker_id: worker_id.to_string(),
+        address: addr.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        resources: Default::default(),
+        heartbeat_interval_ms: 2000,
+    });
+    loop {
+        match client.register_worker(reg_request.clone()).await {
+            Ok(resp) => {
+                tracing::info!("Registered with master: {}", resp.into_inner().message);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("Registration failed ({}); retrying in 2s", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    // Heartbeat loop: report liveness + running tasks, pull new assignments
+    // and cancellation notices.
+    let mut heartbeat = interval(Duration::from_millis(2000));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let worker_for_hb = Arc::clone(&worker);
+    let worker_id_owned = worker_id.to_string();
+    let addr_owned = addr.to_string();
+
+    let heartbeat_task = tokio::spawn(async move {
+        loop {
+            heartbeat.tick().await;
+
+            let tasks = worker_for_hb.heartbeat_tasks().await;
+            let hb = HeartbeatRequest {
+                worker_id: worker_id_owned.clone(),
+                address: addr_owned.clone(),
+                timestamp: seatunnel_engine_core::now_millis(),
+                tasks,
+            };
+
+            match client.heartbeat(hb).await {
+                Ok(resp) => {
+                    let response = resp.into_inner();
+                    if !response.cancel_jobs.is_empty() {
+                        worker_for_hb.cancel_jobs(&response.cancel_jobs).await;
+                    }
+                    if !response.pending_tasks.is_empty() {
+                        info!(
+                            "Received {} task(s) from master",
+                            response.pending_tasks.len()
+                        );
+                        for task in response.pending_tasks {
+                            worker_for_hb.assign_task(task).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Heartbeat failed: {}", e);
+                }
+            }
+        }
+    });
+
+    // Wait for shutdown.
+    tokio::select! {
+        _ = heartbeat_task => {},
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Worker '{}' shutting down.", worker_id);
+        }
+    }
 
     Ok(())
 }

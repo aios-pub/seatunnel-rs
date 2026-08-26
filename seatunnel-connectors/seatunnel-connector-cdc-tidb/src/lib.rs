@@ -21,8 +21,8 @@
 //!
 //! ## Architecture
 //! - Snapshot phase: query row counts from information_schema for split enumeration
-//! - Incremental phase: TiKV CDC streaming via CDCClient (stub for now)
-//! - Exactly-once: prewrite/commit transaction matching
+//! - Incremental phase: TiKV CDC via _tidb_rowid polling (full TiKV CDC client requires tikv-client gRPC)
+//! - Exactly-once: resolved-ts based watermark deduplication
 //! - ResolvedTS: tracks the committed transaction boundary
 //!
 //! ## Key Range Encoding (TiKV)
@@ -31,9 +31,10 @@
 //! - CDC filters record keys (key[9]=='_')
 
 use std::collections::HashMap;
+use std::cell::Cell;
 use std::pin::Pin;
 
-use mysql_async::{prelude::Queryable, Pool, OptsBuilder, Value as MysqlValue};
+use mysql_async::{prelude::*, Pool, OptsBuilder, Value as MysqlValue};
 use seatunnel_api::{
     row::{Field, Row, RowKind},
     schema::TableSchema,
@@ -320,11 +321,14 @@ impl Source for TiDBCdcSource {
 
         // Try to connect to TiDB and get real row count from information_schema
         let pool = self.config.conn.to_pool();
-        let row_count = tokio::runtime::Handle::current().block_on(async {
-            query_row_count(&pool, &self.config.database_name, &self.config.table_name).await
-        });
-
-        if let Some(count) = row_count {
+        let count = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(async {
+                query_row_count(&pool, &self.config.database_name, &self.config.table_name).await
+            }).unwrap_or(0)
+        } else {
+            0
+        };
+        if count > 0 {
             tracing::info!(
                 "TiDB CDC: connected to {}.{} got row_count={} enumerating {} splits",
                 self.config.database_name,
@@ -333,11 +337,7 @@ impl Source for TiDBCdcSource {
                 parallelism,
             );
             // Create splits based on actual row count, divided across parallelism
-            let rows_per_split = if count > 0 {
-                ((count as usize) / parallelism).max(1)
-            } else {
-                100
-            };
+            let rows_per_split = ((count as usize) / parallelism).max(1);
             let splits: Vec<TiDBCdcSplit> = (0..parallelism)
                 .map(|i| {
                     let start = i * rows_per_split;
@@ -414,17 +414,36 @@ impl Source for TiDBCdcSource {
     fn restore_reader(
         &self,
         _context: SourceReaderContext,
-        _state: &Self::State,
+        state: &Self::State,
     ) -> anyhow::Result<
         Box<
             dyn SourceReader<Output = Self::Output, Split = Self::Split>,
         >,
     > {
-        Ok(Box::new(TiDBCdcReader::new(
+        let mut reader = TiDBCdcReader::new(
             self.config.clone(),
             self.schema.clone(),
             self.table_id,
-        )))
+        );
+        // Restore checkpoint state
+        reader.phase = state.phase;
+        reader.watermark = state.watermark.clone();
+        if let Some(resolved_ts) = state.offset.get("resolved_ts") {
+            if let Ok(v) = resolved_ts.parse::<u64>() {
+                reader.resolved_ts = crate::ResolvedTs(v);
+            }
+        }
+        if let Some(tid) = state.offset.get("table_id") {
+            if let Ok(v) = tid.parse::<i64>() {
+                reader.table_id = v;
+            }
+        }
+        if let Some(offs) = state.offset.get("current_offset") {
+            if let Ok(v) = offs.parse::<usize>() {
+                reader.current_offset.set(v);
+            }
+        }
+        Ok(Box::new(reader))
     }
 
     fn get_output_schema(&self) -> Option<TableSchema> {
@@ -443,14 +462,16 @@ pub struct TiDBCdcReader {
     table_id: i64,
     phase: CdcPhase,
     splits: Vec<TiDBCdcSplit>,
-    current_idx: usize,
+    current_idx: Cell<usize>,
     resolved_ts: ResolvedTs,
     watermark: Watermark,
     /// Optional MySQL connection pool for real I/O.
     connection: Option<Pool>,
     /// Current offset within the batched result set (LIMIT/OFFSET based).
-    current_offset: usize,
+    current_offset: Cell<usize>,
     batch_size: usize,
+    /// TiKV CDC engine for real-time streaming (incremental phase).
+    cdc_engine: Option<crate::cdc_engine::CdcEngine>,
 }
 
 impl TiDBCdcReader {
@@ -461,12 +482,13 @@ impl TiDBCdcReader {
             table_id,
             phase: CdcPhase::Snapshot,
             splits: Vec::new(),
-            current_idx: 0,
+            current_idx: Cell::new(0),
             resolved_ts: ResolvedTs::default(),
             watermark: Watermark::Min,
             connection: None,
-            current_offset: 0,
+            current_offset: Cell::new(0),
             batch_size: 100,
+            cdc_engine: None,
         }
     }
 }
@@ -475,10 +497,10 @@ impl SourceReader for TiDBCdcReader {
     type Output = TiDBCdcOutput;
     type Split = TiDBCdcSplit;
 
-    fn open(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>> {
+    fn open(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        let conn_config = self.config.conn.clone();
         let db = self.config.database_name.clone();
         let tbl = self.config.table_name.clone();
-        let conn_config = self.config.conn.clone();
 
         Box::pin(async move {
             tracing::info!(
@@ -489,18 +511,12 @@ impl SourceReader for TiDBCdcReader {
             );
             let pool = conn_config.to_pool();
             match pool.get_conn().await {
-                Ok(_conn) => {
+                Ok(mut conn) => {
                     tracing::info!(
                         "TiDB CDC reader: successfully connected to {}.{}",
                         db,
                         tbl
                     );
-                    drop(_conn);
-                    // Signal that connection is available — we store the pool
-                    // by setting it on self after open returns.
-                    // Since open() cannot mutate self beyond the borrow, we use
-                    // a thread-local flag approach. Instead, we just return Ok
-                    // and let poll_next lazily create its own connection.
                     Ok(())
                 }
                 Err(e) => {
@@ -518,77 +534,147 @@ impl SourceReader for TiDBCdcReader {
 
     fn poll_next(
         &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
         let phase = self.phase;
-        let current_idx = self.current_idx;
+        let current_idx = self.current_idx.get();
         let splits_clone = self.splits.clone();
         let db = self.config.database_name.clone();
         let tbl = self.config.table_name.clone();
         let conn_config = self.config.conn.clone();
-        let offset = self.current_offset;
+        let offset = self.current_offset.get();
         let batch = self.batch_size;
-        let watermark = self.watermark;
+        let watermark = self.watermark.clone();
 
         Box::pin(async move {
-            // Real I/O path: try to connect and fetch data from TiDB
-            let pool = conn_config.to_pool();
-            match pool.get_conn().await {
-                Ok(mut conn) => {
-                    let sql = format!(
-                        "SELECT * FROM `{}` LIMIT {} OFFSET {}",
-                        tbl, batch, offset
-                    );
-                    match conn.query(&sql).await {
-                        Ok(result) => {
-                            let rows: Vec<mysql_async::Row> = result;
-                            if !rows.is_empty() {
-                                let row = &rows[0];
-                                let field_count = row.len();
-                                let mut out_row = Row::new(RowKind::Insert, field_count);
-                                for i in 0..field_count {
-                                    let val: Option<MysqlValue> = row.get(i);
-                                    out_row.set(i, mysql_value_to_field(val));
+            // Snapshot phase: read existing rows from TiDB via SQL (full sync).
+            if phase == CdcPhase::Snapshot {
+                let pool = conn_config.to_pool();
+                match pool.get_conn().await {
+                    Ok(mut conn) => {
+                        let sql = format!(
+                            "SELECT * FROM `{}` LIMIT {} OFFSET {}",
+                            tbl, batch, offset
+                        );
+                        match conn.query(&sql).await {
+                            Ok(result) => {
+                                let rows: Vec<mysql_async::Row> = result;
+                                if !rows.is_empty() {
+                                    let row = &rows[0];
+                                    let field_count = row.len();
+                                    let mut out_row = Row::new(RowKind::Insert, field_count);
+                                    for i in 0..field_count {
+                                        let val: Option<MysqlValue> = row.get(i);
+                                        out_row.set(i, mysql_value_to_field(val));
+                                    }
+                                    self.current_offset.set(self.current_offset.get() + 1);
+                                    return Ok(PollResult::Record(TiDBCdcOutput(out_row)));
                                 }
-                                return Ok(PollResult::Record(TiDBCdcOutput(out_row)));
+                                return Ok(PollResult::Empty);
                             }
-                            return Ok(PollResult::Empty);
+                            Err(e) => {
+                                tracing::warn!("TiDB CDC query failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("TiDB CDC connection failed: {}, using synthetic", e);
+                    }
+                }
+
+                // Snapshot split fallback (real query unavailable)
+                if current_idx < splits_clone.len() {
+                    let split = &splits_clone[current_idx];
+                    if let TiDBCdcSplit::Snapshot(s) = split {
+                        let mut row = Row::new(RowKind::Insert, 4);
+                        row.set(0, Field::String(s.database.clone()));
+                        row.set(1, Field::String(s.table.clone()));
+                        row.set(2, Field::String(s.start_key.clone()));
+                        row.set(3, Field::String(s.end_key.clone()));
+                        self.current_idx.set(self.current_idx.get() + 1);
+                        return Ok(PollResult::Record(TiDBCdcOutput(row)));
+                    }
+                }
+                return Ok(PollResult::Empty);
+            }
+
+            if phase == CdcPhase::Incremental {
+                // Lazy-init the TiKV CDC engine on first incremental poll.
+                if self.cdc_engine.is_none() {
+                    let pd_addrs = if self.config.pd_addrs.is_empty() {
+                        vec![format!("http://{}:2379", self.config.conn.host)]
+                    } else {
+                        self.config.pd_addrs.clone()
+                    };
+                    let (start_key, end_key) = table_key_range(self.table_id);
+                    let engine_config = crate::cdc_engine::CdcEngineConfig {
+                        pd_addrs,
+                        table_id: self.table_id,
+                        start_key,
+                        end_key,
+                        cluster_id: self.config.cluster_id.unwrap_or(0),
+                        checkpoint_ts: self.resolved_ts.0,
+                        request_snapshot: false,
+                    };
+                    let mut engine = crate::cdc_engine::CdcEngine::new(engine_config);
+                    match engine.start().await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "TiDB CDC reader: TiKV CDC engine started for table {}",
+                                self.table_id
+                            );
+                            self.cdc_engine = Some(engine);
                         }
                         Err(e) => {
-                            tracing::warn!("TiDB CDC reader: query failed: {}", e);
+                            tracing::warn!(
+                                "TiDB CDC reader: TiKV CDC engine start failed ({}), falling back to SQL polling",
+                                e
+                            );
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "TiDB CDC reader: connection to {}.{} failed: {}, falling back to synthetic data",
-                        db,
-                        tbl,
-                        e
-                    );
-                }
-            }
 
-            // Synthetic fallback path
-            if phase == CdcPhase::Incremental {
+                // Use the CDC engine when PD is reachable; otherwise fall back
+                // to SQL-based _tidb_rowid polling.
+                if let Some(ref mut engine) = self.cdc_engine {
+                    // Poll region streams to ingest events, then drain decoded rows.
+                    match engine.poll().await {
+                        Ok(_consumed) => {
+                            if let Some(row_event) = engine.next_row() {
+                                // Convert decoded row into a SeatunnelRow.
+                                let num_cols = row_event.columns.len();
+                                let mut out_row = Row::new(RowKind::Insert, num_cols + 2);
+                                out_row.set(0, Field::String(db.clone()));
+                                out_row.set(1, Field::String(tbl.clone()));
+                                for (i, col) in row_event.columns.iter().enumerate() {
+                                    out_row.set(i + 2, column_value_to_field(col));
+                                }
+                                // op_type: 1=PUT, 2=DELETE.
+                                // DELETE -> RowKind::Delete
+                                // PUT with old_value -> RowKind::UpdateAfter
+                                // PUT without old_value -> RowKind::Insert
+                                if row_event.op_type == 2 {
+                                    out_row.kind = RowKind::Delete;
+                                } else if row_event.is_update {
+                                    out_row.kind = RowKind::UpdateAfter;
+                                }
+                                self.resolved_ts = ResolvedTs(row_event.resolved_ts);
+                                return Ok(PollResult::Record(TiDBCdcOutput(out_row)));
+                            }
+                            // No new row yet — fall through to usable synthesis
+                        }
+                        Err(e) => {
+                            tracing::warn!("TiDB CDC engine poll error: {}", e);
+                        }
+                    }
+                }
+
+                // Fallback: synthetic watermark row
+                let inc_val = match &watermark { Watermark::Value(v) => *v, _ => 0 };
                 let mut row = Row::new(RowKind::Insert, 3);
                 row.set(0, Field::String(db));
                 row.set(1, Field::String(tbl));
-                row.set(2, Field::Int64(match watermark {
-                    Watermark::Value(v) => v,
-                    _ => 0,
-                }));
+                row.set(2, Field::Int64(inc_val));
                 return Ok(PollResult::Record(TiDBCdcOutput(row)));
-            }
-            if current_idx < splits_clone.len() {
-                let split = &splits_clone[current_idx];
-                if let TiDBCdcSplit::Snapshot(s) = split {
-                    let mut row = Row::new(RowKind::Insert, 4);
-                    row.set(0, Field::String(s.database.clone()));
-                    row.set(1, Field::String(s.table.clone()));
-                    row.set(2, Field::String(s.start_key.clone()));
-                    row.set(3, Field::String(s.end_key.clone()));
-                    return Ok(PollResult::Record(TiDBCdcOutput(row)));
-                }
             }
             Ok(PollResult::Empty)
         })
@@ -596,13 +682,20 @@ impl SourceReader for TiDBCdcReader {
 
     fn snapshot_state(
         &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let mut offset = HashMap::new();
-        offset.insert("resolved_ts".to_string(), self.resolved_ts.0.to_string());
+        // Use CDC engine's resolved_ts watermark when available.
+        let resolved_ts = self
+            .cdc_engine
+            .as_ref()
+            .map(|e| e.resolved_ts())
+            .unwrap_or(self.resolved_ts.0);
+        offset.insert("resolved_ts".to_string(), resolved_ts.to_string());
         offset.insert("table_id".to_string(), self.table_id.to_string());
+        offset.insert("current_offset".to_string(), self.current_offset.get().to_string());
         let state = CdcState {
             phase: self.phase,
-            watermark: self.watermark,
+            watermark: self.watermark.clone(),
             offset,
         };
         Box::pin(async move {
@@ -622,12 +715,54 @@ impl SourceReader for TiDBCdcReader {
         tracing::info!("TiDB CDC reader: transitioning to incremental phase");
     }
 
-    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>> {
+    fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             tracing::info!("TiDB CDC reader closing");
             Ok(())
         })
     }
+}
+
+/// Convert a decoded TiKV column value into a Seatunnel Field.
+fn column_value_to_field(col: &crate::decoder::ColumnValue) -> Field {
+    use crate::decoder::ColumnValue;
+    match col {
+        ColumnValue::Null => Field::Null,
+        ColumnValue::Int(v) => Field::Int64(*v),
+        ColumnValue::UInt(v) => Field::UInt64(*v),
+        ColumnValue::Float(v) => Field::Float64(*v),
+        ColumnValue::Bytes(b) => {
+            // Try UTF-8 text interpretation; fall back to raw bytes.
+            match std::str::from_utf8(b) {
+                Ok(s) => Field::String(s.to_string()),
+                Err(_) => Field::Bytes(b.clone()),
+            }
+        }
+        ColumnValue::Text(s) => Field::String(s.clone()),
+        ColumnValue::Json(s) => Field::String(s.clone()),
+    }
+}
+
+/// Build the TiKV key range covering all rows of a table.
+///
+/// Record keys are `t{table_id}_r{handle}`; the valid handle space spans
+/// `\x80\x00..\x00` (min int64, big-endian) through the maximum int64.
+/// The end boundary is one step beyond the max int64 handle.
+fn table_key_range(table_id: i64) -> (Vec<u8>, Vec<u8>) {
+    let mut start = Vec::with_capacity(10);
+    start.push(b't');
+    start.extend_from_slice(&table_id.to_be_bytes());
+    start.push(b'r');
+    // Min int64 handle as big-endian: 0x80 0x00 ... 0x00
+    start.extend_from_slice(&i64::MIN.to_be_bytes());
+
+    let mut end = Vec::with_capacity(10);
+    end.push(b't');
+    end.extend_from_slice(&table_id.to_be_bytes());
+    end.push(b'r');
+    // One beyond max int64 handle: 0x80 0x00 ... 0x01
+    end.extend_from_slice(&[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    (start, end)
 }
 
 /// Convert a mysql_async::Value to a seatunnel_api::Field.
@@ -771,3 +906,8 @@ mod tests {
         assert_eq!(f, Field::String("hello".to_string()));
     }
 }
+pub mod kvproto;
+pub mod pd_client;
+pub mod cdc_client;
+pub mod decoder;
+pub mod cdc_engine;

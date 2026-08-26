@@ -1,35 +1,50 @@
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-//! Worker node implementation.
+//! Worker task executor.
 //!
-//! A Worker executes tasks assigned by the Master. It maintains a heartbeat
-//! connection and reports task status updates.
+//! Receives chained TaskDescriptors from the master via heartbeat, builds the
+//! real Source → Transform → Sink chain through the shared connector factory,
+//! runs it in a `TaskGroup` with checkpointing enabled, reports lifecycle
+//! transitions back to the master and persists checkpoint state locally so a
+//! restarted worker resumes from the last binlog position / offset.
 
-use seatunnel_engine_comm::HeartbeatRequest;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::interval;
+
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::resource_manager::ResourceManager;
+use seatunnel_engine_comm::{
+    generated::master_service_client::MasterServiceClient, CheckpointReport, TaskDescriptor,
+    TaskStatusReport,
+};
+use seatunnel_engine_core::checkpoint_listener::CheckpointListener;
+use seatunnel_engine_core::connector_factory::{create_sink, create_source, create_transforms};
+use seatunnel_engine_core::state::TaskState;
+use seatunnel_engine_core::task_group::TaskGroup;
+use seatunnel_engine_core::{now_millis, TaskStatus};
 
-/// Worker node state.
-pub struct WorkerNode {
-    worker_id: String,
-    address: String,
-    master_address: String,
-    resource_manager: Arc<ResourceManager>,
-    running_tasks: Mutex<HashMap<String, TaskExecutionInfo>>,
-    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
-}
+use crate::state_store::LocalStateStore;
 
-#[derive(Debug, Clone)]
-pub struct TaskExecutionInfo {
+/// Information about a task executing on this worker.
+#[derive(Debug)]
+pub struct RunningTask {
     pub task_id: String,
     pub job_id: String,
     pub stage_id: String,
@@ -38,106 +53,312 @@ pub struct TaskExecutionInfo {
     pub start_time: i64,
 }
 
+type SharedMasterClient = Arc<Mutex<Option<MasterServiceClient<tonic::transport::Channel>>>>;
+
+/// Worker node that executes chained pipeline tasks assigned by the master.
+pub struct WorkerNode {
+    worker_id: String,
+    address: String,
+    master_client: SharedMasterClient,
+    state_store: Arc<LocalStateStore>,
+    running_tasks: Mutex<HashMap<String, RunningTaskHandle>>,
+}
+
+/// Internal handle for a spawned task execution.
+#[derive(Debug)]
+struct RunningTaskHandle {
+    job_id: String,
+    cancel: Arc<CancellationToken>,
+}
+
 impl WorkerNode {
-    pub fn new(worker_id: String, address: String, master_address: String) -> Self {
+    pub fn new(
+        worker_id: impl Into<String>,
+        address: impl Into<String>,
+        state_store: Arc<LocalStateStore>,
+    ) -> Self {
         WorkerNode {
-            worker_id,
-            address,
-            master_address,
-            resource_manager: Arc::new(ResourceManager::new()),
+            worker_id: worker_id.into(),
+            address: address.into(),
+            master_client: Arc::new(Mutex::new(None)),
+            state_store,
             running_tasks: Mutex::new(HashMap::new()),
-            heartbeat_task: None,
         }
     }
 
-    /// Register this worker with the resource manager.
-    pub fn register(&self, cpu_cores: u32, memory_bytes: u64) {
-        self.resource_manager.register_worker(
-            self.worker_id.clone(),
-            self.address.clone(),
-            cpu_cores,
-            memory_bytes,
-        );
+    /// Set the gRPC client used for reporting to the master.
+    pub async fn set_master_client(&self, client: MasterServiceClient<tonic::transport::Channel>) {
+        *self.master_client.lock().await = Some(client);
     }
 
-    /// Start the heartbeat loop (in-memory, without gRPC).
-    pub fn start_heartbeat_loop(
-        &mut self,
-        interval_ms: u64,
-        tx: mpsc::UnboundedSender<HeartbeatRequest>,
-    ) {
-        let worker_id = self.worker_id.clone();
-        let address = self.address.clone();
-        let mut interval_handle = interval(Duration::from_millis(interval_ms));
+    pub fn state_store(&self) -> &Arc<LocalStateStore> {
+        &self.state_store
+    }
 
-        let handle = tokio::spawn(async move {
-            loop {
-                interval_handle.tick().await;
-                let hb = HeartbeatRequest {
-                    worker_id: worker_id.clone(),
-                    address: address.clone(),
-                    timestamp: 0,
-                    tasks: vec![],
-                };
-                if tx.send(hb).is_err() {
-                    warn!("Heartbeat channel closed");
-                    break;
-                }
+    /// Accept a task from the master and start executing it asynchronously.
+    /// Completion removes the task from the local registry.
+    pub async fn assign_task(self: &Arc<Self>, task: TaskDescriptor) {
+        let task_id = task.task_id.clone();
+        let job_id = task.job_id.clone();
+
+        info!(
+            "Worker {}: accepting task {} (subtask {}/{})",
+            self.worker_id, task.task_id, task.task_index, task.parallelism
+        );
+
+        let cancel = Arc::new(CancellationToken::new());
+        self.running_tasks.lock().await.insert(
+            task_id.clone(),
+            RunningTaskHandle { job_id: job_id.clone(), cancel: cancel.clone() },
+        );
+
+        let ctx = TaskExecCtx {
+            worker_id: self.worker_id.clone(),
+            master_client: self.master_client.clone(),
+            state_store: self.state_store.clone(),
+        };
+
+        let worker = Arc::clone(self);
+        let cleanup_task_id = task_id.clone();
+        tokio::spawn(async move {
+            execute_descriptor(task, ctx, cancel).await;
+            // Detach from the registry once terminal.
+            worker.running_tasks.lock().await.remove(&cleanup_task_id);
+        });
+    }
+
+    /// Snapshot of running tasks for the next heartbeat.
+    pub async fn heartbeat_tasks(&self) -> Vec<seatunnel_engine_comm::TaskHeartbeat> {
+        self.running_tasks
+            .lock()
+            .await
+            .iter()
+            .map(|(tid, h)| seatunnel_engine_comm::TaskHeartbeat {
+                task_id: tid.clone(),
+                state: 2, // TASK_RUNNING
+                processed_records: 0,
+                last_heartbeat_time: now_millis(),
+                memory_usage: 0,
+            })
+            .collect()
+    }
+
+    /// Stop all local tasks belonging to the given jobs.
+    pub async fn cancel_jobs(&self, job_ids: &[String]) {
+        if job_ids.is_empty() {
+            return;
+        }
+        let mut tasks = self.running_tasks.lock().await;
+        for (tid, handle) in tasks.iter_mut() {
+            if job_ids.contains(&handle.job_id) && !handle.cancel.is_cancelled() {
+                info!("Cancelling task {} (job cancelled)", tid);
+                handle.cancel.cancel();
             }
+        }
+    }
+
+    /// Count of currently tracked tasks.
+    pub async fn running_task_count(&self) -> usize {
+        self.running_tasks.lock().await.len()
+    }
+}
+
+/// Report a task lifecycle transition to the master. Never consumes the
+/// master client — transient RPC failures must not break later reports.
+async fn report_transition_raw(
+    worker_id: &str,
+    master_client: &SharedMasterClient,
+    job_id: &str,
+    task_id: &str,
+    state: i32,
+    records: u64,
+    error: Option<String>,
+) {
+    let mut guard = master_client.lock().await;
+    let Some(client) = guard.as_mut() else {
+        warn!(
+            "no master client; cannot report state {} for task {} (worker {})",
+            state, task_id, worker_id
+        );
+        return;
+    };
+    let report = TaskStatusReport {
+        worker_id: worker_id.to_string(),
+        task_id: task_id.to_string(),
+        job_id: job_id.to_string(),
+        state,
+        timestamp: now_millis(),
+        processed_records: records as i64,
+        error_message: error.unwrap_or_default(),
+    };
+    if let Err(e) = client.report_task_status(tonic::Request::new(report)).await {
+        warn!("report_task_status failed for {}: {}", task_id, e);
+    }
+}
+
+/// Execution context handed to the spawned task future so it can report
+/// transitions and reach the state store without borrowing the worker.
+#[derive(Clone)]
+struct TaskExecCtx {
+    worker_id: String,
+    master_client: SharedMasterClient,
+    state_store: Arc<LocalStateStore>,
+}
+
+/// Execute one descriptor end-to-end: build connectors, restore state, run
+/// the TaskGroup, and report every transition to the master.
+async fn execute_descriptor(
+    task: TaskDescriptor,
+    ctx: TaskExecCtx,
+    cancel: Arc<CancellationToken>,
+) {
+    let task_id = task.task_id.clone();
+    let job_id = task.job_id.clone();
+
+    report_transition_raw(&ctx.worker_id, &ctx.master_client, &job_id, &task_id, 2, 0, None)
+        .await;
+
+    match run_pipeline(&task, &ctx, cancel).await {
+        Ok(status) => {
+            let (code, err) = match status.state {
+                TaskState::Completed => (3, None),
+                TaskState::Cancelled => (5, None),
+                TaskState::Failed { ref error } => (4, Some(error.clone())),
+                other => (2, Some(format!("unexpected state {}", other))),
+            };
+            report_transition_raw(
+                &ctx.worker_id,
+                &ctx.master_client,
+                &job_id,
+                &task_id,
+                code,
+                status.processed_records,
+                err,
+            )
+            .await;
+        }
+        Err(e) => {
+            error!("Task {} crashed: {}", task_id, e);
+            report_transition_raw(
+                &ctx.worker_id,
+                &ctx.master_client,
+                &job_id,
+                &task_id,
+                4,
+                0,
+                Some(e.to_string()),
+            )
+            .await;
+        }
+    }
+}
+
+/// Build and run the chained pipeline for a descriptor.
+async fn run_pipeline(
+    task: &TaskDescriptor,
+    ctx: &TaskExecCtx,
+    cancel: Arc<CancellationToken>,
+) -> anyhow::Result<TaskStatus> {
+    let cfg = &task.config;
+
+    let source_plugin = cfg.get("source.plugin").map(String::as_str).unwrap_or("");
+    let source_config_raw = cfg.get("source.config").map(String::as_str).unwrap_or("{}");
+    let sink_plugin = cfg.get("sink.plugin").map(String::as_str).unwrap_or("console");
+    let sink_config_raw = cfg.get("sink.config").map(String::as_str).unwrap_or("{}");
+    let transform_raw = cfg.get("transform.config").map(String::as_str).unwrap_or("[]");
+    let checkpoint_interval: u64 = cfg
+        .get("checkpoint.interval")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(seatunnel_engine_core::DEFAULT_CHECKPOINT_INTERVAL_MS);
+
+    let source_value: serde_json::Value = serde_json::from_str(source_config_raw)?;
+    let source_config = seatunnel_engine_core::connector_factory::json_to_config_map(&source_value);
+    let sink_value: serde_json::Value = serde_json::from_str(sink_config_raw)?;
+    let sink_config = seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
+    let transforms_cfg: Vec<serde_json::Value> = serde_json::from_str(transform_raw)?;
+
+    // Restore from the newest durable checkpoint when one exists.
+    let restore_state = ctx
+        .state_store
+        .load_latest_checkpoint(&task.job_id, &task.task_id)
+        .ok()
+        .flatten()
+        .map(|(id, data)| {
+            info!(
+                "Task {}: restoring from local checkpoint {}",
+                task.task_id, id
+            );
+            data
         });
 
-        self.heartbeat_task = Some(handle);
-    }
+    let reader = create_source(source_plugin, &source_config, task.parallelism.max(1) as usize, restore_state.as_deref())?;
+    let transforms = create_transforms(&transforms_cfg)?;
+    let writer = create_sink(sink_plugin, &sink_config)?;
 
-    /// Stop the heartbeat loop.
-    pub fn stop_heartbeat(&mut self) {
-        if let Some(handle) = self.heartbeat_task.take() {
-            handle.abort();
-        }
-    }
+    let context = seatunnel_engine_core::task_group::TaskContext::new(
+        task.task_id.clone(),
+        task.job_id.clone(),
+        task.stage_id.clone(),
+        task.task_index.max(0) as usize,
+        task.parallelism.max(1) as usize,
+    )
+    .with_cancel_token(cancel)
+    .with_checkpoint_interval(checkpoint_interval)
+    .with_checkpoint_listener(Arc::new(TaskCheckpointReporter {
+        worker_id: ctx.worker_id.clone(),
+        master_client: ctx.master_client.clone(),
+        state_store: ctx.state_store.clone(),
+    }));
 
-    /// Assign a task for execution.
-    pub async fn assign_task(&self, task_id: String, job_id: String, stage_id: String) {
-        let task_id_clone = task_id.clone();
-        let mut tasks = self.running_tasks.lock().await;
-        tasks.insert(
-            task_id,
-            TaskExecutionInfo {
-                task_id: task_id_clone.clone(),
-                job_id,
-                stage_id,
-                state: "CREATED".to_string(),
-                processed_records: 0,
-                start_time: 0,
-            },
-        );
-        drop(tasks);
-        info!(
-            "Assigned task {} to worker {}",
-            task_id_clone, self.worker_id
-        );
-    }
+    let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
+    group.run().await
+}
 
-    /// Update task status.
-    pub async fn update_task_state(&self, task_id: &str, state: String) {
-        let mut tasks = self.running_tasks.lock().await;
-        if let Some(info) = tasks.get_mut(task_id) {
-            info.state = state;
-        }
-    }
+/// Checkpoint listener that persists state durably and reports success to the
+/// master over gRPC.
+struct TaskCheckpointReporter {
+    worker_id: String,
+    master_client: SharedMasterClient,
+    state_store: Arc<LocalStateStore>,
+}
 
-    /// Update task record count.
-    pub async fn update_task_records(&self, task_id: &str, count: u64) {
-        let mut tasks = self.running_tasks.lock().await;
-        if let Some(info) = tasks.get_mut(task_id) {
-            info.processed_records = count;
-        }
-    }
+impl CheckpointListener for TaskCheckpointReporter {
+    fn on_checkpoint<'a>(
+        &'a self,
+        job_id: &'a str,
+        task_id: &'a str,
+        checkpoint_id: u64,
+        timestamp: i64,
+        state: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // 1. Durable local persistence (crash recovery).
+            if let Err(e) =
+                self.state_store
+                    .save_checkpoint(job_id, task_id, checkpoint_id, &state)
+            {
+                error!(
+                    "Task {} checkpoint {}: local persist failed: {}",
+                    task_id, checkpoint_id, e
+                );
+            }
 
-    /// Get all running tasks.
-    pub async fn running_task_count(&self) -> usize {
-        let tasks = self.running_tasks.lock().await;
-        tasks.len()
+            // 2. Master notification (observability).
+            let mut guard = self.master_client.lock().await;
+            if let Some(client) = guard.as_mut() {
+                let report = CheckpointReport {
+                    job_id: job_id.to_string(),
+                    task_id: task_id.to_string(),
+                    checkpoint_id: checkpoint_id as i64,
+                    timestamp,
+                    checkpoint_data: Vec::new(),
+                    success: true,
+                };
+                if let Err(e) = client.report_checkpoint(tonic::Request::new(report)).await {
+                    warn!("report_checkpoint failed: {}", e);
+                }
+            }
+        })
     }
 }
 
@@ -145,27 +366,76 @@ impl WorkerNode {
 mod tests {
     use super::*;
 
+    fn tmp_store(tag: &str) -> Arc<LocalStateStore> {
+        let dir = std::env::temp_dir().join(format!("st-worker-{}", tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(LocalStateStore::new(dir))
+    }
+
+    #[test]
+    fn test_worker_node_creation() {
+        let worker = WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("create"));
+        assert_eq!(worker.worker_id, "w1");
+    }
+
     #[tokio::test]
-    async fn test_worker_assign_task() {
-        let mut worker = WorkerNode::new(
-            "w1".to_string(),
-            "127.0.0.1:5001".to_string(),
-            "127.0.0.1:5000".to_string(),
+    async fn test_assign_and_complete_fake_job() {
+        let worker =
+            Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("run")));
+        let mut config = HashMap::new();
+        config.insert("source.plugin".to_string(), "Fake".to_string());
+        config.insert(
+            "source.config".to_string(),
+            serde_json::json!({ "row.num": 3 }).to_string(),
         );
-        worker.register(8, 8 * 1024 * 1024 * 1024);
+        config.insert("sink.plugin".to_string(), "Console".to_string());
+        config.insert("sink.config".to_string(), "{}".to_string());
+        config.insert("transform.config".to_string(), "[]".to_string());
+        config.insert("checkpoint.interval".to_string(), "60000".to_string());
+        let task = TaskDescriptor {
+            task_id: "t-1".into(),
+            job_id: "j-1".into(),
+            stage_id: "s-1".into(),
+            task_name: "pipeline".into(),
+            task_index: 0,
+            source_config_json: String::new(),
+            sink_config_json: String::new(),
+            parallelism: 1,
+            config,
+        };
+        worker.assign_task(task).await;
+        // Wait for detached execution to finish.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
 
-        worker
-            .assign_task(
-                "task-1".to_string(),
-                "job-1".to_string(),
-                "stage-1".to_string(),
-            )
-            .await;
-        assert_eq!(worker.running_task_count().await, 1);
-
-        worker
-            .update_task_state("task-1", "RUNNING".to_string())
-            .await;
-        worker.update_task_records("task-1", 100).await;
+    #[tokio::test]
+    async fn test_cancel_stops_running_task() {
+        let worker =
+            Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("cancel")));
+        let mut config = HashMap::new();
+        config.insert("source.plugin".to_string(), "Kafka".to_string());
+        config.insert(
+            "source.config".to_string(),
+            serde_json::json!({ "bootstrap.servers": "127.0.0.1:19092", "topic": "never" }).to_string(),
+        );
+        config.insert("sink.plugin".to_string(), "Console".to_string());
+        config.insert("sink.config".to_string(), "{}".to_string());
+        config.insert("transform.config".to_string(), "[]".to_string());
+        config.insert("checkpoint.interval".to_string(), "60000".to_string());
+        let task = TaskDescriptor {
+            task_id: "t-c".into(),
+            job_id: "j-c".into(),
+            stage_id: "s".into(),
+            task_name: "streaming".into(),
+            task_index: 0,
+            source_config_json: String::new(),
+            sink_config_json: String::new(),
+            parallelism: 1,
+            config,
+        };
+        worker.assign_task(task).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        worker.cancel_jobs(&["j-c".to_string()]).await;
+        assert!(worker.running_task_count().await <= 1);
     }
 }

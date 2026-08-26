@@ -3,7 +3,7 @@ use std::error::Error;
 
 pub const DEFAULT_DELIMITER: &str = "|";
 
-pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Error>> {
+pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     let text = std::str::from_utf8(bytes)?.trim_end_matches('\n').trim_end_matches('\r');
     let fields: Vec<&str> = text.split(DEFAULT_DELIMITER).collect();
     let mut row = Row::new(seatunnel_api::RowKind::Insert, schema.column_count());
@@ -12,7 +12,7 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Er
             row.set(i, parse_text(fields[i], &col.column_type)?);
         }
     }
-    Ok(row)
+    Ok(vec![row])
 }
 
 pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -64,8 +64,10 @@ mod tests {
         row.set(0, seatunnel_api::Field::Int64(7));
         row.set(1, seatunnel_api::Field::String("test".to_string()));
         assert_eq!(serialize(&schema, &row).unwrap(), b"7|test");
-        let decoded = deserialize(b"42|hello", &schema).unwrap();
-        assert_eq!(*decoded.get(0), seatunnel_api::Field::Int64(42));
-        assert_eq!(*decoded.get(1), seatunnel_api::Field::String("hello".to_string()));
+        let rows = deserialize(b"42|hello", &schema)
+.unwrap();
+
+        assert_eq!(*rows[0].get(0), seatunnel_api::Field::Int64(42));
+        assert_eq!(*rows[0].get(1), seatunnel_api::Field::String("hello".to_string()));
     }
 }

@@ -53,6 +53,8 @@ message HeartbeatResponse {
   string worker_id = 1;
   int64 next_interval_ms = 2;
   repeated TaskDescriptor pending_tasks = 3;
+  // Jobs the master has cancelled; workers must stop their local tasks for them.
+  repeated string cancel_jobs = 4;
 }
 
 message TaskHeartbeat {

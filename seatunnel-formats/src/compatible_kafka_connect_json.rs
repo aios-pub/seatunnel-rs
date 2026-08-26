@@ -2,7 +2,7 @@ use seatunnel_api::{Row, TableSchema};
 use serde_json::{Value};
 use std::error::Error;
 
-pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Error>> {
+pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(bytes)?;
     let obj = value.as_object().ok_or("Expected JSON object")?;
     let empty_map: serde_json::Map<String, Value> = serde_json::Map::<String, Value>::default();
@@ -11,7 +11,7 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Row, Box<dyn Er
     for (i, col) in schema.columns.iter().enumerate() {
         row.set(i, json_to_field(payload.get(&col.name))?);
     }
-    Ok(row)
+    Ok(vec![row])
 }
 
 pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -79,12 +79,17 @@ mod tests {
     }
     #[test]
     fn test_deserialize() {
-        let row = deserialize(b"{\"schema\":{},\"payload\":{\"id\":42,\"name\":\"hello\"}}", &make_schema()).unwrap();
+        let rows = deserialize(b"{\"schema\":{},\"payload\":{\"id\":42,\"name\":\"hello\"}}", &make_schema())
+.unwrap();
+        let row = &rows[0];
+        let row = &rows[0];
         assert_eq!(*row.get(0), seatunnel_api::Field::Int64(42));
     }
     #[test]
     fn test_null_payload() {
-        let row = deserialize(b"{\"schema\":{},\"payload\":null}", &make_schema()).unwrap();
-        assert!(row.get(0).is_null());
+        let rows = deserialize(b"{\"schema\":{},\"payload\":null}", &make_schema())
+.unwrap();
+        let row = &rows[0];
+        assert!(rows[0].get(0).is_null());
     }
 }

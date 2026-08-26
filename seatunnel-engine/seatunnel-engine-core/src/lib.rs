@@ -15,7 +15,10 @@ use uuid::Uuid;
 pub mod barrier;
 pub mod checkpoint;
 pub mod checkpoint_coordinator;
+pub mod checkpoint_listener;
 pub mod checkpoint_storage;
+#[cfg(feature = "connectors")]
+pub mod connector_factory;
 pub mod dag;
 pub mod execution;
 pub mod recovery;
@@ -24,13 +27,21 @@ pub mod savepoint;
 pub mod state;
 pub mod state_backend;
 pub mod task;
+pub mod task_group;
 
 // Re-export key types
 pub use barrier::{BarrierTracker, CheckpointBarrier, StreamElement};
 pub use checkpoint::{
     CheckpointConfig, CheckpointId, CheckpointState, CompletedCheckpoint, TaskCheckpointState,
+    CheckpointStorage,
 };
 pub use checkpoint_coordinator::CheckpointCoordinator;
+pub use checkpoint_listener::{CheckpointListener, NopCheckpointListener};
+#[cfg(feature = "connectors")]
+pub use connector_factory::{
+    create_sink, create_source, create_transforms, AnySplit, BoxedSinkWriter, BoxedSourceReader,
+    BoxedTransform, ConsoleSinkWriter, FakeSeqSource,
+};
 pub use checkpoint_storage::{
     CheckpointStorageBackend, CheckpointStorageError, HDFSCheckpointStorage,
     InMemoryCheckpointStorage, LocalCheckpointStorage, S3CheckpointStorage,

@@ -80,11 +80,38 @@ impl MessageFormat {
 }
 
 /// Deserialize bytes into a Row using the specified format.
+/// For CDC formats that emit multiple rows (e.g. UPDATE), takes the first row.
 pub fn deserialize(
     format: MessageFormat,
     bytes: &[u8],
     schema: &TableSchema,
 ) -> Result<Row, Box<dyn Error>> {
+    let rows = match format {
+        MessageFormat::Json => json::deserialize(bytes, schema)?,
+        MessageFormat::Text => text::deserialize(bytes, schema)?,
+        MessageFormat::CanalJson => canal_json::deserialize(bytes, schema)?,
+        MessageFormat::DebeziumJson => debezium_json::deserialize(bytes, schema)?,
+        MessageFormat::CompatibleDebeziumJson => {
+            compatible_debezium_json::deserialize(bytes, schema)?
+        }
+        MessageFormat::CompatibleKafkaConnectJson => {
+            compatible_kafka_connect_json::deserialize(bytes, schema)?
+        }
+        MessageFormat::OggJson => ogg_json::deserialize(bytes, schema)?,
+        MessageFormat::MaxwellJson => maxwell_json::deserialize(bytes, schema)?,
+        MessageFormat::Avro => avro::deserialize(bytes, schema)?,
+        MessageFormat::Protobuf => protobuf::deserialize(bytes, schema)?,
+        MessageFormat::Native => native::deserialize(bytes, schema)?,
+    };
+    rows.into_iter().next().ok_or("Empty result from format deserializer".into())
+}
+
+/// Deserialize bytes into all Rows (useful for CDC formats with UPDATE_BEFORE/UPDATE_AFTER).
+pub fn deserialize_all(
+    format: MessageFormat,
+    bytes: &[u8],
+    schema: &TableSchema,
+) -> Result<Vec<Row>, Box<dyn Error>> {
     match format {
         MessageFormat::Json => json::deserialize(bytes, schema),
         MessageFormat::Text => text::deserialize(bytes, schema),

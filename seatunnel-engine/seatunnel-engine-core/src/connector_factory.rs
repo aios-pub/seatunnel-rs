@@ -1,0 +1,681 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+//! Connector factory: builds engine-ready Source readers, Transform chains and
+//! Sink writers from job configuration.
+//!
+//! This is the single place where plugin names map to concrete connector
+//! implementations. Both the cluster WorkerNode and the CLI local runner use
+//! it, guaranteeing identical behavior in both modes.
+//!
+//! The factory returns type-erased boxes (`BoxedSourceReader` /
+//! `BoxedSinkWriter`) so the execution layer never needs to know which
+//! connector is running.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+
+use serde::Serialize;
+use seatunnel_api::row::{Field, Row};
+use seatunnel_api::schema::TableSchema;
+use seatunnel_api::sink::sink_writer::SinkWriter;
+use seatunnel_api::source::source_reader::{PollResult, SourceReader};
+use seatunnel_api::source::source_split::SourceSplit;
+use seatunnel_api::transform::Transform;
+
+/// A split handle whose concrete payload is erased by the reader adapter.
+/// The engine's chained TaskGroup lets readers self-manage splits, so the
+/// engine only needs an opaque identifier.
+#[derive(Debug, Clone)]
+pub struct AnySplit {
+    id: String,
+}
+
+impl AnySplit {
+    pub fn new(id: impl Into<String>) -> Self {
+        AnySplit { id: id.into() }
+    }
+}
+
+impl SourceSplit for AnySplit {
+    fn split_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Type-erased source reader producing plain `Row`s.
+pub type BoxedSourceReader = Box<dyn SourceReader<Output = Row, Split = AnySplit>>;
+
+/// Type-erased sink writer consuming `Row`s with byte-serialized states.
+pub type BoxedSinkWriter = Box<dyn SinkWriter<Input = Row, WriterState = Vec<u8>, CommitInfo = Vec<u8>>>;
+
+/// Type-erased transform chain element.
+pub type BoxedTransform = Box<dyn Transform<Input = Row, Output = Row>>;
+
+// ---------------------------------------------------------------------------
+// Reader adapter
+// ---------------------------------------------------------------------------
+
+struct ReaderAdapter<R> {
+    inner: R,
+    warned_splits: bool,
+}
+
+impl<R> SourceReader for ReaderAdapter<R>
+where
+    R: SourceReader + Send,
+    R::Output: Into<Row>,
+{
+    type Output = Row;
+    type Split = AnySplit;
+
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.open().await })
+    }
+
+    fn poll_next(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
+        Box::pin(async move {
+            match self.inner.poll_next().await? {
+                PollResult::Record(out) => Ok(PollResult::Record(out.into())),
+                PollResult::Empty => Ok(PollResult::Empty),
+                PollResult::EOF => Ok(PollResult::EOF),
+            }
+        })
+    }
+
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move { self.inner.snapshot_state().await })
+    }
+
+    fn add_splits(&mut self, _splits: Vec<Self::Split>) {
+        // Readers managed by this engine enumerate their own splits; external
+        // split assignment is not part of the chained execution model yet.
+        if !self.warned_splits {
+            self.warned_splits = true;
+            tracing::debug!("ReaderAdapter: external add_splits ignored (readers self-enumerate)");
+        }
+    }
+
+    fn handle_no_more_splits(&mut self) {
+        self.inner.handle_no_more_splits();
+    }
+
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.close().await })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink adapter
+// ---------------------------------------------------------------------------
+
+struct SinkWriterAdapter<W> {
+    inner: W,
+}
+
+#[async_trait::async_trait]
+impl<W> SinkWriter for SinkWriterAdapter<W>
+where
+    W: SinkWriter<Input = Row> + Send,
+    W::CommitInfo: Serialize + Send,
+    W::WriterState: Serialize + Send,
+{
+    type Input = Row;
+    type WriterState = Vec<u8>;
+    type CommitInfo = Vec<u8>;
+
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.open().await })
+    }
+
+    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.write(record).await })
+    }
+
+    fn prepare_commit(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
+        Box::pin(async move {
+            let infos = self.inner.prepare_commit().await?;
+            Ok(infos
+                .iter()
+                .map(|info| serde_json::to_vec(info).unwrap_or_default())
+                .collect())
+        })
+    }
+
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move {
+            let state = self.inner.snapshot_state().await?;
+            serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("serialize writer state: {}", e))
+        })
+    }
+
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.close().await })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in fake source (smoke tests / local demos)
+// ---------------------------------------------------------------------------
+
+/// Emits a bounded sequence of synthetic rows, then EOF.
+#[derive(Debug, Default)]
+pub struct FakeSeqSource {
+    emitted: u64,
+    total: u64,
+}
+
+impl FakeSeqSource {
+    pub fn with_total(total: u64) -> Self {
+        FakeSeqSource { emitted: 0, total }
+    }
+}
+
+impl SourceReader for FakeSeqSource {
+    type Output = Row;
+    type Split = AnySplit;
+
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn poll_next(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
+        Box::pin(async move {
+            if self.emitted >= self.total {
+                return Ok(PollResult::EOF);
+            }
+            let mut row = Row::new(seatunnel_api::row::RowKind::Insert, 3);
+            row.set(0, Field::Int64(self.emitted as i64));
+            row.set(1, Field::String(format!("fake-row-{}", self.emitted)));
+            row.set(2, Field::Bool(self.emitted % 2 == 0));
+            self.emitted += 1;
+            Ok(PollResult::Record(row))
+        })
+    }
+
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move { Ok(serde_json::to_vec(&self.emitted).unwrap()) })
+    }
+
+    fn add_splits(&mut self, _splits: Vec<Self::Split>) {}
+
+    fn handle_no_more_splits(&mut self) {}
+
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in console sink (used by local runs and smoke tests)
+// ---------------------------------------------------------------------------
+
+/// Sink writer that prints every row as a JSON object on stdout.
+pub struct ConsoleSinkWriter {
+    prefix: String,
+    written: u64,
+}
+
+impl ConsoleSinkWriter {
+    pub fn new(prefix: impl Into<String>) -> Self {
+        ConsoleSinkWriter { prefix: prefix.into(), written: 0 }
+    }
+}
+
+#[async_trait::async_trait]
+impl SinkWriter for ConsoleSinkWriter {
+    type Input = Row;
+    type WriterState = Vec<u8>;
+    type CommitInfo = Vec<u8>;
+
+    fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        self.written += 1;
+        let line = row_to_json(&record);
+        Box::pin(async move {
+            println!("{}{}", self.prefix, line);
+            Ok(())
+        })
+    }
+
+    fn prepare_commit(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+        let n = self.written;
+        Box::pin(async move { Ok(serde_json::to_vec(&serde_json::json!({ "written": n })).unwrap()) })
+    }
+
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn field_to_json(field: &Field) -> serde_json::Value {
+    use serde_json::Value;
+    match field {
+        Field::Null => Value::Null,
+        Field::Bool(b) => Value::Bool(*b),
+        Field::Int8(v) => (*v).into(),
+        Field::Int16(v) => (*v).into(),
+        Field::Int32(v) => (*v).into(),
+        Field::Int64(v) => (*v).into(),
+        Field::UInt8(v) => (*v).into(),
+        Field::UInt16(v) => (*v).into(),
+        Field::UInt32(v) => (*v).into(),
+        Field::UInt64(v) => (*v).into(),
+        Field::Float32(v) => serde_json::Number::from_f64(*v as f64).map(Value::Number).unwrap_or(Value::Null),
+        Field::Float64(v) => serde_json::Number::from_f64(*v).map(Value::Number).unwrap_or(Value::Null),
+        Field::String(s) => Value::String(s.clone()),
+        Field::Bytes(b) => Value::String(format!("0x{}", hex::encode(b))),
+        Field::Decimal(d) => Value::String(d.to_string()),
+        Field::Json(s) => s.clone(),
+        Field::Date(d) => Value::String(d.to_string()),
+        Field::Time(t) => Value::String(t.to_string()),
+        Field::DateTime(dt) => Value::String(dt.to_string()),
+        Field::TimestampTz(ts) => Value::String(ts.to_string()),
+        Field::Duration(d) => (*d).into(),
+        Field::Array(items) => Value::Array(items.iter().map(field_to_json).collect()),
+        Field::Row(inner) => {
+            let obj: serde_json::Map<String, serde_json::Value> = inner
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (format!("f{}", i), field_to_json(f)))
+                .collect();
+            Value::Object(obj)
+        }
+    }
+}
+
+fn row_to_json(row: &Row) -> String {
+    let obj: serde_json::Map<String, serde_json::Value> = (0..row.field_count())
+        .map(|i| (format!("f{}", i), field_to_json(row.get(i))))
+        .collect();
+    serde_json::Value::Object(obj).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Built-in filter transform (index-based comparisons)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CompareOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    NotNull,
+    IsNull,
+}
+
+impl CompareOp {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "=" | "eq" | "equals" => Ok(CompareOp::Eq),
+            "!=" | "ne" | "not_equals" => Ok(CompareOp::Ne),
+            ">" | "gt" => Ok(CompareOp::Gt),
+            "<" | "lt" => Ok(CompareOp::Lt),
+            ">=" | "gte" | "gteq" => Ok(CompareOp::Gte),
+            "<=" | "lte" | "lteq" => Ok(CompareOp::Lte),
+            "not_null" | "notnull" => Ok(CompareOp::NotNull),
+            "is_null" | "isnull" | "null" => Ok(CompareOp::IsNull),
+            other => Err(anyhow::anyhow!("unsupported filter operator '{}'", other)),
+        }
+    }
+}
+
+/// Filter rows by comparing the numeric/string value of one field index.
+pub struct FilterByIndexTransform {
+    index: usize,
+    op: CompareOp,
+    value: Option<Field>,
+}
+
+impl FilterByIndexTransform {
+    pub fn new(index: usize, op: CompareOp, value: Option<Field>) -> Self {
+        FilterByIndexTransform { index, op, value }
+    }
+}
+
+fn numeric_value(field: &Field) -> Option<f64> {
+    match field {
+        Field::Int8(v) => Some(*v as f64),
+        Field::Int16(v) => Some(*v as f64),
+        Field::Int32(v) => Some(*v as f64),
+        Field::Int64(v) => Some(*v as f64),
+        Field::UInt8(v) => Some(*v as f64),
+        Field::UInt16(v) => Some(*v as f64),
+        Field::UInt32(v) => Some(*v as f64),
+        Field::UInt64(v) => Some(*v as f64),
+        Field::Float32(v) => Some(*v as f64),
+        Field::Float64(v) => Some(*v),
+        Field::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+impl Transform for FilterByIndexTransform {
+    type Input = Row;
+    type Output = Row;
+
+    fn process(&mut self, record: Self::Input) -> anyhow::Result<Vec<Self::Output>> {
+        if self.index >= record.field_count() {
+            return Ok(vec![]);
+        }
+        let field = record.get(self.index);
+        let keep = match self.op {
+            CompareOp::NotNull => !matches!(field, Field::Null),
+            CompareOp::IsNull => matches!(field, Field::Null),
+            CompareOp::Eq | CompareOp::Ne => {
+                let eq = match (&self.value, field) {
+                    (Some(Field::String(want)), Field::String(got)) => want == got,
+                    (Some(want), got) => match (numeric_value(want), numeric_value(got)) {
+                        (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if self.op == CompareOp::Eq { eq } else { !eq }
+            }
+            CompareOp::Gt | CompareOp::Lt | CompareOp::Gte | CompareOp::Lte => {
+                let (Some(a), Some(b)) = (self.value.as_ref().and_then(numeric_value), numeric_value(field)) else {
+                    return Ok(vec![]);
+                };
+                match self.op {
+                    CompareOp::Gt => b > a,
+                    CompareOp::Lt => b < a,
+                    CompareOp::Gte => b >= a,
+                    CompareOp::Lte => b <= a,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        Ok(if keep { vec![record] } else { vec![] })
+    }
+
+    fn get_output_schema(&self) -> Option<TableSchema> {
+        None
+    }
+
+    fn set_input_schema(&mut self, _schema: TableSchema) {}
+}
+
+// ---------------------------------------------------------------------------
+// Config helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a JSON config object into the flat `HashMap<String,String>` shape
+/// that `ConnectorConfig` consumes. Nested objects are serialized back to
+/// their dotted-path representation so `startup.mode`, `database-name` etc.
+/// survive round-trips through the gRPC descriptor.
+pub fn json_to_config_map(value: &serde_json::Value) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    fn walk(prefix: &str, v: &serde_json::Value, out: &mut HashMap<String, String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    let key = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                    walk(&key, child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                // Arrays are stored as comma-separated scalars when they hold
+                // scalars, otherwise as JSON text.
+                if items.iter().all(|i| i.is_string() || i.is_number() || i.is_boolean()) {
+                    let joined = items
+                        .iter()
+                        .map(scalar_to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.insert(prefix.to_string(), joined);
+                } else if let Ok(text) = serde_json::to_string(v) {
+                    out.insert(prefix.to_string(), text);
+                }
+            }
+            scalar => {
+                out.insert(prefix.to_string(), scalar_to_string(scalar));
+            }
+        }
+    }
+    walk("", value, &mut out);
+    out
+}
+
+fn scalar_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory entry points
+// ---------------------------------------------------------------------------
+
+/// Build the source reader described by `plugin` + flat config.
+///
+/// `restore_state` carries the serialized checkpoint state captured at the
+/// last completed checkpoint; connectors that support it (CDC readers)
+/// resume from that position instead of starting over.
+///
+/// Supported plugins: MySQL-CDC (`MySqlCdc`), Postgres-CDC, TiDB-CDC, Kafka,
+/// JDBC and the built-in FakeSource. Plugin matching is case-insensitive and
+/// tolerates common aliases so YAML configs read naturally.
+pub fn create_source(
+    plugin: &str,
+    config: &HashMap<String, String>,
+    parallelism: usize,
+    restore_state: Option<&[u8]>,
+) -> anyhow::Result<BoxedSourceReader> {
+    use seatunnel_connector_common::ConnectorConfig;
+    let conn = ConnectorConfig::new(config.clone());
+    let lower = plugin.to_lowercase().replace(['-', '_'], "");
+
+    match lower.as_str() {
+        "mysqlcdc" | "mysql" | "mysqlcdcsource" | "cdcmysql" => {
+            #[cfg(feature = "connector-mysql")]
+            {
+                use seatunnel_connector_cdc_mysql::{MySqlCdcConfig, MySqlCdcReader};
+                let cfg = MySqlCdcConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: MySQL-CDC source → {}:{} db={} table={} startup={:?}",
+                    cfg.hostname, cfg.port, cfg.database_name, cfg.table_name, cfg.startup_mode
+                );
+                let mut reader = MySqlCdcReader::new(cfg, None);
+                if let Some(bytes) = restore_state {
+                    reader
+                        .restore_from_state_bytes(bytes)
+                        .map_err(|e| anyhow::anyhow!("restore MySQL CDC state: {}", e))?;
+                }
+                Ok(Box::new(ReaderAdapter { inner: reader, warned_splits: false }))
+            }
+            #[cfg(not(feature = "connector-mysql"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("MySQL CDC connector not compiled in (feature connector-mysql)"))
+            }
+        }
+        "postgrescdc" | "postgres" | "postgresqlcdc" | "cdcpostgres" => {
+            #[cfg(feature = "connector-postgres")]
+            {
+                use seatunnel_connector_cdc_postgres::{PostgresCdcConfig, PostgresCdcReader};
+                let cfg = PostgresCdcConfig::from_config(&conn);
+                tracing::info!("factory: Postgres-CDC source");
+                Ok(Box::new(ReaderAdapter { inner: PostgresCdcReader::new(cfg, None), warned_splits: false }))
+            }
+            #[cfg(not(feature = "connector-postgres"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("Postgres CDC connector not compiled in"))
+            }
+        }
+        "tidbcdc" | "tidb" | "cdctidb" => {
+            #[cfg(feature = "connector-tidb")]
+            {
+                use seatunnel_connector_cdc_tidb::{TiDBCdcConfig, TiDBCdcReader};
+                let cfg = TiDBCdcConfig::from_config(&conn);
+                tracing::info!("factory: TiDB-CDC source");
+                Ok(Box::new(ReaderAdapter { inner: TiDBCdcReader::new(cfg, None, 0), warned_splits: false }))
+            }
+            #[cfg(not(feature = "connector-tidb"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("TiDB CDC connector not compiled in"))
+            }
+        }
+        "kafka" | "kafkasource" => {
+            #[cfg(feature = "connector-kafka")]
+            {
+                use seatunnel_connector_kafka::{KafkaSourceConfig, KafkaSourceReader};
+                let cfg = KafkaSourceConfig::from_config(&conn);
+                tracing::info!("factory: Kafka source topic={} brokers={}", cfg.topic, cfg.bootstrap_servers);
+                Ok(Box::new(ReaderAdapter { inner: KafkaSourceReader::new(cfg, None), warned_splits: false }))
+            }
+            #[cfg(not(feature = "connector-kafka"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("Kafka connector not compiled in"))
+            }
+        }
+        "fake" | "fake source" | "fakesource" => {
+            let _ = (parallelism, restore_state);
+            Ok(Box::new(ReaderAdapter { inner: FakeSeqSource::default(), warned_splits: false }))
+        }
+        other => Err(anyhow::anyhow!("unknown source plugin '{}'", other)),
+    }
+}
+
+/// Build the sink writer described by `plugin` + flat config.
+pub fn create_sink(plugin: &str, config: &HashMap<String, String>) -> anyhow::Result<BoxedSinkWriter> {
+    use seatunnel_connector_common::ConnectorConfig;
+    let conn = ConnectorConfig::new(config.clone());
+    let lower = plugin.to_lowercase().replace(['-', '_'], "");
+
+    match lower.as_str() {
+        "kafka" | "kafkasink" => {
+            #[cfg(feature = "connector-kafka")]
+            {
+                use seatunnel_connector_kafka::{KafkaSinkConfig, KafkaSinkWriter};
+                let cfg = KafkaSinkConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: Kafka sink topic={} brokers={} acks={}",
+                    cfg.topic, cfg.bootstrap_servers, cfg.acks
+                );
+                Ok(Box::new(SinkWriterAdapter { inner: KafkaSinkWriter::new(cfg) }))
+            }
+            #[cfg(not(feature = "connector-kafka"))]
+            {
+                Err(anyhow::anyhow!("Kafka connector not compiled in"))
+            }
+        }
+        "jdbc" | "jdbcsink" => {
+            #[cfg(feature = "connector-jdbc")]
+            {
+                use seatunnel_connector_jdbc::{JdbcSinkConfig, JdbcSinkWriter};
+                let cfg = JdbcSinkConfig::from_config(&conn);
+                tracing::info!("factory: JDBC sink");
+                Ok(Box::new(SinkWriterAdapter { inner: JdbcSinkWriter::new(cfg, None) }))
+            }
+            #[cfg(not(feature = "connector-jdbc"))]
+            {
+                Err(anyhow::anyhow!("JDBC connector not compiled in"))
+            }
+        }
+        "console" | "consolesink" | "" => Ok(Box::new(SinkWriterAdapter {
+            inner: ConsoleSinkWriter::new("[console] "),
+        })),
+        other => Err(anyhow::anyhow!("unknown sink plugin '{}'", other)),
+    }
+}
+
+/// Build a transform chain from the ordered list of transform configs.
+///
+/// Recognized transform types:
+/// - `filter` with `{field_index, operator, value}`
+/// Unknown transforms produce an error — failing fast beats silently dropping
+/// user logic.
+pub fn create_transforms(configs: &[serde_json::Value]) -> anyhow::Result<Vec<BoxedTransform>> {
+    let mut chain: Vec<BoxedTransform> = Vec::with_capacity(configs.len());
+    for cfg in configs {
+        let plugin = cfg
+            .get("plugin_name")
+            .or_else(|| cfg.get("plugin"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match plugin.as_str() {
+            "filter" => {
+                let index = cfg.get("field_index").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    anyhow::anyhow!("filter transform requires integer 'field_index'")
+                })? as usize;
+                let op = CompareOp::parse(
+                    cfg.get("operator").and_then(|v| v.as_str()).unwrap_or("not_null"),
+                )?;
+                let value = cfg.get("value").map(json_scalar_to_field);
+                chain.push(Box::new(FilterByIndexTransform::new(index, op, value)));
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown transform plugin '{}' (supported: filter)",
+                    other
+                ))
+            }
+        }
+    }
+    Ok(chain)
+}
+
+fn json_scalar_to_field(v: &serde_json::Value) -> Field {
+    match v {
+        serde_json::Value::Bool(b) => Field::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Field::Int64(i)
+            } else {
+                Field::Float64(n.as_f64().unwrap_or_default())
+            }
+        }
+        serde_json::Value::String(s) => Field::String(s.clone()),
+        _ => Field::Null,
+    }
+}
