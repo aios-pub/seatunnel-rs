@@ -16,6 +16,7 @@
  */
 
 use crate::row::Row;
+use crate::schema::SchemaChangeEvent;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -38,4 +39,16 @@ pub trait SinkWriter: Send {
     fn prepare_commit(&mut self) -> WriterFuture<'_, Vec<Self::CommitInfo>>;
     fn snapshot_state(&mut self) -> WriterFuture<'_, Vec<u8>>;
     fn close(&mut self) -> WriterFuture<'_, ()>;
+
+    /// Apply a mid-stream schema change emitted by the source
+    /// (Java: `SupportSchemaEvolutionSinkWriter#applySchemaChange`).
+    ///
+    /// Implementations MUST first flush every buffered row that still
+    /// uses the old schema, then apply the change to their storage
+    /// (e.g. `ALTER TABLE` for JDBC, mapping update for Elasticsearch).
+    /// The default implementation is a no-op for sinks that cannot
+    /// react to schema changes.
+    fn apply_schema_change(&mut self, _event: &SchemaChangeEvent) -> WriterFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }

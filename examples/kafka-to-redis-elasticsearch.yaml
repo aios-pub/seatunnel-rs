@@ -1,0 +1,50 @@
+# Kafka → Redis & Elasticsearch fan-in style examples.
+#
+# Two independent example jobs sharing one Kafka source configuration
+# shape; submit them separately with the relevant `source`/`sink` pair.
+
+# ── 1) Kafka → Redis ────────────────────────────────────────────────
+# env:
+#   job.name: kafka-to-redis
+#   parallelism: 2
+# source:
+#   Kafka:
+#     bootstrap.servers: "127.0.0.1:9092"
+#     topic: users-cdc
+#     group.id: redis-sync
+#     startup.mode: earliest
+#     format: json
+# sink:
+#   Redis:
+#     host: 127.0.0.1
+#     port: 6379
+#     # auth: secret
+#     data-type: hash        # string | hash | list | set | zset
+#     key: "users:${f0}"     # ${fN} placeholders reference row fields
+#     hash-field: "${f1}"
+#     batch-size: 100
+#     # expire: 3600         # key TTL seconds, -1 disables
+
+# ── 2) Kafka → Elasticsearch ────────────────────────────────────────
+# env:
+#   job.name: kafka-to-elasticsearch
+#   parallelism: 1
+# source:
+#   Kafka:
+#     bootstrap.servers: "127.0.0.1:9092"
+#     topic: users-cdc
+#     group.id: es-sync
+#     startup.mode: earliest
+#     format: json
+# sink:
+  Elasticsearch:
+    hosts: "127.0.0.1:9200"
+    # username: elastic
+    # password: changeme
+    index: users_idx
+    # Document _id from key fields (f0 = replicated id); enables upsert
+    # (doc_as_upsert) and delete semantics.
+    primary-keys: f0
+    max-batch-size: 200
+    schema-save-mode: create_when_not_exist
+    data-save-mode: append_data

@@ -126,6 +126,22 @@ pub struct CdcEngine {
 }
 
 impl CdcEngine {
+    /// Replace the schema used to decode row values (schema evolution).
+    pub fn update_column_types(
+        &mut self,
+        column_types: Vec<crate::decoder::RowColType>,
+        pk_ordinal: Option<usize>,
+    ) {
+        if self.config.column_types != column_types || self.config.pk_ordinal != pk_ordinal {
+            tracing::info!(
+                "TiKV CDC engine: schema updated ({} columns)",
+                column_types.len()
+            );
+            self.config.column_types = column_types;
+            self.config.pk_ordinal = pk_ordinal;
+        }
+    }
+
     pub fn new(config: CdcEngineConfig) -> Self {
         let resume_checkpoint_ts = config.checkpoint_ts;
         let enc_start_key = encode_comparable(&config.start_key);

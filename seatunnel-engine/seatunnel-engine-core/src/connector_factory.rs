@@ -95,6 +95,7 @@ where
         Box::pin(async move {
             match self.inner.poll_next().await? {
                 PollResult::Record(out) => Ok(PollResult::Record(out.into())),
+                PollResult::SchemaChange(event) => Ok(PollResult::SchemaChange(event)),
                 PollResult::Empty => Ok(PollResult::Empty),
                 PollResult::EOF => Ok(PollResult::EOF),
             }
@@ -178,6 +179,14 @@ where
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move { self.inner.close().await })
+    }
+
+    fn apply_schema_change(
+        &mut self,
+        event: &seatunnel_api::SchemaChangeEvent,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        let event = event.clone();
+        Box::pin(async move { self.inner.apply_schema_change(&event).await })
     }
 }
 
@@ -646,8 +655,14 @@ pub fn create_source(
                     cfg.topic,
                     cfg.bootstrap_servers
                 );
+                let mut reader = KafkaSourceReader::new(cfg, None);
+                if let Some(bytes) = restore_state {
+                    reader
+                        .restore_from_state_bytes(bytes)
+                        .map_err(|e| anyhow::anyhow!("restore Kafka source state: {}", e))?;
+                }
                 Ok(Box::new(ReaderAdapter {
-                    inner: KafkaSourceReader::new(cfg, None),
+                    inner: reader,
                     warned_splits: false,
                 }))
             }
@@ -655,6 +670,77 @@ pub fn create_source(
             {
                 let _ = (parallelism, restore_state);
                 Err(anyhow::anyhow!("Kafka connector not compiled in"))
+            }
+        }
+        "jdbc" | "jdbcsource" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_jdbc::{JdbcSourceConfig, JdbcSourceReader};
+                let cfg = JdbcSourceConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: JDBC source url={}",
+                    cfg.url.replace(&cfg.password, "***")
+                );
+                let mut reader = JdbcSourceReader::new(cfg, None);
+                if let Some(bytes) = restore_state {
+                    reader
+                        .restore_from_state_bytes(bytes)
+                        .map_err(|e| anyhow::anyhow!("restore JDBC source state: {}", e))?;
+                }
+                Ok(Box::new(ReaderAdapter {
+                    inner: reader,
+                    warned_splits: false,
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("JDBC connector not compiled in"))
+            }
+        }
+        "redis" | "redissource" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_redis::{RedisConfig, RedisSourceReader};
+                let cfg = RedisConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: Redis source {}:{} pattern={}",
+                    cfg.host,
+                    cfg.port,
+                    cfg.keys_pattern
+                );
+                let _ = restore_state;
+                Ok(Box::new(ReaderAdapter {
+                    inner: RedisSourceReader::new(cfg),
+                    warned_splits: false,
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("Redis connector not compiled in"))
+            }
+        }
+        "elasticsearch" | "es" | "essource" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_elasticsearch::{EsConfig, EsSourceReader};
+                let cfg = EsConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: Elasticsearch source index={} hosts={:?}",
+                    cfg.index,
+                    cfg.hosts
+                );
+                let _ = restore_state;
+                Ok(Box::new(ReaderAdapter {
+                    inner: EsSourceReader::new(cfg),
+                    warned_splits: false,
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("Elasticsearch connector not compiled in"))
             }
         }
         "fake" | "fake source" | "fakesource" => {
@@ -715,6 +801,45 @@ pub fn create_sink(
             #[cfg(not(feature = "connectors"))]
             {
                 Err(anyhow::anyhow!("JDBC connector not compiled in"))
+            }
+        }
+        "redis" | "redissink" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_redis::{RedisConfig, RedisSinkWriter};
+                let cfg = RedisConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: Redis sink {}:{} data-type={:?}",
+                    cfg.host,
+                    cfg.port,
+                    cfg.data_type
+                );
+                Ok(Box::new(SinkWriterAdapter {
+                    inner: RedisSinkWriter::new(cfg),
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                Err(anyhow::anyhow!("Redis connector not compiled in"))
+            }
+        }
+        "elasticsearch" | "es" | "essink" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_elasticsearch::{EsConfig, EsSinkWriter};
+                let cfg = EsConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: Elasticsearch sink index={} hosts={:?}",
+                    cfg.index,
+                    cfg.hosts
+                );
+                Ok(Box::new(SinkWriterAdapter {
+                    inner: EsSinkWriter::new(cfg, None),
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                Err(anyhow::anyhow!("Elasticsearch connector not compiled in"))
             }
         }
         "console" | "consolesink" | "" => Ok(Box::new(SinkWriterAdapter {

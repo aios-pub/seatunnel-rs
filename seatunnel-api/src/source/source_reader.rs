@@ -17,6 +17,7 @@
 
 use super::source_split::SourceSplit;
 use crate::row::Row;
+use crate::schema::SchemaChangeEvent;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -46,6 +47,11 @@ pub trait SourceReader: Send {
 #[derive(Debug)]
 pub enum PollResult<T> {
     Record(T),
+    /// A DDL-induced schema change detected by the source. The engine
+    /// forwards it to the sink (`SinkWriter::apply_schema_change`) before
+    /// any row with the new shape is written, mirroring the Java
+    /// schema-evolution pipeline.
+    SchemaChange(Box<SchemaChangeEvent>),
     Empty,
     EOF,
 }

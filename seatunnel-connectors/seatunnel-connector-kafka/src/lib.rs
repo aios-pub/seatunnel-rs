@@ -27,15 +27,17 @@
 //! - 2PC commit support for exactly-once semantics
 //! - Format-based serialization via seatunnel-formats
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::TopicPartitionList;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::Message as RdkafkaMessage;
+use rdkafka::Offset;
 use seatunnel_api::{
     row::{Row, RowKind},
     schema::TableSchema,
@@ -111,20 +113,20 @@ impl KafkaSourceState {
 }
 
 /// Startup mode for Kafka consumer offset.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum KafkaStartupMode {
     #[default]
     Earliest,
     Latest,
+    /// Start from the first offset whose timestamp >= ts (milliseconds).
     Timestamp {
         ts: i64,
     },
-    GroupOffset {
-        group: String,
-    },
-    SpecificOffset {
-        partition: i32,
-        offset: i64,
+    /// Use the consumer group's committed offsets.
+    GroupOffset,
+    /// Start from explicit `partition -> offset` positions.
+    SpecificOffsets {
+        offsets: HashMap<i32, i64>,
     },
 }
 
@@ -136,6 +138,15 @@ pub struct KafkaSourceConfig {
     pub group_id: String,
     pub startup_mode: KafkaStartupMode,
     pub format: MessageFormat,
+    /// Field delimiter for TEXT format (sink side / text fallback).
+    pub field_delimiter: String,
+    /// Optional column-name list; when set, messages are deserialized with
+    /// `seatunnel-formats` against this schema (required for CDC formats).
+    pub columns: Vec<String>,
+    pub subtask_index: usize,
+    pub subtask_count: usize,
+    /// Poll timeout per `poll_next` call, milliseconds.
+    pub poll_timeout_ms: u64,
 }
 
 impl Default for KafkaSourceConfig {
@@ -146,12 +157,31 @@ impl Default for KafkaSourceConfig {
             group_id: "seatunnel-consumer".to_string(),
             startup_mode: KafkaStartupMode::Earliest,
             format: MessageFormat::Json,
+            field_delimiter: ",".to_string(),
+            columns: Vec::new(),
+            subtask_index: 0,
+            subtask_count: 1,
+            poll_timeout_ms: 250,
         }
     }
 }
 
+/// Parse `partition:offset,partition:offset` into a map.
+pub fn parse_specific_offsets(s: &str) -> HashMap<i32, i64> {
+    let mut out = HashMap::new();
+    for pair in s.split(',') {
+        if let Some((p, o)) = pair.trim().split_once(':') {
+            if let (Ok(p), Ok(o)) = (p.trim().parse::<i32>(), o.trim().parse::<i64>()) {
+                out.insert(p, o);
+            }
+        }
+    }
+    out
+}
+
 impl KafkaSourceConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
+        let specific = parse_specific_offsets(&config.get_string("startup.specific-offsets", ""));
         KafkaSourceConfig {
             bootstrap_servers: config.get_string("bootstrap.servers", "localhost:9092"),
             topic: config.get_string("topic", "seatunnel"),
@@ -160,26 +190,39 @@ impl KafkaSourceConfig {
                 .get("format")
                 .and_then(|f| MessageFormat::from_str(f))
                 .unwrap_or(MessageFormat::Json),
-            startup_mode: config
-                .get("startup.mode")
-                .map(|s| match s.as_str() {
-                    "earliest" => KafkaStartupMode::Earliest,
-                    "latest" => KafkaStartupMode::Latest,
-                    "group-offsets" => KafkaStartupMode::GroupOffset {
-                        group: config.get_string("group.id", "seatunnel-consumer"),
-                    },
-                    _ => KafkaStartupMode::Earliest,
-                })
-                .unwrap_or(KafkaStartupMode::Earliest),
+            field_delimiter: config.get_string("field.delimiter", ","),
+            columns: config
+                .get_string("columns", "")
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+            subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
+            subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
+            poll_timeout_ms: config.get_int("poll.timeout.ms", 250).max(10) as u64,
+            startup_mode: match config.get_string("startup.mode", "earliest").as_str() {
+                "latest" => KafkaStartupMode::Latest,
+                "timestamp" => KafkaStartupMode::Timestamp {
+                    ts: config.get_int("startup.timestamp", 0),
+                },
+                "group-offsets" | "group_offsets" | "groupoffsets" => KafkaStartupMode::GroupOffset,
+                "specific-offsets" | "specific_offsets" | "specificoffsets" => {
+                    KafkaStartupMode::SpecificOffsets {
+                        offsets: specific,
+                    }
+                }
+                _ => KafkaStartupMode::Earliest,
+            },
         }
     }
 
-    /// `auto.offset.reset` value matching the startup mode.
+    /// `auto.offset.reset` value matching the startup mode. Assignment
+    /// always carries explicit offsets; this only covers gaps.
     fn auto_offset_reset(&self) -> &'static str {
         match self.startup_mode {
             KafkaStartupMode::Earliest => "earliest",
             KafkaStartupMode::Latest => "latest",
-            _ => "earliest",
+            _ => "error",
         }
     }
 }
@@ -258,25 +301,198 @@ impl Source for KafkaSource {
 }
 
 /// Kafka Source reader.
+///
+/// Uses manual partition assignment (`assign`) instead of group subscribe so
+/// that each subtask consumes a deterministic subset of partitions
+/// (`partition % subtask_count == subtask_index`), mirroring the Java
+/// `KafkaSourceSplitEnumerator` split→reader assignment. Offsets are
+/// committed to the consumer group at checkpoint time and restored from
+/// checkpoint state on restart.
 pub struct KafkaSourceReader {
     config: KafkaSourceConfig,
-    #[allow(dead_code)] // retained for future schema-aware serialization
+    /// Schema built from the configured column list (if any).
     schema: Option<TableSchema>,
-    splits: Vec<KafkaSourceSplit>,
+    /// Restored offsets from the last checkpoint (`topic-partition` → last
+    /// consumed offset); applied on open.
+    restore_offsets: HashMap<String, i64>,
     /// Highest consumed offset per `topic-partition`, captured at checkpoint.
     last_offsets: HashMap<String, i64>,
+    /// Rows decoded from a multi-row message (e.g. Debezium UPDATE) awaiting
+    /// emission.
+    pending: VecDeque<Row>,
     consumer: Option<StreamConsumer>,
+    /// Partitions assigned to this subtask.
+    assigned: Vec<i32>,
 }
 
 impl KafkaSourceReader {
     pub fn new(config: KafkaSourceConfig, schema: Option<TableSchema>) -> Self {
+        let schema = schema.or_else(|| {
+            if config.columns.is_empty() {
+                None
+            } else {
+                Some(TableSchema::new(
+                    format!("kafka.{}", config.topic),
+                    config
+                        .columns
+                        .iter()
+                        .map(|c| seatunnel_api::ColumnDef::new(c.clone(), seatunnel_api::ColumnType::String))
+                        .collect(),
+                ))
+            }
+        });
         KafkaSourceReader {
             config,
             schema,
-            splits: Vec::new(),
+            restore_offsets: HashMap::new(),
             last_offsets: HashMap::new(),
+            pending: VecDeque::new(),
             consumer: None,
+            assigned: Vec::new(),
         }
+    }
+
+    pub fn restore_from_state_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let state: KafkaSourceState = serde_json::from_slice(bytes)?;
+        self.restore_offsets = state.offsets;
+        Ok(())
+    }
+
+    /// Resolve the start offset for one partition according to the startup
+    /// mode and restored state.
+    async fn start_offset(
+        consumer: &StreamConsumer,
+        topic: &str,
+        partition: i32,
+        config: &KafkaSourceConfig,
+        restored: Option<i64>,
+    ) -> Offset {
+        if let Some(last) = restored {
+            return Offset::Offset(last + 1);
+        }
+        match &config.startup_mode {
+            KafkaStartupMode::SpecificOffsets { offsets } => {
+                offsets.get(&partition).map(|o| Offset::Offset(*o)).unwrap_or(Offset::Beginning)
+            }
+            KafkaStartupMode::Timestamp { ts } => {
+                let mut times = TopicPartitionList::new();
+                // librdkafka interprets the offset field as the lookup timestamp (ms).
+                let _ = times.add_partition_offset(topic, partition, Offset::Offset(*ts));
+                match consumer.offsets_for_times(times, Duration::from_secs(10)) {
+                    Ok(list) => list
+                        .elements()
+                        .iter()
+                        .find(|e| e.partition() == partition)
+                        .map(|e| e.offset())
+                        .unwrap_or(Offset::Beginning),
+                    Err(e) => {
+                        tracing::warn!("offsets_for_times failed: {}", e);
+                        Offset::Beginning
+                    }
+                }
+            }
+            KafkaStartupMode::GroupOffset => {
+                let mut tpls = TopicPartitionList::new();
+                let _ = tpls.add_partition(topic, partition);
+                match consumer.committed_offsets(tpls, Duration::from_secs(10)) {
+                    Ok(list) => list
+                        .elements()
+                        .iter()
+                        .find(|e| e.partition() == partition)
+                        .map(|e| e.offset())
+                        .unwrap_or(Offset::Invalid),
+                    Err(e) => {
+                        tracing::warn!("committed_offsets failed: {}", e);
+                        Offset::Invalid
+                    }
+                }
+            }
+            KafkaStartupMode::Latest => Offset::End,
+            KafkaStartupMode::Earliest => Offset::Beginning,
+        }
+    }
+
+    /// Decode a message payload into rows.
+    fn decode_payload(&self, payload: &[u8]) -> Vec<Row> {
+        if let Some(schema) = &self.schema {
+            return match seatunnel_formats::deserialize_all(self.config.format, payload, schema) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!("kafka decode failed ({}); message skipped", e);
+                    Vec::new()
+                }
+            };
+        }
+        // No schema configured: TEXT yields a single string field, JSON
+        // object/array payloads are mapped positionally.
+        match self.config.format {
+            MessageFormat::Text => {
+                let mut row = Row::new(RowKind::Insert, 1);
+                row.set(0, seatunnel_api::Field::String(String::from_utf8_lossy(payload).to_string()));
+                vec![row]
+            }
+            _ => {
+                let text = String::from_utf8_lossy(payload);
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(serde_json::Value::Object(map)) => {
+                        let mut row = Row::new(RowKind::Insert, map.len());
+                        for (i, (_, v)) in map.iter().enumerate() {
+                            row.set(i, json_value_to_field(v));
+                        }
+                        vec![row]
+                    }
+                    Ok(serde_json::Value::Array(items)) => {
+                        let mut row = Row::new(RowKind::Insert, items.len());
+                        for (i, v) in items.iter().enumerate() {
+                            row.set(i, json_value_to_field(v));
+                        }
+                        vec![row]
+                    }
+                    _ => {
+                        let mut row = Row::new(RowKind::Insert, 1);
+                        row.set(0, seatunnel_api::Field::String(text.to_string()));
+                        vec![row]
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commit the last consumed offsets (+1) to the consumer group.
+    fn commit_offsets(&self) {
+        if let Some(consumer) = &self.consumer {
+            if self.last_offsets.is_empty() {
+                return;
+            }
+            let mut tpl = TopicPartitionList::new();
+            for (key, offset) in &self.last_offsets {
+                if let Some((topic, partition)) = key.rsplit_once('-') {
+                    if let Ok(p) = partition.parse::<i32>() {
+                        let _ = tpl.add_partition_offset(topic, p, Offset::Offset(offset + 1));
+                    }
+                }
+            }
+            if let Err(e) = consumer.commit(&tpl, CommitMode::Async) {
+                tracing::debug!("kafka offset commit deferred: {}", e);
+            }
+        }
+    }
+}
+
+fn json_value_to_field(v: &serde_json::Value) -> seatunnel_api::Field {
+    use seatunnel_api::Field;
+    match v {
+        serde_json::Value::Null => Field::Null,
+        serde_json::Value::Bool(b) => Field::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Field::Int64(i)
+            } else {
+                Field::Float64(n.as_f64().unwrap_or_default())
+            }
+        }
+        serde_json::Value::String(s) => Field::String(s.clone()),
+        other => Field::String(other.to_string()),
     }
 }
 
@@ -287,9 +503,11 @@ impl SourceReader for KafkaSourceReader {
     fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         Box::pin(async move {
             tracing::info!(
-                "Opening Kafka source reader for topic={} (auto.offset.reset={})",
+                "Opening Kafka source reader for topic={} subtask={}/{} (startup={:?})",
                 self.config.topic,
-                self.config.auto_offset_reset()
+                self.config.subtask_index,
+                self.config.subtask_count,
+                self.config.startup_mode
             );
             let consumer: StreamConsumer = ClientConfig::new()
                 .set("bootstrap.servers", &self.config.bootstrap_servers)
@@ -299,9 +517,50 @@ impl SourceReader for KafkaSourceReader {
                 .set("enable.partition.eof", "false")
                 .create()
                 .map_err(|e| anyhow::anyhow!("Failed to create Kafka consumer: {}", e))?;
+
+            // Discover real partitions and keep this subtask's subset.
+            let metadata = consumer
+                .fetch_metadata(Some(&self.config.topic), Duration::from_secs(10))
+                .map_err(|e| anyhow::anyhow!("fetch_metadata failed: {}", e))?;
+            let partitions: Vec<i32> = metadata
+                .topics()
+                .iter()
+                .find(|t| t.name() == self.config.topic)
+                .map(|t| {
+                    t.partitions()
+                        .iter()
+                        .map(|p| p.id())
+                        .filter(|p| *p as usize % self.config.subtask_count == self.config.subtask_index)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if partitions.is_empty() {
+                tracing::warn!(
+                    "Kafka source: no partitions of topic '{}' assigned to subtask {}",
+                    self.config.topic,
+                    self.config.subtask_index
+                );
+            }
+
+            let mut tpl = TopicPartitionList::new();
+            for &p in &partitions {
+                let key = format!("{}-{}", self.config.topic, p);
+                let restored = self.restore_offsets.get(&key).copied();
+                let start =
+                    Self::start_offset(&consumer, &self.config.topic, p, &self.config, restored).await;
+                tpl.add_partition_offset(&self.config.topic, p, start)
+                    .map_err(|e| anyhow::anyhow!("assign offset for {}-{}: {}", self.config.topic, p, e))?;
+            }
             consumer
-                .subscribe(&[&self.config.topic])
-                .map_err(|e| anyhow::anyhow!("Failed to subscribe to topic: {}", e))?;
+                .assign(&tpl)
+                .map_err(|e| anyhow::anyhow!("Failed to assign partitions: {}", e))?;
+            tracing::info!(
+                "Kafka source: assigned partitions {:?} of topic '{}'",
+                partitions,
+                self.config.topic
+            );
+            self.assigned = partitions;
             self.consumer = Some(consumer);
             Ok(())
         })
@@ -310,34 +569,31 @@ impl SourceReader for KafkaSourceReader {
     fn poll_next(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>> {
-        let _ = &self.splits;
         Box::pin(async move {
-            // Try to poll from the real Kafka consumer with a short timeout.
-            if let Some(consumer) = &self.consumer {
-                match tokio::time::timeout(Duration::from_millis(250), consumer.recv()).await {
-                    Ok(Ok(msg)) => {
-                        if let Some(payload) = msg.payload() {
-                            let s = String::from_utf8_lossy(payload).to_string();
-                            self.last_offsets.insert(
-                                format!("{}-{}", msg.topic(), msg.partition()),
-                                msg.offset(),
-                            );
-                            let mut row = Row::new(RowKind::Insert, 3);
-                            row.set(0, seatunnel_api::Field::String(s));
-                            row.set(1, seatunnel_api::Field::Int64(msg.offset()));
-                            row.set(2, seatunnel_api::Field::String(msg.topic().to_string()));
-                            return Ok(PollResult::Record(KafkaSourceOutput(row)));
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Kafka consumer error: {}", e);
-                    }
-                    Err(_) => {
-                        // Timeout — no message available yet.
-                    }
-                }
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(PollResult::Record(KafkaSourceOutput(row)));
             }
-            Ok(PollResult::Empty)
+            let Some(consumer) = &self.consumer else {
+                return Ok(PollResult::Empty);
+            };
+            match tokio::time::timeout(Duration::from_millis(self.config.poll_timeout_ms), consumer.recv()).await {
+                Ok(Ok(msg)) => {
+                    let key = format!("{}-{}", msg.topic(), msg.partition());
+                    self.last_offsets.insert(key, msg.offset());
+                    if let Some(payload) = msg.payload() {
+                        self.pending.extend(self.decode_payload(payload));
+                    }
+                    if let Some(row) = self.pending.pop_front() {
+                        return Ok(PollResult::Record(KafkaSourceOutput(row)));
+                    }
+                    Ok(PollResult::Empty)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Kafka consumer error: {}", e);
+                    Ok(PollResult::Empty)
+                }
+                Err(_) => Ok(PollResult::Empty),
+            }
         })
     }
 
@@ -345,6 +601,8 @@ impl SourceReader for KafkaSourceReader {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         Box::pin(async move {
+            // Commit-on-checkpoint (Java `commit_on_checkpoint`).
+            self.commit_offsets();
             let state = KafkaSourceState {
                 offsets: self.last_offsets.clone(),
             };
@@ -353,15 +611,17 @@ impl SourceReader for KafkaSourceReader {
     }
 
     fn add_splits(&mut self, splits: Vec<Self::Split>) {
-        tracing::info!("KafkaSourceReader: adding {} splits", splits.len());
-        self.splits.extend(splits);
+        tracing::info!("KafkaSourceReader: adding {} splits (assignment is partition-based)", splits.len());
     }
 
     fn handle_no_more_splits(&mut self) {}
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
-        self.consumer.take();
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            self.commit_offsets();
+            self.consumer.take();
+            Ok(())
+        })
     }
 }
 
@@ -404,6 +664,25 @@ pub struct KafkaAggregatedCommitInfo {
     pub total_messages: usize,
 }
 
+/// Delivery semantics (Java: `KafkaSemantics`; `NON` is the Java default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KafkaSemantics {
+    #[default]
+    Non,
+    AtLeastOnce,
+    ExactlyOnce,
+}
+
+impl KafkaSemantics {
+    fn parse(s: &str) -> Self {
+        match s.to_lowercase().replace(['-', '_'], "").as_str() {
+            "atleastonce" | "atleasonce" => KafkaSemantics::AtLeastOnce,
+            "exactlyonce" => KafkaSemantics::ExactlyOnce,
+            _ => KafkaSemantics::Non,
+        }
+    }
+}
+
 /// Kafka Sink configuration.
 #[derive(Debug, Clone)]
 pub struct KafkaSinkConfig {
@@ -421,6 +700,10 @@ pub struct KafkaSinkConfig {
     pub transactional_id: Option<String>,
     /// Delivery timeout per record.
     pub message_timeout_ms: u64,
+    /// Field names (or `#ordinal` like `#0`) routed into the message key.
+    pub partition_key_fields: Vec<String>,
+    /// Delimiter joining fields for TEXT format payloads.
+    pub field_delimiter: String,
 }
 
 impl Default for KafkaSinkConfig {
@@ -434,13 +717,18 @@ impl Default for KafkaSinkConfig {
             transactions_enabled: false,
             transactional_id: None,
             message_timeout_ms: 30_000,
+            partition_key_fields: Vec::new(),
+            field_delimiter: ",".to_string(),
         }
     }
 }
 
 impl KafkaSinkConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
-        let tx_enabled = config.get_bool("transactions.enabled", false);
+        let tx_enabled = config.get_bool(
+            "transactions.enabled",
+            KafkaSemantics::parse(&config.get_string("semantics", "")) == KafkaSemantics::ExactlyOnce,
+        );
         KafkaSinkConfig {
             bootstrap_servers: config.get_string("bootstrap.servers", "localhost:9092"),
             topic: config.get_string("topic", "seatunnel-sink"),
@@ -459,6 +747,13 @@ impl KafkaSinkConfig {
                 }
             }),
             message_timeout_ms: config.get_int("message.timeout.ms", 30_000) as u64,
+            partition_key_fields: config
+                .get_string("partition-key-fields", &config.get_string("partition_key_fields", ""))
+                .split(',')
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+                .collect(),
+            field_delimiter: config.get_string("field.delimiter", &config.get_string("field_delimiter", ",")),
         }
     }
 }
@@ -619,16 +914,30 @@ impl KafkaSinkWriter {
         let mut sent = 0usize;
         let mut failures = Vec::new();
         for record in &records {
-            let payload = encode_row(record, &self.config.format);
-            match producer
-                .send(
-                    FutureRecord::<str, str>::to(&topic).payload(&payload),
-                    Duration::from_millis(self.config.message_timeout_ms),
-                )
-                .await
-            {
-                Ok(_) => sent += 1,
-                Err((e, _)) => failures.push(e.to_string()),
+            let payload = encode_row(record, &self.config.format, &self.config.field_delimiter);
+            let message = FutureRecord::<str, str>::to(&topic).payload(&payload);
+            match row_key(record, &self.config.partition_key_fields) {
+                Some(key) => {
+                    match producer
+                        .send(
+                            message.key(key.as_str()),
+                            Duration::from_millis(self.config.message_timeout_ms),
+                        )
+                        .await
+                    {
+                        Ok(_) => sent += 1,
+                        Err((e, _)) => failures.push(e.to_string()),
+                    }
+                }
+                None => {
+                    match producer
+                        .send(message, Duration::from_millis(self.config.message_timeout_ms))
+                        .await
+                    {
+                        Ok(_) => sent += 1,
+                        Err((e, _)) => failures.push(e.to_string()),
+                    }
+                }
             }
         }
 
@@ -749,22 +1058,52 @@ impl SinkWriter for KafkaSinkWriter {
 }
 
 /// Serialize a `Row` into a Kafka payload according to the configured format.
-fn encode_row(row: &Row, format: &MessageFormat) -> String {
+fn encode_row(row: &Row, format: &MessageFormat, delimiter: &str) -> String {
     match format {
+        // Java TextFormatSerializer joins every field with the delimiter.
         MessageFormat::Text => row
             .fields
-            .first()
+            .iter()
             .map(|f| match f {
                 seatunnel_api::Field::String(s) => s.clone(),
+                seatunnel_api::Field::Null => String::new(),
                 other => format!("{}", other),
             })
-            .unwrap_or_default(),
+            .collect::<Vec<_>>()
+            .join(delimiter),
         // The JSON-family encoders all fall back to the positional array
         // encoding here because CDC rows arrive positionally without column
         // names attached. Canal/Debezium envelopes are produced by the
         // dedicated formats crate when schemas are available.
         _ => row_to_json_string(row),
     }
+}
+
+/// Build a message key from configured key fields. Field selectors are names
+/// (`f0`-style generated names apply when no schema was propagated) or
+/// `#ordinal` references.
+fn row_key(row: &Row, key_fields: &[String]) -> Option<String> {
+    if key_fields.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(key_fields.len());
+    for selector in key_fields {
+        let field = if let Some(ordinal) = selector.strip_prefix('#') {
+            ordinal.parse::<usize>().ok().and_then(|i| row.fields.get(i))
+        } else {
+            // Match generated field names (f0..fN) against the selector.
+            selector
+                .strip_prefix('f')
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|i| row.fields.get(i))
+        };
+        parts.push(match field {
+            Some(seatunnel_api::Field::String(s)) => s.clone(),
+            Some(seatunnel_api::Field::Null) | None => String::new(),
+            Some(other) => format!("{}", other),
+        });
+    }
+    Some(parts.join("_"))
 }
 
 /// Serialize a `Row` into a JSON string payload for Kafka.
@@ -937,6 +1276,55 @@ mod tests {
             _ => panic!("unexpected pending"),
         };
         assert_eq!(result.total_messages, 15);
+    }
+
+    #[test]
+    fn test_parse_specific_offsets() {
+        let offsets = parse_specific_offsets("0:100, 1:250,2:7");
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets.get(&0), Some(&100));
+        assert_eq!(offsets.get(&1), Some(&250));
+        assert_eq!(offsets.get(&2), Some(&7));
+        assert!(parse_specific_offsets("").is_empty());
+    }
+
+    #[test]
+    fn test_row_key_extraction() {
+        let mut row = Row::new(RowKind::Insert, 3);
+        row.set(0, seatunnel_api::Field::Int64(7));
+        row.set(1, seatunnel_api::Field::String("alice".to_string()));
+        row.set(2, seatunnel_api::Field::String("x".to_string()));
+
+        // No key fields → None.
+        assert!(row_key(&row, &[]).is_none());
+        // Ordinal selector.
+        assert_eq!(row_key(&row, &["#0".to_string()]).as_deref(), Some("7"));
+        // Generated f-name selector.
+        assert_eq!(
+            row_key(&row, &["f1".to_string(), "f2".to_string()]).as_deref(),
+            Some("alice_x")
+        );
+    }
+
+    #[test]
+    fn test_semantics_parses_exactly_once() {
+        let mut props = HashMap::new();
+        props.insert("bootstrap.servers".to_string(), "b:9092".to_string());
+        props.insert("semantics".to_string(), "exactly-once".to_string());
+        let config = ConnectorConfig::new(props);
+        let sink_config = KafkaSinkConfig::from_config(&config);
+        assert!(sink_config.transactions_enabled);
+        assert!(sink_config.transactional_id.is_some());
+    }
+
+    #[test]
+    fn test_text_encoding_joins_with_delimiter() {
+        let mut row = Row::new(RowKind::Insert, 3);
+        row.set(0, seatunnel_api::Field::Int64(1));
+        row.set(1, seatunnel_api::Field::String("alice".to_string()));
+        row.set(2, seatunnel_api::Field::Null);
+        let text = encode_row(&row, &MessageFormat::Text, ",");
+        assert_eq!(text, "1,alice,");
     }
 
     #[test]

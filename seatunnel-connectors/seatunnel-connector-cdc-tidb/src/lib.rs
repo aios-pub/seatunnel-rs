@@ -63,6 +63,7 @@ use seatunnel_api::{
     },
 };
 use seatunnel_connector_cdc_base::{
+    parse_type_spec, SchemaEvolutionConfig, SchemaWatcher,
     CdcPhase, CdcState, IncrementalSplit, SnapshotSplit, Watermark,
 };
 use seatunnel_connector_common::ConnectorConfig;
@@ -182,6 +183,8 @@ pub struct TiDBCdcConfig {
     pub resubscribe_interval_ms: u64,
     /// MySQL-compatible connection info for reading table metadata/data.
     pub conn: TiDBCdcConnConfig,
+    /// Schema-evolution settings (TiDB DDL detected by metadata polling).
+    pub schema_evolution: SchemaEvolutionConfig,
 }
 
 impl Default for TiDBCdcConfig {
@@ -200,6 +203,7 @@ impl Default for TiDBCdcConfig {
             capture_timeout: 300_000,
             store_address_rewrite: Vec::new(),
             resubscribe_interval_ms: 0,
+            schema_evolution: SchemaEvolutionConfig::default(),
             conn: TiDBCdcConnConfig::new("127.0.0.1", 4000, "root", "", "seatunnel"),
         }
     }
@@ -247,6 +251,7 @@ impl TiDBCdcConfig {
             // correctly-encoded spans, and periodic re-registration adds
             // churn against TiKV's observe-handle lifecycle.
             resubscribe_interval_ms: config.get_int("resubscribe-interval-ms", 0).max(0) as u64,
+            schema_evolution: SchemaEvolutionConfig::from_config(config),
             conn: TiDBCdcConnConfig::new(
                 config.get_string("conn-host", "127.0.0.1").as_str(),
                 config.get_int("conn-port", 4000) as u16,
@@ -456,6 +461,10 @@ pub struct TiDBCdcReader {
     batch_size: i64,
     /// TiKV CDC engine for real-time streaming (incremental phase).
     cdc_engine: Option<crate::cdc_engine::CdcEngine>,
+    /// Schema-evolution watcher (metadata polling; TiKV streams no DDL).
+    schema_watcher: Option<SchemaWatcher>,
+    /// Persistent SQL-endpoint pool reused across snapshot batches.
+    sql_pool: Option<mysql_async::Pool>,
     /// Decoded rows awaiting emission (stream events + drained transactions).
     pending_rows: VecDeque<Row>,
     engine_errors: u32,
@@ -474,6 +483,8 @@ impl TiDBCdcReader {
             watermark: Watermark::Min,
             batch_size: SNAPSHOT_BATCH_SIZE,
             cdc_engine: None,
+            schema_watcher: None,
+            sql_pool: None,
             pending_rows: VecDeque::new(),
             engine_errors: 0,
         }
@@ -601,6 +612,78 @@ impl TiDBCdcReader {
         Ok(())
     }
 
+
+    /// Fetch the table's column metadata as (ColumnDef list, engine column
+    /// types, pk ordinal). Used to prime and refresh the schema watcher.
+    async fn fetch_column_metadata(
+        config: &TiDBCdcConfig,
+    ) -> anyhow::Result<(Vec<seatunnel_api::ColumnDef>, Vec<crate::decoder::RowColType>, Option<usize>)> {
+        let pool = config.conn.to_pool();
+        let mut conn = pool.get_conn().await?;
+        let sql = format!(
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE, COLUMN_KEY, IS_NULLABLE \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA='{}' AND TABLE_NAME='{}' ORDER BY ORDINAL_POSITION",
+            config.database_name.replace('\'', "''"),
+            config.table_name.replace('\'', "''"),
+        );
+        let rows: Vec<mysql_async::Row> = conn.query(sql).await?;
+        let dialect = seatunnel_api::schema::MySqlDialect;
+        use seatunnel_api::schema::DatabaseDialect;
+        let mut defs = Vec::with_capacity(rows.len());
+        let mut col_types = Vec::with_capacity(rows.len());
+        let mut pk_ordinal = None;
+        for (idx, r) in rows.iter().enumerate() {
+            let name: Option<String> = r.get("COLUMN_NAME").unwrap_or(None);
+            let Some(name) = name else { continue };
+            let ctype: Option<String> = r.get("COLUMN_TYPE").unwrap_or(None);
+            let ctype = ctype.unwrap_or_else(|| "varchar(255)".to_string());
+            let ckey: Option<String> = r.get("COLUMN_KEY").unwrap_or(None);
+            let nullable: Option<String> = r.get("IS_NULLABLE").unwrap_or(None);
+            let (base, len, scale) = parse_type_spec(&ctype);
+            let primary = ckey.as_deref() == Some("PRI");
+            if primary && pk_ordinal.is_none() {
+                pk_ordinal = Some(idx);
+            }
+            defs.push(
+                seatunnel_api::ColumnDef::new(
+                    name,
+                    dialect.map_type(&base, len, scale),
+                )
+                .nullable(nullable.as_deref() != Some("NO"))
+                .with_primary_key(primary)
+                .source_type(ctype.clone()),
+            );
+            col_types.push(crate::decoder::parse_column_type(&ctype));
+        }
+        Ok((defs, col_types, pk_ordinal))
+    }
+
+    /// Poll the schema watcher and emit a schema-change event when the
+    /// table's columns drifted; also refreshes the engine's decode schema.
+    async fn poll_schema_watcher(&mut self) -> Option<seatunnel_api::SchemaChangeEvent> {
+        let config = self.config.clone();
+        let watcher = self.schema_watcher.as_mut()?;
+        watcher
+            .poll(|| async move {
+                let (defs, _, _) = Self::fetch_column_metadata(&config).await?;
+                Ok(defs)
+            })
+            .await
+            .ok()?;
+        let event = watcher.take_pending()?;
+        // Refresh the engine's decode schema to the new column layout.
+        if let Some(engine) = self.cdc_engine.as_mut() {
+            match Self::fetch_column_metadata(&self.config).await {
+                Ok((_, col_types, pk_ordinal)) => {
+                    engine.update_column_types(col_types, pk_ordinal);
+                }
+                Err(e) => tracing::warn!("TiDB CDC: schema refresh failed: {}", e),
+            }
+        }
+        Some(event)
+    }
+
     /// Drain decoded engine rows into the local buffer (bounded wait so
     /// snapshot scans are not starved by idle streams).
     async fn drain_engine(&mut self, budget_ms: u64) {
@@ -708,6 +791,19 @@ impl SourceReader for TiDBCdcReader {
             // snapshot are captured and replayed afterwards (no-loss window).
             if streams_changes {
                 self.start_engine().await?;
+                if self.config.schema_evolution.enabled {
+                    let mut watcher = SchemaWatcher::new(
+                        format!("{}.{}", self.config.database_name, self.config.table_name),
+                        &self.config.schema_evolution,
+                    );
+                    match Self::fetch_column_metadata(&self.config).await {
+                        Ok((defs, _, _)) => watcher.prime(defs),
+                        Err(e) => {
+                            tracing::warn!("TiDB CDC: schema watcher priming failed: {}", e)
+                        }
+                    }
+                    self.schema_watcher = Some(watcher);
+                }
             }
 
             // Seed snapshot splits unless restored or streaming-only.
@@ -738,6 +834,11 @@ impl SourceReader for TiDBCdcReader {
                 if let Some(row) = self.pending_rows.pop_front() {
                     return Ok(PollResult::Record(TiDBCdcOutput(row)));
                 }
+                // Schema evolution: metadata poll (bounded by interval) and
+                // emit before any row with the new shape.
+                if let Some(event) = self.poll_schema_watcher().await {
+                    return Ok(PollResult::SchemaChange(Box::new(event)));
+                }
                 return Ok(PollResult::Empty);
             }
 
@@ -747,7 +848,7 @@ impl SourceReader for TiDBCdcReader {
             self.drain_engine(10).await;
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
-                let pool = self.config.conn.to_pool();
+                let pool = self.sql_pool.get_or_insert_with(|| self.config.conn.to_pool());
                 let mut conn = pool.get_conn().await?;
                 let col = self.config.split_column.replace('`', "``");
                 let sql = format!(

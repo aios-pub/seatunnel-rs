@@ -19,6 +19,8 @@ members = [
     "seatunnel-connectors/seatunnel-connector-cdc-tidb",
     "seatunnel-connectors/seatunnel-connector-cdc-postgres",
     "seatunnel-connectors/seatunnel-connector-jdbc",
+    "seatunnel-connectors/seatunnel-connector-redis",
+    "seatunnel-connectors/seatunnel-connector-elasticsearch",
     "seatunnel-benchmarks",
 ]
 
@@ -71,6 +73,9 @@ postgres-types = "0.2"
 
 # CDC framework
 rustcdc = { version = "0.12", default-features = false, features = ["postgres"] }
+
+# Redis
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster", "cluster-async"] }
 
 # TiDB / TiKV
 tikv-client = "0.4"
@@ -136,6 +141,8 @@ seatunnel-connector-cdc-mysql = { path = "seatunnel-connectors/seatunnel-connect
 seatunnel-connector-cdc-tidb = { path = "seatunnel-connectors/seatunnel-connector-cdc-tidb" }
 seatunnel-connector-cdc-postgres = { path = "seatunnel-connectors/seatunnel-connector-cdc-postgres" }
 seatunnel-connector-jdbc = { path = "seatunnel-connectors/seatunnel-connector-jdbc" }
+seatunnel-connector-redis = { path = "seatunnel-connectors/seatunnel-connector-redis" }
+seatunnel-connector-elasticsearch = { path = "seatunnel-connectors/seatunnel-connector-elasticsearch" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

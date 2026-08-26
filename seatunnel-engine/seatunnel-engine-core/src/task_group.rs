@@ -190,6 +190,23 @@ impl TaskGroup {
                         self.sink.write(row).await?;
                     }
                 }
+                Ok(PollResult::SchemaChange(event)) => {
+                    // Schema evolution: the sink flushes its old-schema buffer
+                    // and applies the DDL before any new-shape row is written.
+                    tracing::info!(
+                        "Task {} schema change on table '{}' ({} changes): {:?}",
+                        self.context.task_id,
+                        event.table,
+                        event.changes.len(),
+                        event.statement
+                    );
+                    self.sink.apply_schema_change(&event).await?;
+                    if let Some(schema) = &mut self.output_schema {
+                        if let Err(e) = schema.apply_schema_change_event(&event) {
+                            anyhow::bail!("apply schema change to output schema: {}", e);
+                        }
+                    }
+                }
                 Ok(PollResult::Empty) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }

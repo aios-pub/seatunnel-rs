@@ -248,6 +248,9 @@ pub struct PostgresCdcConfig {
     /// partitioned so each subtask scans a disjoint interval.
     pub subtask_index: usize,
     pub subtask_count: usize,
+    /// Schema-evolution settings (PG DDL detected by catalog polling;
+    /// pgoutput does not expose parsed DDL through this stack).
+    pub schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig,
 }
 
 impl Default for PostgresCdcConfig {
@@ -268,6 +271,7 @@ impl Default for PostgresCdcConfig {
             parallelism: 4,
             subtask_index: 0,
             subtask_count: 1,
+            schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::default(),
         }
     }
 }
@@ -298,6 +302,7 @@ impl PostgresCdcConfig {
                 .unwrap_or(PostgresStartupMode::Initial),
             parallelism: config.get_int("parallelism", 4) as usize,
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
+            schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::from_config(config),
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
         }
     }
@@ -592,6 +597,8 @@ pub struct PostgresCdcReader {
     watermark: Watermark,
     /// Admin/snapshot connection (also used for publication provisioning).
     admin_client: Arc<Mutex<Option<Arc<Client>>>>,
+    /// Schema-evolution watcher (catalog polling).
+    schema_watcher: Option<seatunnel_connector_cdc_base::SchemaWatcher>,
     /// Cached column order so snapshot rows and streamed events align.
     columns: Vec<String>,
     column_types: Vec<Type>,
@@ -618,6 +625,7 @@ impl PostgresCdcReader {
             lsn: Lsn::zero(),
             watermark: Watermark::Min,
             admin_client: Arc::new(Mutex::new(None)),
+            schema_watcher: None,
             columns: Vec::new(),
             column_types: Vec::new(),
             rustcdc_conn: None,
@@ -776,6 +784,67 @@ impl PostgresCdcReader {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Prime the schema watcher baseline (subtask 0 only).
+    async fn prime_schema_watcher(&mut self) {
+        if !self.config.schema_evolution.enabled || self.config.subtask_index != 0 {
+            return;
+        }
+        let mut watcher = seatunnel_connector_cdc_base::SchemaWatcher::new(
+            self.config.qualified_table(),
+            &self.config.schema_evolution,
+        );
+        // Bind the guard clone first: argument temporaries would otherwise
+        // live across the await and make the future non-Send.
+        let admin = self.admin_client.lock().clone();
+        match fetch_pg_column_defs(admin, &self.config.schema_name, &self.config.table_name).await
+        {
+            Ok(defs) if !defs.is_empty() => watcher.prime(defs),
+            Ok(_) => tracing::warn!("PostgreSQL CDC: schema watcher found no columns"),
+            Err(e) => tracing::warn!("PostgreSQL CDC: schema watcher priming failed: {}", e),
+        }
+        self.schema_watcher = Some(watcher);
+    }
+
+    /// Poll the schema watcher; on change refreshes the cached column
+    /// layout (used to decode streamed rows) and returns the event.
+    async fn poll_schema_watcher(&mut self) -> Option<seatunnel_api::SchemaChangeEvent> {
+        // Split the borrows: watcher vs admin client vs cached layout.
+        let Self {
+            schema_watcher,
+            admin_client,
+            config,
+            columns,
+            column_types,
+            ..
+        } = self;
+        let watcher = schema_watcher.as_mut()?;
+        let admin = admin_client.lock().clone();
+        let schema_name = config.schema_name.clone();
+        let table_name = config.table_name.clone();
+        let admin_fetch = admin.clone();
+        let result = watcher
+            .poll(|| async move {
+                fetch_pg_column_defs(admin_fetch, &schema_name, &table_name).await
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::debug!("PostgreSQL CDC: schema poll failed: {}", e);
+            return None;
+        }
+        let event = watcher.take_pending()?;
+        if let Some(client) = admin {
+            let sql = format!("SELECT * FROM {} LIMIT 0", config.qualified_table());
+            match client.prepare(&sql).await {
+                Ok(stmt) => {
+                    *columns = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+                    *column_types = stmt.columns().iter().map(|c| c.type_().clone()).collect();
+                }
+                Err(e) => tracing::warn!("PostgreSQL CDC: column cache refresh failed: {}", e),
+            }
+        }
+        Some(event)
     }
 
     /// Cache column names/types so snapshot and streamed rows share layout.
@@ -968,6 +1037,9 @@ impl SourceReader for PostgresCdcReader {
 
             // Uniform row layout for both phases.
             self.cache_columns(&client).await?;
+
+            // Schema evolution: baseline the watcher after the layout cache.
+            self.prime_schema_watcher().await;
 
             // Baseline WAL position (metadata for observability/state).
             if !resuming_incremental {
@@ -1190,6 +1262,11 @@ impl PostgresCdcReader {
         if let Some(change) = self.stream_buffer.pop_front() {
             return Ok(PollResult::Record(PostgresCdcOutput(change.row)));
         }
+        // Schema evolution: catalog poll (interval-bounded), emitted before
+        // any row with the new shape.
+        if let Some(event) = self.poll_schema_watcher().await {
+            return Ok(PollResult::SchemaChange(Box::new(event)));
+        }
         Ok(PollResult::Empty)
     }
 }
@@ -1219,6 +1296,44 @@ fn json_val_to_field(val: &serde_json::Value) -> Field {
     }
 }
 
+
+/// Fetch table columns from the pg catalog (schema-evolution watcher input).
+async fn fetch_pg_column_defs(
+    client: Option<Arc<Client>>,
+    schema_name: &str,
+    table_name: &str,
+) -> anyhow::Result<Vec<seatunnel_api::ColumnDef>> {
+    let client = client.ok_or_else(|| anyhow::anyhow!("admin client not connected"))?;
+    let sql = "SELECT a.attname AS name, t.typname AS data_type, \
+               NOT a.attnotnull AS nullable, \
+               COALESCE((SELECT ix.indisprimary FROM pg_index ix \
+                         WHERE ix.indrelid = a.attrelid \
+                           AND a.attnum = ANY(ix.indkey) LIMIT 1), false) AS is_primary \
+        FROM pg_attribute a \
+        JOIN pg_class c ON a.attrelid = c.oid \
+        JOIN pg_namespace n ON c.relnamespace = n.oid \
+        JOIN pg_type t ON a.atttypid = t.oid \
+        WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
+        ORDER BY a.attnum";
+    let rows = client.query(sql, &[&schema_name, &table_name]).await?;
+    use seatunnel_api::schema::DatabaseDialect;
+    let dialect = seatunnel_api::schema::PostgresDialect;
+    let mut defs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.get(0);
+        let data_type: String = row.get(1);
+        let nullable: bool = row.get(2);
+        let is_primary: bool = row.get(3);
+        defs.push(
+            seatunnel_api::ColumnDef::new(name, dialect.map_type(&data_type, None, None))
+                .nullable(nullable)
+                .with_primary_key(is_primary)
+                .source_type(data_type),
+        );
+    }
+    Ok(defs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1355,7 @@ mod tests {
             parallelism: 1,
             subtask_index: 0,
             subtask_count: 1,
+            schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::default(),
         }
     }
 

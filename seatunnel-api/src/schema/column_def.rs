@@ -21,7 +21,7 @@ use crate::row::ColumnType;
 ///
 /// Mirrors `org.apache.seatunnel.api.table.catalog.Column` from the Java version,
 /// but with compile-time type safety via the `ColumnType` enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnDef {
     /// Column name
     pub name: String,
@@ -56,6 +56,12 @@ impl ColumnDef {
     /// Mark this column as part of the primary key.
     pub fn primary_key(mut self) -> Self {
         self.primary_key = true;
+        self
+    }
+
+    /// Conditionally mark this column as part of the primary key.
+    pub fn with_primary_key(mut self, primary_key: bool) -> Self {
+        self.primary_key = primary_key;
         self
     }
 

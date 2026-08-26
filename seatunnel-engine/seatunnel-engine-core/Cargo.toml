@@ -29,6 +29,8 @@ seatunnel-connector-cdc-postgres = { path = "../../seatunnel-connectors/seatunne
 seatunnel-connector-cdc-tidb = { path = "../../seatunnel-connectors/seatunnel-connector-cdc-tidb", optional = true }
 seatunnel-connector-jdbc = { path = "../../seatunnel-connectors/seatunnel-connector-jdbc", optional = true }
 seatunnel-connector-kafka = { path = "../../seatunnel-connectors/seatunnel-connector-kafka", optional = true }
+seatunnel-connector-redis = { path = "../../seatunnel-connectors/seatunnel-connector-redis", optional = true }
+seatunnel-connector-elasticsearch = { path = "../../seatunnel-connectors/seatunnel-connector-elasticsearch", optional = true }
 
 [features]
 default = ["connectors"]
@@ -39,6 +41,8 @@ connectors = [
     "dep:seatunnel-connector-cdc-tidb",
     "dep:seatunnel-connector-jdbc",
     "dep:seatunnel-connector-kafka",
+    "dep:seatunnel-connector-redis",
+    "dep:seatunnel-connector-elasticsearch",
 ]
 connector-mysql = ["connectors"]
 connector-postgres = ["connectors"]

@@ -72,7 +72,8 @@ use seatunnel_api::{
     },
 };
 use seatunnel_connector_cdc_base::{
-    CdcConfig, CdcPhase, CdcSource, CdcState, IncrementalSplit, SnapshotSplit, Watermark,
+    alter_table_target, CdcConfig, CdcPhase, CdcSource, CdcState, IncrementalSplit,
+    SchemaEvolutionConfig, SchemaWatcher, SnapshotSplit, Watermark,
 };
 use seatunnel_connector_common::ConnectorConfig;
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,8 @@ pub struct MySqlCdcConfig {
     /// are partitioned so each subtask scans a disjoint id interval.
     pub subtask_index: usize,
     pub subtask_count: usize,
+    /// Schema-evolution settings (DDL-to-schema-change-event pipeline).
+    pub schema_evolution: SchemaEvolutionConfig,
 }
 
 impl Default for MySqlCdcConfig {
@@ -210,6 +213,7 @@ impl Default for MySqlCdcConfig {
             split_column: "id".to_string(),
             subtask_index: 0,
             subtask_count: 1,
+            schema_evolution: SchemaEvolutionConfig::default(),
         }
     }
 }
@@ -239,6 +243,7 @@ impl MySqlCdcConfig {
             split_column: config.get_string("split.column", "id"),
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
+            schema_evolution: SchemaEvolutionConfig::from_config(config),
         }
     }
 
@@ -512,6 +517,11 @@ pub struct MySqlCdcReader {
     table_maps: HashMap<u64, TableMapEvent<'static>>,
     /// True when the binlog stream hit a fatal error and needs re-establishing.
     stream_broken: bool,
+    /// Schema-evolution watcher fed by binlog query (DDL) events.
+    schema_watcher: Option<SchemaWatcher>,
+    /// Persistent connection pool shared by snapshot batches and metadata
+    /// queries (avoids a fresh pool — and TCP churn — per batch).
+    pool: Option<Pool>,
 }
 
 impl MySqlCdcReader {
@@ -531,11 +541,49 @@ impl MySqlCdcReader {
             snapshot_buffer: VecDeque::new(),
             table_maps: HashMap::new(),
             stream_broken: false,
+            schema_watcher: None,
+            pool: None,
         }
     }
 
-    fn build_pool(&self) -> Pool {
-        MySqlCdcSource::build_pool_for(&self.config)
+    /// The reader's cached pool, built on first use.
+    fn build_pool(&mut self) -> Pool {
+        if self.pool.is_none() {
+            self.pool = Some(MySqlCdcSource::build_pool_for(&self.config));
+        }
+        self.pool.clone().expect("pool just built")
+    }
+
+    /// Fetch the current column list for the captured table and prime the
+    /// schema watcher's baseline.
+    async fn prime_schema_watcher(&mut self) -> anyhow::Result<()> {
+        let pool = self.build_pool();
+        let mut conn = pool.get_conn().await?;
+        let rows: Vec<(String, u32)> = conn
+            .exec(
+                "SELECT COLUMN_NAME, ORDINAL_POSITION FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                (&self.config.database_name, &self.config.table_name),
+            )
+            .await?;
+        let columns: Vec<seatunnel_api::ColumnDef> = rows
+            .into_iter()
+            .map(|(name, _)| {
+                seatunnel_api::ColumnDef::new(name, seatunnel_api::ColumnType::String)
+            })
+            .collect();
+        if let Some(watcher) = &mut self.schema_watcher {
+            watcher.prime(columns);
+        }
+        Ok(())
+    }
+
+    /// Emit a pending schema-change event, if any.
+    fn take_schema_change(&mut self) -> Option<PollResult<MySqlCdcOutput>> {
+        self.schema_watcher
+            .as_mut()
+            .and_then(|w| w.take_pending())
+            .map(|event| PollResult::SchemaChange(Box::new(event)))
     }
 
     /// Apply previously snapshotted state (checkpoint restore path).
@@ -763,7 +811,35 @@ impl MySqlCdcReader {
                 self.table_maps.insert(tme.table_id(), tme.into_owned());
             }
             EventData::RowsEvent(rows) => self.absorb_rows_event(rows),
+            EventData::QueryEvent(qe) => self.observe_query_event(&qe),
             _ => {}
+        }
+    }
+
+    /// Fast-path schema evolution: feed captured `ALTER TABLE` statements
+    /// from the binlog into the watcher.
+    fn observe_query_event(&mut self, qe: &mysql_async::binlog::events::QueryEvent<'_>) {
+        if self.schema_watcher.is_none() {
+            return;
+        }
+        let schema = String::from_utf8_lossy(qe.schema_raw()).to_string();
+        if schema != self.config.database_name {
+            return;
+        }
+        let query = qe.query().to_string();
+        if !query.to_lowercase().trim_start().starts_with("alter table") {
+            return;
+        }
+        match alter_table_target(&query) {
+            Some(table) if self.config.table_matches(&table) => {
+                if let Some(watcher) = &mut self.schema_watcher {
+                    watcher.observe_ddl(&query);
+                }
+            }
+            _ => tracing::debug!(
+                "MySQL CDC: ALTER on non-captured table ignored: {}",
+                query
+            ),
         }
     }
 
@@ -904,6 +980,19 @@ impl SourceReader for MySqlCdcReader {
 
             self.connect_and_prepare().await?;
 
+            // Schema evolution: subtask 0 owns the binlog stream and the
+            // DDL watcher; snapshot-only subtasks finish too quickly to care.
+            if self.config.schema_evolution.enabled && self.config.subtask_index == 0 {
+                let watcher = SchemaWatcher::new(
+                    format!("{}.{}", self.config.database_name, self.config.table_name),
+                    &self.config.schema_evolution,
+                );
+                self.schema_watcher = Some(watcher);
+                if let Err(e) = self.prime_schema_watcher().await {
+                    tracing::warn!("MySQL CDC: schema watcher priming failed: {}", e);
+                }
+            }
+
             // Startup-mode shortcuts.
             match self.config.startup_mode {
                 MySqlStartupMode::Latest | MySqlStartupMode::Earliest => {
@@ -962,6 +1051,12 @@ impl SourceReader for MySqlCdcReader {
         Box<dyn std::future::Future<Output = anyhow::Result<PollResult<Self::Output>>> + Send + '_>,
     > {
         Box::pin(async move {
+            // Schema-change events take precedence so the sink applies DDL
+            // before any row with the new shape is written.
+            if let Some(change) = self.take_schema_change() {
+                return Ok(change);
+            }
+
             if self.phase == CdcPhase::Incremental {
                 return self.poll_incremental().await;
             }
@@ -1018,7 +1113,8 @@ impl SourceReader for MySqlCdcReader {
                 split.end_key,
                 last_pk
             );
-            let rows = query_snapshot_batch(&self.config, &split, last_pk).await?;
+            let pool = self.build_pool();
+            let rows = query_snapshot_batch(&pool, &self.config, &split, last_pk).await?;
             tracing::trace!(
                 "MySQL CDC poll[snapshot]: batch returned {} rows",
                 rows.len()
@@ -1140,11 +1236,11 @@ impl MySqlCdcReader {
 /// Fetch the next keyset-paginated snapshot batch for a split.
 /// Returns `(first_pk_of_batch, row)` pairs ordered by the split column.
 async fn query_snapshot_batch(
+    pool: &Pool,
     config: &MySqlCdcConfig,
     split: &SnapshotSplit,
     last_pk: i64,
 ) -> anyhow::Result<Vec<(i64, SeatunnelRow)>> {
-    let pool = MySqlCdcSource::build_pool_for(config);
     let mut conn = pool.get_conn().await.map_err(|e| {
         anyhow::anyhow!(
             "snapshot query failed ({}:{}): {}",
@@ -1384,6 +1480,7 @@ mod tests {
             split_column: "id".into(),
             subtask_index: 0,
             subtask_count: 1,
+            schema_evolution: SchemaEvolutionConfig::default(),
         }
     }
 

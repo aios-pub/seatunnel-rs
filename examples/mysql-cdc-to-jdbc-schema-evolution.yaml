@@ -1,0 +1,41 @@
+# MySQL CDC → JDBC sink with automatic schema evolution.
+#
+# DDL executed on the source table (ADD / DROP / MODIFY / RENAME COLUMN)
+# is captured from the binlog, forwarded through the engine as a schema
+# change event, and applied to the sink table with ALTER TABLE before any
+# row using the new shape is written.
+#
+# Submit:
+#   seatunnel job submit -c examples/mysql-cdc-to-jdbc-schema-evolution.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: mysql-cdc-to-jdbc-schema-evolution
+  parallelism: 1
+  checkpoint.interval: 5000
+
+source:
+  MySQL-CDC:
+    hostname: "127.0.0.1"
+    port: 13306
+    username: root
+    password: root
+    database-name: seatunnel
+    table-name: users
+    startup.mode: initial
+    split.column: id
+    # Schema evolution: binlog DDL → schema-change events → sink ALTER TABLE.
+    schema-evolution.enabled: true
+
+sink:
+  JDBC:
+    url: "jdbc:mysql://127.0.0.1:13306/seatunnel"
+    username: root
+    password: root
+    table: users_sink
+    # Positional rows carry no column names; f0 is the replicated id column.
+    primary-keys: f0
+    enable-upsert: true
+    batch.size: 100
+    # Create the sink table when missing (from the first batch's shape).
+    schema-save-mode: create_when_not_exist
+    data-save-mode: append_data

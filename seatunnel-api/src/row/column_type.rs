@@ -27,7 +27,7 @@ use std::fmt;
 /// cross-table type mismatches), this enum provides compile-time type
 /// safety. Each connector discovers the exact type from the database
 /// schema and maps it precisely.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ColumnType {
     // Boolean
     Bool,

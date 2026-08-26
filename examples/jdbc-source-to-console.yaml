@@ -1,0 +1,26 @@
+# JDBC source → console: bounded parallel snapshot read.
+#
+# The source discovers the schema, splits the primary-key range into
+# `partition.num` chunks and reads each chunk with keyset pagination.
+# Works with MySQL, TiDB (MySQL wire) and PostgreSQL URLs.
+#
+# Submit:
+#   seatunnel job submit -c examples/jdbc-source-to-console.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: jdbc-source-to-console
+  parallelism: 2
+
+source:
+  JDBC:
+    url: "jdbc:mysql://127.0.0.1:13306/seatunnel"
+    username: root
+    password: root
+    table: users
+    # Optional: explicit split column and partition count
+    # partition.column: id
+    # partition.num: 4
+    fetch.size: 512
+
+sink:
+  Console: {}

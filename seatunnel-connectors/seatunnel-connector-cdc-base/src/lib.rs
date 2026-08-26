@@ -187,27 +187,548 @@ impl CdcState {
     }
 }
 
-/// Schema change event for CDC.
+pub use seatunnel_api::SchemaChangeEvent;
+
+/// Result of diffing two column lists: the schema changes (in application
+/// order) that transform `old` into `new`.
+///
+/// Rename detection heuristic: a diff that drops exactly one column and adds
+/// exactly one column with an identical definition is interpreted as a rename
+/// (metadata polling cannot distinguish rename from drop+add by itself).
+pub fn diff_columns(
+    table: &str,
+    old: &[seatunnel_api::ColumnDef],
+    new: &[seatunnel_api::ColumnDef],
+) -> Vec<SchemaChangeEvent> {
+    use seatunnel_api::{ColumnDef, SchemaChange};
+
+    let old_by_name: std::collections::HashMap<&str, &ColumnDef> =
+        old.iter().map(|c| (c.name.as_str(), c)).collect();
+    let new_by_name: std::collections::HashMap<&str, &ColumnDef> =
+        new.iter().map(|c| (c.name.as_str(), c)).collect();
+
+    let added: Vec<&ColumnDef> = new
+        .iter()
+        .filter(|c| !old_by_name.contains_key(c.name.as_str()))
+        .collect();
+    let dropped: Vec<&str> = old
+        .iter()
+        .filter(|c| !new_by_name.contains_key(c.name.as_str()))
+        .map(|c| c.name.as_str())
+        .collect();
+    let modified: Vec<(&ColumnDef, &ColumnDef)> = new
+        .iter()
+        .filter_map(|c| {
+            let prev = *old_by_name.get(c.name.as_str())?;
+            (prev.column_type != c.column_type || prev.nullable != c.nullable).then_some((prev, c))
+        })
+        .collect();
+
+    // Rename heuristic: single drop + single add with equal definitions.
+    if added.len() == 1
+        && dropped.len() == 1
+        && modified.is_empty()
+        && added[0].column_type == old_by_name[dropped[0]].column_type
+        && added[0].nullable == old_by_name[dropped[0]].nullable
+    {
+        return vec![SchemaChangeEvent::new(
+            table,
+            vec![SchemaChange::rename_column(dropped[0], added[0].name.clone())],
+        )];
+    }
+
+    // Positions in the NEW layout so positional sinks can map by ordinal.
+    let position_of = |name: &str| -> Option<usize> {
+        new.iter().position(|c| c.name == name)
+    };
+    let mut changes: Vec<SchemaChange> = Vec::new();
+    for col in added {
+        let pos = position_of(&col.name);
+        changes.push(match pos {
+            Some(p) => SchemaChange::add_column_at(col.clone(), p),
+            None => SchemaChange::add_column(col.clone()),
+        });
+    }
+    for name in dropped {
+        let pos = old.iter().position(|c| c.name == name);
+        changes.push(SchemaChange::DropColumn {
+            column_name: name.to_string(),
+            position: pos,
+        });
+    }
+    for (prev, col) in modified {
+        let pos = position_of(&col.name);
+        changes.push(match pos {
+            Some(p) => SchemaChange::modify_column_at(col.clone(), p),
+            None => SchemaChange::modify_column(col.clone()),
+        });
+        // Keep nullability/type metadata coherent for consumers comparing defs.
+        let _ = prev;
+    }
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    vec![SchemaChangeEvent::new(table, changes)]
+}
+
+
+// ---------------------------------------------------------------------------
+// Schema evolution machinery
+// ---------------------------------------------------------------------------
+
+/// Schema-evolution configuration shared by CDC connectors.
+///
+/// Java counterpart: `SourceOptions.SCHEMA_CHANGES_ENABLED` (default false)
+/// and the per-connector DDL resolvers.
 #[derive(Debug, Clone)]
-pub enum SchemaChangeEvent {
-    AddColumn {
-        table: String,
-        column: seatunnel_api::ColumnDef,
-    },
-    DropColumn {
-        table: String,
-        column_name: String,
-    },
-    RenameColumn {
-        table: String,
-        old_name: String,
-        new_name: String,
-    },
-    AlterType {
-        table: String,
-        column_name: String,
-        new_type: seatunnel_api::ColumnType,
-    },
+pub struct SchemaEvolutionConfig {
+    pub enabled: bool,
+    /// information_schema polling interval for connectors without a DDL
+    /// stream (TiDB / Postgres).
+    pub poll_interval_ms: u64,
+    /// Only emit changes for these columns (Java `schema-changes.include`).
+    pub include: Vec<String>,
+    /// Never emit changes for these columns (Java `schema-changes.exclude`).
+    pub exclude: Vec<String>,
+}
+
+impl Default for SchemaEvolutionConfig {
+    fn default() -> Self {
+        SchemaEvolutionConfig {
+            enabled: false,
+            poll_interval_ms: 10_000,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl SchemaEvolutionConfig {
+    fn split_list(s: &str) -> Vec<String> {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
+    pub fn from_config(config: &seatunnel_connector_common::ConnectorConfig) -> Self {
+        SchemaEvolutionConfig {
+            enabled: config.get_bool(
+                "schema-evolution.enabled",
+                config.get_bool("schema_evolution.enabled", false),
+            ),
+            poll_interval_ms: config
+                .get_int(
+                    "schema-evolution.poll-interval-ms",
+                    config.get_int("schema_evolution.poll_interval_ms", 10_000),
+                )
+                .max(100) as u64,
+            include: Self::split_list(&config.get_string(
+                "schema-evolution.include",
+                &config.get_string("schema_changes.include", ""),
+            )),
+            exclude: Self::split_list(&config.get_string(
+                "schema-evolution.exclude",
+                &config.get_string("schema_changes.exclude", ""),
+            )),
+        }
+    }
+
+    /// Whether a change on `column` passes the include/exclude filters.
+    fn accepts_column(&self, column: &str) -> bool {
+        if !self.include.is_empty() && !self.include.iter().any(|c| c == column) {
+            return false;
+        }
+        !self.exclude.iter().any(|c| c == column)
+    }
+}
+
+/// Tracks a table's columns and detects changes either from captured DDL
+/// statements (`observe_ddl`) or by diffing freshly-fetched column lists
+/// on an interval (`poll`).
+pub struct SchemaWatcher {
+    pub table_id: String,
+    columns: Vec<seatunnel_api::ColumnDef>,
+    enabled: bool,
+    filters: SchemaEvolutionConfig,
+    interval: std::time::Duration,
+    last_check: std::time::Instant,
+    pending: std::collections::VecDeque<SchemaChangeEvent>,
+}
+
+impl SchemaWatcher {
+    pub fn new(table_id: impl Into<String>, config: &SchemaEvolutionConfig) -> Self {
+        SchemaWatcher {
+            table_id: table_id.into(),
+            columns: Vec::new(),
+            enabled: config.enabled,
+            filters: config.clone(),
+            interval: std::time::Duration::from_millis(config.poll_interval_ms),
+            last_check: std::time::Instant::now(),
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Set the baseline column list (no events emitted).
+    pub fn prime(&mut self, columns: Vec<seatunnel_api::ColumnDef>) {
+        self.columns = columns;
+    }
+
+    pub fn columns(&self) -> &[seatunnel_api::ColumnDef] {
+        &self.columns
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Apply a captured DDL statement to the baseline and queue the
+    /// resulting event (MySQL-style binlog query events).
+    pub fn observe_ddl(&mut self, ddl: &str) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(changes) = parse_alter_table(ddl) {
+            let changes: Vec<seatunnel_api::SchemaChange> = changes
+                .into_iter()
+                .filter(|c| self.filters.accepts_column(c.column_name()))
+                .collect();
+            if changes.is_empty() {
+                return;
+            }
+            // Attach positions from the baseline so positional sinks can
+            // map source column names to their own fN scheme.
+            let changes: Vec<seatunnel_api::SchemaChange> = changes
+                .into_iter()
+                .map(|change| match &change {
+                    seatunnel_api::SchemaChange::AddColumn { .. } => {
+                        let pos = Some(self.columns.len());
+                        set_position(change, pos)
+                    }
+                    other => {
+                        let name = other.column_name().to_string();
+                        let pos = self.columns.iter().position(|c| c.name == name);
+                        set_position(change, pos)
+                    }
+                })
+                .collect();
+            let event =
+                SchemaChangeEvent::new(self.table_id.clone(), changes).with_statement(ddl.trim());
+            if !self.columns.is_empty() {
+                let mut schema = seatunnel_api::TableSchema::new(
+                    self.table_id.clone(),
+                    self.columns.clone(),
+                );
+                if schema.apply_schema_change_event(&event).is_ok() {
+                    self.columns = schema.columns;
+                }
+            }
+            tracing::info!(
+                "schema change on {}: {} change(s) from DDL",
+                self.table_id,
+                event.changes.len()
+            );
+            self.pending.push_back(event);
+        }
+    }
+
+    /// Diff freshly-fetched columns against the baseline on the configured
+    /// interval. `fetch` is connector-specific (information_schema query).
+    pub async fn poll<F, Fut>(&mut self, fetch: F) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<seatunnel_api::ColumnDef>>>,
+    {
+        if !self.enabled || self.columns.is_empty() {
+            return Ok(());
+        }
+        if self.last_check.elapsed() < self.interval {
+            return Ok(());
+        }
+        self.last_check = std::time::Instant::now();
+        let fresh = fetch().await?;
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        for mut event in diff_columns(&self.table_id, &self.columns, &fresh) {
+            event
+                .changes
+                .retain(|c| self.filters.accepts_column(c.column_name()));
+            if event.changes.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                "schema change on {}: {} change(s) detected by poll",
+                event.table,
+                event.changes.len()
+            );
+            self.columns = fresh.clone();
+            self.pending.push_back(event);
+        }
+        Ok(())
+    }
+
+    /// Take the next pending schema-change event.
+    pub fn take_pending(&mut self) -> Option<SchemaChangeEvent> {
+        self.pending.pop_front()
+    }
+}
+
+fn set_position(
+    change: seatunnel_api::SchemaChange,
+    position: Option<usize>,
+) -> seatunnel_api::SchemaChange {
+    use seatunnel_api::SchemaChange;
+    match (change, position) {
+        (SchemaChange::AddColumn { column, .. }, pos) => match pos {
+            Some(p) => SchemaChange::add_column_at(column, p),
+            None => SchemaChange::add_column(column),
+        },
+        (SchemaChange::DropColumn { column_name, .. }, pos) => SchemaChange::DropColumn {
+            column_name,
+            position: pos,
+        },
+        (
+            SchemaChange::RenameColumn {
+                old_name,
+                new_name,
+                ..
+            },
+            pos,
+        ) => SchemaChange::RenameColumn {
+            old_name,
+            new_name,
+            position: pos,
+        },
+        (SchemaChange::ModifyColumn { column, .. }, pos) => match pos {
+            Some(p) => SchemaChange::modify_column_at(column, p),
+            None => SchemaChange::modify_column(column),
+        },
+    }
+}
+
+/// Parse a MySQL/TiDB `ALTER TABLE` statement into schema changes.
+///
+/// Covers the column operations the schema-evolution pipeline supports:
+/// `ADD [COLUMN]`, `DROP [COLUMN]`, `MODIFY [COLUMN]`, `CHANGE [COLUMN]`,
+/// `RENAME COLUMN ... TO ...`. Other clauses (index, comment, rename table)
+/// are ignored and produce no changes. Returns `None` for non-ALTER
+/// statements.
+pub fn parse_alter_table(ddl: &str) -> Option<Vec<seatunnel_api::SchemaChange>> {
+    use seatunnel_api::SchemaChange;
+
+    let normalized = normalize_ws(ddl);
+    let lower = normalized.to_lowercase();
+    let rest = lower.strip_prefix("alter table ")?;
+    // Skip the table name (possibly `db`.`tbl` or db.tbl).
+    let after_table = skip_identifier(rest);
+    let actions_src = &normalized[normalized.len() - after_table.len()..];
+
+    let mut changes = Vec::new();
+    for action in split_actions(actions_src) {
+        let action_norm = normalize_ws(&action);
+        let action_lower = action_norm.to_lowercase();
+        // Non-column targets of ADD/DROP clauses.
+        if action_lower.starts_with("add index ")
+            || action_lower.starts_with("add key ")
+            || action_lower.starts_with("add constraint ")
+            || action_lower.starts_with("add primary ")
+            || action_lower.starts_with("add unique ")
+            || action_lower.starts_with("add foreign ")
+            || action_lower.starts_with("add fulltext ")
+            || action_lower.starts_with("add spatial ")
+            || action_lower.starts_with("add check ")
+            || action_lower.starts_with("drop index ")
+            || action_lower.starts_with("drop key ")
+            || action_lower.starts_with("drop primary ")
+            || action_lower.starts_with("drop foreign ")
+            || action_lower.starts_with("drop constraint ")
+            || action_lower.starts_with("drop check ")
+        {
+            continue;
+        }
+        if action_lower.starts_with("add ") {
+            let inner = strip_keyword(&action_norm, "add");
+            let inner = strip_keyword(inner, "column");
+            // Parenthesized multi-column list.
+            if let Some(list) = inner.strip_prefix('(').and_then(|l| l.strip_suffix(')')) {
+                for col in list.split(',') {
+                    if let Some(def) = parse_column_def(col) {
+                        changes.push(SchemaChange::add_column(def));
+                    }
+                }
+            } else if let Some(def) = parse_column_def(inner) {
+                changes.push(SchemaChange::add_column(def));
+            }
+        } else if action_lower.starts_with("drop ") {
+            let inner = strip_keyword(&action_norm, "drop");
+            let inner = strip_keyword(inner, "column");
+            let name = inner.split_whitespace().next().unwrap_or("").trim_matches('`');
+            if !name.is_empty() {
+                changes.push(SchemaChange::drop_column(name));
+            }
+        } else if action_lower.starts_with("modify ") {
+            let inner = strip_keyword(&action_norm, "modify");
+            let inner = strip_keyword(inner, "column");
+            if let Some(def) = parse_column_def(inner) {
+                changes.push(SchemaChange::modify_column(def));
+            }
+        } else if action_lower.starts_with("change ") {
+            let inner = strip_keyword(&action_norm, "change");
+            let inner = strip_keyword(inner, "column");
+            let mut parts = inner.splitn(2, char::is_whitespace);
+            let old = parts.next().unwrap_or("").trim_matches('`');
+            if let Some(rest) = parts.next() {
+                if let Some(def) = parse_column_def(rest) {
+                    changes.push(SchemaChange::rename_column(old, def.name.clone()));
+                    changes.push(SchemaChange::modify_column(def));
+                }
+            }
+        } else if action_lower.starts_with("rename column ") {
+            let inner = strip_keyword(&action_norm, "rename");
+            let inner = strip_keyword(inner, "column");
+            let to_pos = inner.to_lowercase().find(" to ")?;
+            let old = inner[..to_pos].trim().trim_matches('`');
+            let new = inner[to_pos + 4..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('`');
+            if !old.is_empty() && !new.is_empty() {
+                changes.push(SchemaChange::rename_column(old, new));
+            }
+        }
+        // Other ALTER clauses (ADD INDEX, ALGORITHM=..., etc.) are ignored.
+    }
+    Some(changes)
+}
+
+/// Extract the target table name (last `db.tbl` component, backticks
+/// stripped) from an `ALTER TABLE` statement; `None` for other statements.
+pub fn alter_table_target(ddl: &str) -> Option<String> {
+    let normalized = normalize_ws(ddl);
+    let mut it = normalized.split_whitespace();
+    if !it.next()?.eq_ignore_ascii_case("alter") {
+        return None;
+    }
+    if !it.next()?.eq_ignore_ascii_case("table") {
+        return None;
+    }
+    let ident = it.next()?;
+    let name = ident.split('.').next_back().unwrap_or("").trim_matches('`');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Skip `db`.`tbl` / db.tbl / tbl and return the remainder.
+fn skip_identifier(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '`');
+        let word_end = rest
+            .find(|c: char| c.is_whitespace() || c == '`' || c == '.')
+            .unwrap_or(rest.len());
+        rest = &rest[word_end..];
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '`');
+        if rest.starts_with('.') {
+            rest = &rest[1..];
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn strip_keyword<'a>(s: &'a str, keyword: &str) -> &'a str {
+    if s.len() > keyword.len() + 1
+        && s[..keyword.len()].eq_ignore_ascii_case(keyword)
+        && s.as_bytes()[keyword.len()] == b' '
+    {
+        &s[keyword.len() + 1..]
+    } else {
+        s
+    }
+}
+
+/// Split ALTER actions on top-level commas (parentheses aware).
+fn split_actions(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                out.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Parse "name type [NOT NULL|NULL] ..." into a ColumnDef.
+fn parse_column_def(s: &str) -> Option<seatunnel_api::ColumnDef> {
+    let s = s.trim().trim_matches('`');
+    let mut tokens: Vec<&str> = s.split_whitespace().collect();
+    let name = tokens.first()?.trim_matches('`').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    tokens.remove(0);
+    if tokens.is_empty() {
+        return None;
+    }
+    // Type token possibly followed by (len[,scale]).
+    let mut type_str = tokens.remove(0).to_lowercase();
+    if tokens.first().map(|t| t.starts_with('(')).unwrap_or(false) {
+        while !tokens.is_empty() {
+            type_str.push_str(tokens.remove(0));
+            if type_str.ends_with(')') {
+                break;
+            }
+        }
+    }
+    let nullable = !tokens.join(" ").to_lowercase().contains("not null");
+    let (base, len, scale) = parse_type_spec(&type_str);
+    let dialect = seatunnel_api::schema::MySqlDialect;
+    let column_type = seatunnel_api::schema::DatabaseDialect::map_type(&dialect, &base, len, scale);
+    Some(
+        seatunnel_api::ColumnDef::new(name, column_type)
+            .nullable(nullable)
+            .source_type(type_str),
+    )
+}
+
+/// Split "decimal(10,2)" into ("decimal", Some(10), Some(2)).
+pub fn parse_type_spec(ty: &str) -> (String, Option<u32>, Option<i8>) {
+    if let Some(open) = ty.find('(') {
+        let base = ty[..open].trim().to_string();
+        let inner = ty[open + 1..].trim_end_matches(')');
+        let mut nums = inner.split(',');
+        let len = nums.next().and_then(|n| n.trim().parse::<u32>().ok());
+        let scale = nums.next().and_then(|n| n.trim().parse::<i8>().ok());
+        (base, len, scale)
+    } else {
+        (ty.trim().to_string(), None, None)
+    }
 }
 
 /// Common CDC configuration.
@@ -341,20 +862,168 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_change_event() {
-        let event = SchemaChangeEvent::AddColumn {
-            table: "users".to_string(),
-            column: seatunnel_api::ColumnDef::new(
-                "email".to_string(),
-                seatunnel_api::ColumnType::String,
-            ),
+    fn test_diff_columns_add_drop_modify() {
+        use seatunnel_api::{ColumnDef, ColumnType, SchemaChange};
+
+        let old = vec![
+            ColumnDef::new("id", ColumnType::Int64).primary_key(),
+            ColumnDef::new("name", ColumnType::String),
+        ];
+        // add "email", drop "name", modify "id" -> Int32
+        let new = vec![
+            ColumnDef::new("id", ColumnType::Int32).primary_key(),
+            ColumnDef::new("email", ColumnType::String),
+        ];
+        let events = diff_columns("db.t", &old, &new);
+        assert_eq!(events.len(), 1);
+        let changes = &events[0].changes;
+        // email lands at ordinal 1 in the new layout (id, email)
+        assert!(changes.contains(&SchemaChange::add_column_at(
+            ColumnDef::new("email", ColumnType::String),
+            1
+        )));
+        assert!(changes.contains(&SchemaChange::DropColumn {
+            column_name: "name".to_string(),
+            position: Some(1),
+        }));
+        assert!(changes.contains(&SchemaChange::modify_column_at(
+            ColumnDef::new("id", ColumnType::Int32).primary_key(),
+            0
+        )));
+    }
+
+    #[test]
+    fn test_diff_columns_rename_heuristic() {
+        use seatunnel_api::{ColumnDef, ColumnType, SchemaChange};
+
+        let old = vec![ColumnDef::new("id", ColumnType::Int64)];
+        let new = vec![ColumnDef::new("uid", ColumnType::Int64)];
+        let events = diff_columns("db.t", &old, &new);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].changes,
+            vec![SchemaChange::rename_column("id", "uid")]
+        );
+    }
+
+    #[test]
+    fn test_diff_columns_no_change() {
+        use seatunnel_api::{ColumnDef, ColumnType};
+
+        let cols = vec![ColumnDef::new("id", ColumnType::Int64)];
+        assert!(diff_columns("db.t", &cols, &cols).is_empty());
+    }
+
+    #[test]
+    fn test_parse_alter_table_operations() {
+        use seatunnel_api::{ColumnDef, ColumnType, SchemaChange};
+
+        // ADD COLUMN
+        let changes = parse_alter_table("ALTER TABLE `db`.`users` ADD COLUMN email VARCHAR(64) NOT NULL").unwrap();
+        assert_eq!(
+            changes,
+            vec![SchemaChange::add_column(
+                ColumnDef::new("email", ColumnType::String)
+                    .not_null()
+                    .source_type("varchar(64)")
+            )]
+        );
+
+        // DROP COLUMN
+        let changes = parse_alter_table("ALTER TABLE users DROP COLUMN age").unwrap();
+        assert_eq!(changes, vec![SchemaChange::drop_column("age")]);
+
+        // MODIFY COLUMN with type change
+        let changes = parse_alter_table("ALTER TABLE users MODIFY score DECIMAL(10,2)").unwrap();
+        assert_eq!(
+            changes,
+            vec![SchemaChange::modify_column(
+                ColumnDef::new(
+                    "score",
+                    ColumnType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                )
+                .source_type("decimal(10,2)")
+            )]
+        );
+
+        // CHANGE COLUMN = rename + modify
+        let changes = parse_alter_table("ALTER TABLE users CHANGE COLUMN name full_name VARCHAR(128)").unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0], SchemaChange::rename_column("name", "full_name"));
+
+        // RENAME COLUMN
+        let changes = parse_alter_table("ALTER TABLE users RENAME COLUMN a TO b").unwrap();
+        assert_eq!(changes, vec![SchemaChange::rename_column("a", "b")]);
+
+        // Multi-action statement
+        let changes = parse_alter_table("ALTER TABLE t ADD c1 INT, DROP c2").unwrap();
+        assert_eq!(changes.len(), 2);
+
+        // Ignored clause types produce no changes; non-ALTER is None.
+        assert!(parse_alter_table("ALTER TABLE t ADD INDEX idx_name (name)").unwrap().is_empty());
+        assert!(parse_alter_table("CREATE TABLE t (a INT)").is_none());
+        assert!(parse_alter_table("BEGIN").is_none());
+    }
+
+    #[test]
+    fn test_schema_filters_include_exclude() {
+        let config = SchemaEvolutionConfig {
+            enabled: true,
+            include: vec!["email".to_string()],
+            exclude: vec![],
+            ..SchemaEvolutionConfig::default()
         };
-        match event {
-            SchemaChangeEvent::AddColumn { table, column } => {
-                assert_eq!(table, "users");
-                assert_eq!(column.name, "email");
-            }
-            _ => panic!("wrong variant"),
-        }
+        let mut watcher = SchemaWatcher::new("db.t", &config);
+        watcher.observe_ddl("ALTER TABLE t ADD COLUMN email VARCHAR(8)");
+        watcher.observe_ddl("ALTER TABLE t ADD COLUMN phone VARCHAR(8)");
+        assert!(watcher.take_pending().is_some()); // email passes
+        assert!(watcher.take_pending().is_none()); // phone filtered out
+
+        let config = SchemaEvolutionConfig {
+            enabled: true,
+            include: vec![],
+            exclude: vec!["email".to_string()],
+            ..SchemaEvolutionConfig::default()
+        };
+        let mut watcher = SchemaWatcher::new("db.t", &config);
+        watcher.observe_ddl("ALTER TABLE t ADD COLUMN email VARCHAR(8)");
+        assert!(watcher.take_pending().is_none()); // excluded
+    }
+
+    #[test]
+    fn test_alter_table_target() {
+        assert_eq!(
+            alter_table_target("ALTER TABLE `db`.`users` ADD COLUMN email VARCHAR(64)"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            alter_table_target("alter table users drop column x"),
+            Some("users".to_string())
+        );
+        assert_eq!(alter_table_target("CREATE TABLE t (a INT)"), None);
+    }
+
+    #[test]
+    fn test_watcher_observe_ddl_queues_event() {
+        let config = SchemaEvolutionConfig {
+            enabled: true,
+            poll_interval_ms: 1000,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let mut watcher = SchemaWatcher::new("db.users", &config);
+        watcher.prime(vec![
+            seatunnel_api::ColumnDef::new("id", seatunnel_api::ColumnType::Int64).primary_key(),
+        ]);
+        watcher.observe_ddl("ALTER TABLE users ADD COLUMN email VARCHAR(64)");
+        let event = watcher.take_pending().expect("event queued");
+        assert_eq!(event.changes.len(), 1);
+        assert!(watcher.take_pending().is_none());
+        // Baseline updated.
+        assert!(watcher.columns().iter().any(|c| c.name == "email"));
     }
 }
+

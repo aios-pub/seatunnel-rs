@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let tso = pd.get_tso().await?;
     // TSO layout: physical ms << 18 | logical; subtract from the physical part.
     let checkpoint = if checkpoint_ago > 0 {
-        tso.checked_sub(checkpoint_ago * 1000 << 18).unwrap_or(0)
+        tso.saturating_sub((checkpoint_ago * 1000) << 18)
     } else {
         tso
     };
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = Vec::new();
     for ri in &regions {
         let region_id = ri.region.id;
-        let epoch = ri.region.region_epoch.clone();
+        let epoch = ri.region.region_epoch;
         // Resolve the leader store address (first voter peer's store).
         let leader = pd.leader_address(ri).await?.unwrap_or_default();
         let leader = if let Some((host, port)) = leader.rsplit_once(':') {

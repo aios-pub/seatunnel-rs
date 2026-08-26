@@ -40,7 +40,10 @@ pub use configuration::{ConfigOption, OptionRule, ReadonlyConfig};
 pub use execution::{Engine, ExecutionMode};
 pub use factory::{Factory, FactoryContext};
 pub use row::{ColumnType, Field, Row, RowKind};
-pub use schema::{ColumnDef, DatabaseDialect, SchemaDiscoverer, TableSchema};
+pub use schema::{
+    ColumnDef, DatabaseDialect, SchemaChange, SchemaChangeEvent, SchemaChangeError,
+    SchemaDiscoverer, TableSchema,
+};
 pub use sink::{Sink, SinkCommitter, SinkWriter};
 pub use source::{Source, SourceReader, SourceSplit, SourceSplitEnumerator};
 pub use transform::Transform;
