@@ -239,6 +239,10 @@ impl CdcClient {
         let channel = Channel::from_shared(addr)
             .map_err(|e| anyhow::anyhow!("Invalid TiKV address: {}", e))?
             .connect_timeout(Duration::from_secs(10))
+            // Match grpc-go defaults from official TiCDC (grpc_conn.go):
+            // InitialWindowSize = 65535, InitialConnWindowSize = 8MB
+            .initial_stream_window_size(65_535)
+            .initial_connection_window_size(8 * 1024 * 1024)
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to TiKV {}: {}", tikv_addr, e))?;
