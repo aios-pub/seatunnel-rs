@@ -35,7 +35,7 @@ use seatunnel_engine_comm::{
     TaskStatusReport,
 };
 use seatunnel_engine_core::checkpoint_listener::CheckpointListener;
-use seatunnel_engine_core::connector_factory::{create_sink, create_source, create_transforms};
+use seatunnel_engine_core::connector_factory::{create_sink, create_sinks, create_source, create_transforms};
 use seatunnel_engine_core::state::TaskState;
 use seatunnel_engine_core::task_group::TaskGroup;
 use seatunnel_engine_core::{now_millis, TaskStatus};
@@ -299,13 +299,19 @@ async fn run_pipeline(
 ) -> anyhow::Result<TaskStatus> {
     let cfg = &task.config;
 
-    let source_plugin = cfg.get("source.plugin").map(String::as_str).unwrap_or("");
-    let source_config_raw = cfg.get("source.config").map(String::as_str).unwrap_or("{}");
-    let sink_plugin = cfg
-        .get("sink.plugin")
+    // Multi-pipeline jobs carry `pipeline.*` keys (source + sink list,
+    // fan-out built inside the task); legacy single-pipeline descriptors
+    // keep source.plugin/sink.plugin.
+    let source_plugin = cfg
+        .get("pipeline.source.plugin")
+        .or_else(|| cfg.get("source.plugin"))
         .map(String::as_str)
-        .unwrap_or("console");
-    let sink_config_raw = cfg.get("sink.config").map(String::as_str).unwrap_or("{}");
+        .unwrap_or("");
+    let source_config_raw = cfg
+        .get("pipeline.source.config")
+        .or_else(|| cfg.get("source.config"))
+        .map(String::as_str)
+        .unwrap_or("{}");
     let transform_raw = cfg
         .get("transform.config")
         .map(String::as_str)
@@ -318,14 +324,13 @@ async fn run_pipeline(
     let source_value: serde_json::Value = serde_json::from_str(source_config_raw)?;
     let mut source_config =
         seatunnel_engine_core::connector_factory::json_to_config_map(&source_value);
-    // Partition snapshot ranges across parallel subtasks.
+    // Partition snapshot ranges across parallel subtasks (within this
+    // pipeline — task_index/parallelism are pipeline-scoped).
     source_config.insert("subtask.index".to_string(), task.task_index.to_string());
     source_config.insert(
         "subtask.count".to_string(),
         task.parallelism.max(1).to_string(),
     );
-    let sink_value: serde_json::Value = serde_json::from_str(sink_config_raw)?;
-    let sink_config = seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
     let transforms_cfg: Vec<serde_json::Value> = serde_json::from_str(transform_raw)?;
 
     // Restore from the newest durable checkpoint when one exists.
@@ -349,7 +354,37 @@ async fn run_pipeline(
         restore_state.as_deref(),
     )?;
     let transforms = create_transforms(&transforms_cfg)?;
-    let writer = create_sink(sink_plugin, &sink_config)?;
+
+    // Sink side: pipeline descriptors carry a sink LIST (fan-out through
+    // the FanoutSinkWriter mux); legacy descriptors fall back to a single
+    // sink.plugin/sink.config pair.
+    let writer = if let Some(sinks_raw) = cfg.get("pipeline.sinks") {
+        let sinks: Vec<seatunnel_engine_core::connector_factory::SinkDeclaration> =
+            serde_json::from_str(sinks_raw)?;
+        let policy = seatunnel_engine_core::fanout::SinkFailurePolicy::parse(
+            cfg.get("pipeline.on-sink-failure")
+                .map(String::as_str)
+                .unwrap_or("fail"),
+        );
+        info!(
+            "Task {}: pipeline '{}' → {} sink(s), on-sink-failure={:?}",
+            task.task_id,
+            cfg.get("pipeline.name").map(String::as_str).unwrap_or("?"),
+            sinks.len(),
+            policy
+        );
+        create_sinks(&sinks, policy)?
+    } else {
+        let sink_plugin = cfg
+            .get("sink.plugin")
+            .map(String::as_str)
+            .unwrap_or("console");
+        let sink_value: serde_json::Value =
+            serde_json::from_str(cfg.get("sink.config").map(String::as_str).unwrap_or("{}"))?;
+        let sink_config =
+            seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
+        create_sink(sink_plugin, &sink_config)?
+    };
 
     let context = seatunnel_engine_core::task_group::TaskContext::new(
         task.task_id.clone(),

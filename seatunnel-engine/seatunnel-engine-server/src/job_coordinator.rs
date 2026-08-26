@@ -145,6 +145,108 @@ impl Default for JobCoordinator {
     }
 }
 
+pub(crate) struct PipelineSpec {
+    name: String,
+    parallelism: usize,
+    source_plugin: String,
+    source_config: serde_json::Value,
+    sinks: Vec<seatunnel_engine_core::connector_factory::SinkDeclaration>,
+    on_sink_failure: String,
+}
+
+/// Extract every pipeline from the job config:
+/// - `pipelines: [{source: {Plugin: {...}}, sinks: [{A: {...}}, ...]}, ...]`
+///   for explicit multi-source / fan-out topologies;
+/// - legacy shorthand `source: {Plugin: {...}}` + `sink:` (single block,
+///   multi-key map or list — all entries become sinks of one pipeline).
+fn extract_pipelines(
+    config: &serde_json::Value,
+    default_parallelism: usize,
+) -> anyhow::Result<Vec<PipelineSpec>> {
+    let default_policy = config
+        .pointer("/env/on-sink-failure")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fail")
+        .to_string();
+
+    let mut pipelines = Vec::new();
+    if let Some(list) = config.get("pipelines").and_then(|v| v.as_array()) {
+        if list.is_empty() {
+            anyhow::bail!("'pipelines' section is empty");
+        }
+        for (idx, entry) in list.iter().enumerate() {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("p{}", idx));
+            let parallelism = entry
+                .get("parallelism")
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).max(1))
+                .unwrap_or(default_parallelism);
+            let source_section = entry
+                .get("source")
+                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has no source section", name))?;
+            let (source_plugin, source_config) = first_block(source_section)
+                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has an empty source section", name))?;
+            let sink_section = entry
+                .get("sinks")
+                .or_else(|| entry.get("sink"))
+                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has no sinks section", name))?;
+            let sinks =
+                seatunnel_engine_core::connector_factory::parse_sink_declarations(sink_section)?;
+            let on_sink_failure = entry
+                .get("on-sink-failure")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&default_policy)
+                .to_string();
+            pipelines.push(PipelineSpec {
+                name,
+                parallelism,
+                source_plugin,
+                source_config,
+                sinks,
+                on_sink_failure,
+            });
+        }
+        return Ok(pipelines);
+    }
+
+    // Legacy single-pipeline shorthand.
+    let source_section = config
+        .get("source")
+        .ok_or_else(|| anyhow::anyhow!("job config has no source section"))?;
+    let (source_plugin, source_config) = first_block(source_section)
+        .ok_or_else(|| anyhow::anyhow!("job config has an empty source section"))?;
+    let sink_section = config
+        .get("sink")
+        .ok_or_else(|| anyhow::anyhow!("job config has no sink section"))?;
+    let sinks = seatunnel_engine_core::connector_factory::parse_sink_declarations(sink_section)?;
+    Ok(vec![PipelineSpec {
+        name: "pipeline".to_string(),
+        parallelism: default_parallelism,
+        source_plugin,
+        source_config,
+        sinks,
+        on_sink_failure: default_policy,
+    }])
+}
+
+/// First `{PluginName: {...}}` block of a section (map or single-item list).
+fn first_block(section: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    match section {
+        serde_json::Value::Object(map) => map.iter().next().map(|(k, v)| (k.clone(), v.clone())),
+        serde_json::Value::Array(items) => items.first().and_then(|item| {
+            item.as_object()
+                .and_then(|m| m.iter().next())
+                .map(|(k, v)| (k.clone(), v.clone()))
+        }),
+        _ => None,
+    }
+}
+
+
 impl JobCoordinator {
     pub fn new() -> Self {
         JobCoordinator {
@@ -177,63 +279,84 @@ impl JobCoordinator {
         }
 
         let checkpoint_interval = env_checkpoint_interval(config);
-        let source = extract_first_section(config, "source")
-            .ok_or_else(|| anyhow::anyhow!("job config has no source section"))?;
-        let sink = extract_first_section(config, "sink")
-            .ok_or_else(|| anyhow::anyhow!("job config has no sink section"))?;
+        let pipelines = extract_pipelines(config, parallelism)?;
         let transforms = extract_transform_list(config);
 
+        let summary = pipelines
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}[{}: {} → {} sink(s), on-sink-failure={}]",
+                    p.name,
+                    p.parallelism,
+                    p.source_plugin,
+                    p.sinks.len(),
+                    p.on_sink_failure
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
-            "Compiling job {} '{}': parallelism={} checkpoint={}ms source='{}' sink='{}' transforms={}",
-            job_id,
-            job_name,
-            parallelism,
-            checkpoint_interval,
-            source.0,
-            sink.0,
-            transforms.len()
+            "Compiling job {} '{}': checkpoint={}ms pipelines={}",
+            job_id, job_name, checkpoint_interval, summary
         );
 
-        // Build task descriptors — one per subtask, round-robin over workers.
-        let mut tasks = Vec::with_capacity(parallelism);
-        for i in 0..parallelism {
-            let (worker_id, worker_addr) = &workers[i % workers.len()];
-            tasks.push(TaskDescriptor {
-                task_id: format!("{}-{}", job_id, i),
-                job_id: job_id.to_string(),
-                stage_id: format!("{}-pipeline", job_id),
-                task_name: format!("{}-pipeline-{}", job_name, i),
-                task_index: i as i32,
-                source_config_json: String::new(),
-                sink_config_json: String::new(),
-                parallelism: parallelism as i32,
-                config: HashMap::from([
-                    ("worker_id".to_string(), worker_id.clone()),
-                    ("worker_address".to_string(), worker_addr.clone()),
-                    ("job.name".to_string(), job_name.to_string()),
-                    ("source.plugin".to_string(), source.0.clone()),
-                    (
-                        "source.config".to_string(),
-                        serde_json::to_string(&source.1)
-                            .map_err(|e| anyhow::anyhow!("serialize source config: {}", e))?,
-                    ),
-                    ("sink.plugin".to_string(), sink.0.clone()),
-                    (
-                        "sink.config".to_string(),
-                        serde_json::to_string(&sink.1)
-                            .map_err(|e| anyhow::anyhow!("serialize sink config: {}", e))?,
-                    ),
-                    (
-                        "transform.config".to_string(),
-                        serde_json::to_string(&transforms)
-                            .map_err(|e| anyhow::anyhow!("serialize transforms: {}", e))?,
-                    ),
-                    (
-                        "checkpoint.interval".to_string(),
-                        checkpoint_interval.to_string(),
-                    ),
-                ]),
-            });
+        // Build task descriptors — one per (pipeline, subtask), round-robin
+        // over workers. Each descriptor carries its pipeline's source and
+        // the FULL sink list (fan-out happens inside the task).
+        let mut tasks = Vec::new();
+        let mut task_no = 0usize;
+        for (pipe_idx, pipe) in pipelines.iter().enumerate() {
+            for i in 0..pipe.parallelism {
+                let (worker_id, worker_addr) = &workers[task_no % workers.len()];
+                let sinks_json: Vec<serde_json::Value> = pipe
+                    .sinks
+                    .iter()
+                    .map(|sink| serde_json::json!({ "plugin": sink.plugin, "config": sink.config }))
+                    .collect();
+                tasks.push(TaskDescriptor {
+                    task_id: format!("{}-p{}-{}", job_id, pipe_idx, i),
+                    job_id: job_id.to_string(),
+                    stage_id: format!("{}-p{}", job_id, pipe_idx),
+                    task_name: format!("{}-{}-{}", job_name, pipe.name, i),
+                    task_index: i as i32,
+                    source_config_json: String::new(),
+                    sink_config_json: String::new(),
+                    parallelism: pipe.parallelism as i32,
+                    config: HashMap::from([
+                        ("worker_id".to_string(), worker_id.clone()),
+                        ("worker_address".to_string(), worker_addr.clone()),
+                        ("job.name".to_string(), job_name.to_string()),
+                        ("pipeline.index".to_string(), pipe_idx.to_string()),
+                        ("pipeline.name".to_string(), pipe.name.clone()),
+                        ("pipeline.source.plugin".to_string(), pipe.source_plugin.clone()),
+                        (
+                            "pipeline.source.config".to_string(),
+                            serde_json::to_string(&pipe.source_config)
+                                .map_err(|e| anyhow::anyhow!("serialize source config: {}", e))?,
+                        ),
+                        (
+                            "pipeline.sinks".to_string(),
+                            serde_json::to_string(&sinks_json)
+                                .map_err(|e| anyhow::anyhow!("serialize sinks: {}", e))?,
+                        ),
+                        (
+                            "pipeline.on-sink-failure".to_string(),
+                            pipe.on_sink_failure.clone(),
+                        ),
+                        (
+                            "transform.config".to_string(),
+                            serde_json::to_string(&transforms)
+                                .map_err(|e| anyhow::anyhow!("serialize transforms: {}", e))?,
+                        ),
+                        (
+                            "checkpoint.interval".to_string(),
+                            checkpoint_interval.to_string(),
+                        ),
+                    ]),
+                });
+                task_no += 1;
+            }
         }
 
         // Register the job + task infos.
@@ -460,24 +583,6 @@ impl JobCoordinator {
     }
 }
 
-/// Extract `(plugin_name, config_value)` of the first entry of a section
-/// (`source` / `sink`). Accepts both `{Plugin: {...}}` maps and arrays of
-/// single-key objects.
-fn extract_first_section<'a>(
-    config: &'a serde_json::Value,
-    section: &str,
-) -> Option<(String, &'a serde_json::Value)> {
-    let sec = config.get(section)?;
-    match sec {
-        serde_json::Value::Object(map) => map.iter().next().map(|(k, v)| (k.clone(), v)),
-        serde_json::Value::Array(items) => items.first().and_then(|item| {
-            item.as_object()
-                .and_then(|m| m.iter().next())
-                .map(|(k, v)| (k.clone(), v))
-        }),
-        _ => None,
-    }
-}
 
 /// Normalize the transform section into an ordered array of configs.
 fn extract_transform_list(config: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -550,6 +655,75 @@ mod tests {
             .collect()
     }
 
+
+    #[test]
+    fn test_compile_multi_pipeline_with_fanout() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "job.name": "multi", "parallelism": 2, "on-sink-failure": "isolate" },
+            "pipelines": [
+                {
+                    "name": "cdc-fanout",
+                    "parallelism": 1,
+                    "source": { "MySQL-CDC": { "database-name": "s", "table-name": "t" } },
+                    "sinks": [
+                        { "Kafka": { "topic": "a" } },
+                        { "JDBC": { "url": "jdbc:mysql://x" } }
+                    ]
+                },
+                {
+                    // no name → p1; default parallelism from env (2)
+                    "source": { "JDBC": { "url": "jdbc:mysql://y" } },
+                    "sink": { "Console": {} }
+                }
+            ]
+        });
+
+        let (_job, tasks) = coordinator
+            .compile_and_schedule("j2", "multi", &config, None, &workers(2))
+            .unwrap();
+        // pipeline 0: 1 subtask; pipeline 1: 2 subtasks.
+        assert_eq!(tasks.len(), 3);
+        let t = &tasks[0];
+        assert_eq!(t.task_id, "j2-p0-0");
+        assert_eq!(t.config.get("pipeline.name").unwrap(), "cdc-fanout");
+        assert_eq!(t.config.get("pipeline.source.plugin").unwrap(), "MySQL-CDC");
+        assert_eq!(t.config.get("pipeline.on-sink-failure").unwrap(), "isolate");
+        let sinks: serde_json::Value =
+            serde_json::from_str(t.config.get("pipeline.sinks").unwrap()).unwrap();
+        assert_eq!(sinks.as_array().unwrap().len(), 2);
+        assert_eq!(sinks[0]["plugin"], "Kafka");
+        assert_eq!(sinks[1]["plugin"], "JDBC");
+
+        let t1 = &tasks[1];
+        assert_eq!(t1.task_id, "j2-p1-0");
+        assert_eq!(t1.parallelism, 2);
+        assert_eq!(t1.task_index, 0);
+        let t2 = &tasks[2];
+        assert_eq!(t2.task_index, 1);
+        // Default policy inherited from env.
+        assert_eq!(t2.config.get("pipeline.on-sink-failure").unwrap(), "isolate");
+    }
+
+    #[test]
+    fn test_compile_legacy_sink_list() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "job.name": "legacy", "parallelism": 1 },
+            "source": { "Fake": { "row.num": 1 } },
+            "sink": [
+                { "Console": {} },
+                { "Console": { "prefix": "x" } }
+            ]
+        });
+        let (_job, tasks) = coordinator
+            .compile_and_schedule("j3", "legacy", &config, None, &workers(1))
+            .unwrap();
+        let sinks: serde_json::Value =
+            serde_json::from_str(tasks[0].config.get("pipeline.sinks").unwrap()).unwrap();
+        assert_eq!(sinks.as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn test_compile_chained_tasks() {
         let coordinator = JobCoordinator::new();
@@ -566,12 +740,19 @@ mod tests {
         assert_eq!(tasks.len(), 2);
 
         let t0 = &tasks[0];
-        assert_eq!(t0.config.get("source.plugin").unwrap(), "MySQL-CDC");
-        assert_eq!(t0.config.get("sink.plugin").unwrap(), "Kafka");
+        assert_eq!(t0.task_id, "j1-p0-0");
+        assert_eq!(
+            t0.config.get("pipeline.source.plugin").unwrap(),
+            "MySQL-CDC"
+        );
         assert_eq!(t0.config.get("checkpoint.interval").unwrap(), "10000");
         let src: serde_json::Value =
-            serde_json::from_str(t0.config.get("source.config").unwrap()).unwrap();
+            serde_json::from_str(t0.config.get("pipeline.source.config").unwrap()).unwrap();
         assert_eq!(src["hostname"], "db");
+        let sinks: serde_json::Value =
+            serde_json::from_str(t0.config.get("pipeline.sinks").unwrap()).unwrap();
+        assert_eq!(sinks[0]["plugin"], "Kafka");
+        assert_eq!(sinks[0]["config"]["topic"], "out");
 
         // Round-robin placement across three workers.
         assert_eq!(tasks[0].config.get("worker_id").unwrap(), "worker-0");

@@ -10,6 +10,7 @@
 use chrono::Utc;
 use uuid::Uuid;
 
+pub mod fanout;
 pub mod barrier;
 pub mod checkpoint;
 pub mod checkpoint_coordinator;

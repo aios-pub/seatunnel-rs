@@ -1,0 +1,65 @@
+# Multi-pipeline job: multiple sources and sinks in ONE config, with
+# fan-out (a single source feeding several different sink systems
+# concurrently through one read connection).
+#
+# Pipeline 1 "cdc-fanout": MySQL-CDC → Kafka AND JDBC simultaneously.
+#   One binlog connection broadcasts every row to both sinks on separate
+#   writer tasks (low latency — a slow sink never blocks the fast one).
+# Pipeline 2 "jdbc-export": JDBC source → Console (independent pipeline
+#   with its own parallelism and checkpoints).
+#
+# Submit:
+#   seatunnel job submit -c examples/multi-pipeline-fanout.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: multi-pipeline-fanout
+  checkpoint.interval: 5000
+  # Default failure policy for every pipeline's fan-out sinks:
+  #   fail    — any sink failure fails the task (strict at-least-once)
+  #   isolate — remove the failed sink, keep the rest running
+  on-sink-failure: fail
+
+pipelines:
+  - name: cdc-fanout
+    parallelism: 1
+    source:
+      MySQL-CDC:
+        hostname: "127.0.0.1"
+        port: 13306
+        username: root
+        password: root
+        database-name: seatunnel
+        table-name: users
+        startup.mode: initial
+        split.column: id
+        schema-evolution.enabled: true
+    sinks:
+      - Kafka:
+          bootstrap.servers: "127.0.0.1:9092"
+          topic: users-cdc-fanout
+          format: json
+          acks: all
+          batch.size: 256
+      - JDBC:
+          url: "jdbc:mysql://127.0.0.1:13306/seatunnel"
+          username: root
+          password: root
+          table: users_fanout
+          primary-keys: f0
+          enable-upsert: true
+          schema-save-mode: create_when_not_exist
+          data-save-mode: append_data
+    # Pipeline-level override of the failure policy:
+    # on-sink-failure: isolate
+
+  - name: jdbc-export
+    parallelism: 1
+    source:
+      JDBC:
+        url: "jdbc:mysql://127.0.0.1:13306/seatunnel"
+        username: root
+        password: root
+        table: users          # reads the source table; users_fanout is
+        fetch.size: 512       # created by the cdc-fanout pipeline above
+    sinks:
+      - Console: {}

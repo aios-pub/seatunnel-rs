@@ -15,5 +15,6 @@
 
 # Features
 
+- [Multi-Pipeline Jobs (Fan-Out)](pipelines.md)
 - [Startup Modes & Resuming from a Point in Time](startup-modes.md)
 - [Schema Evolution](schema-evolution.md)

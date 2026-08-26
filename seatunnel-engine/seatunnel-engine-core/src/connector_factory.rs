@@ -130,8 +130,8 @@ where
 // Sink adapter
 // ---------------------------------------------------------------------------
 
-struct SinkWriterAdapter<W> {
-    inner: W,
+pub(crate) struct SinkWriterAdapter<W> {
+    pub(crate) inner: W,
 }
 
 #[async_trait::async_trait]
@@ -847,6 +847,70 @@ pub fn create_sink(
         })),
         other => Err(anyhow::anyhow!("unknown sink plugin '{}'", other)),
     }
+}
+
+
+/// One sink declaration of a pipeline: plugin name + its config object.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SinkDeclaration {
+    pub plugin: String,
+    pub config: serde_json::Value,
+}
+
+/// Parse a pipeline's `sinks` section into declarations. Accepts:
+/// - array of single-key blocks: `[{Kafka: {...}}, {JDBC: {...}}]`
+/// - multi-key map: `{Kafka: {...}, JDBC: {...}}` (order not guaranteed)
+/// - a single block map (legacy `sink:` shape)
+pub fn parse_sink_declarations(section: &serde_json::Value) -> anyhow::Result<Vec<SinkDeclaration>> {
+    let blocks: Vec<serde_json::Value> = match section {
+        serde_json::Value::Array(items) => items.clone(),
+        serde_json::Value::Object(_) => vec![section.clone()],
+        serde_json::Value::Null => Vec::new(),
+        other => anyhow::bail!("sink section must be a map or list, got: {}", other),
+    };
+    let mut sinks = Vec::new();
+    for block in blocks {
+        let Some(map) = block.as_object() else {
+            anyhow::bail!("each sink entry must be a map of {{PluginName: {{...}}}}");
+        };
+        for (plugin, config) in map {
+            sinks.push(SinkDeclaration {
+                plugin: plugin.clone(),
+                config: config.clone(),
+            });
+        }
+    }
+    if sinks.is_empty() {
+        anyhow::bail!("pipeline has no sinks configured");
+    }
+    Ok(sinks)
+}
+
+/// Build the sink writer(s) for a pipeline. A single sink returns the
+/// writer directly; multiple sinks return a [`FanoutSinkWriter`] mux so
+/// one reader broadcasts to all of them concurrently.
+pub fn create_sinks(
+    sinks: &[SinkDeclaration],
+    failure_policy: crate::fanout::SinkFailurePolicy,
+) -> anyhow::Result<BoxedSinkWriter> {
+    if sinks.len() == 1 {
+        let sink = &sinks[0];
+        let config = json_to_config_map(&sink.config);
+        return create_sink(&sink.plugin, &config);
+    }
+    let writers = sinks
+        .iter()
+        .enumerate()
+        .map(|(idx, sink)| {
+            let config = json_to_config_map(&sink.config);
+            Ok((
+                format!("{}#{}", sink.plugin, idx),
+                create_sink(&sink.plugin, &config)?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<(String, BoxedSinkWriter)>>>()?;
+    let mux: BoxedSinkWriter = Box::new(crate::fanout::FanoutSinkWriter::new(writers, failure_policy));
+    Ok(mux)
 }
 
 /// Build a transform chain from the ordered list of transform configs.

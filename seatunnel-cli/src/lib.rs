@@ -155,7 +155,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
 /// Run a job fully in-process using the same connector factory as workers.
 async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) -> Result<()> {
     use seatunnel_engine_core::connector_factory::{
-        create_sink, create_source, create_transforms, json_to_config_map,
+        create_sinks, create_source, create_transforms, json_to_config_map,
     };
     use seatunnel_engine_core::task_group::{TaskContext, TaskGroup};
 
@@ -183,34 +183,118 @@ async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) ->
     println!("  Job: {} × parallelism {}", job_name, parallelism);
     println!("========================================");
 
-    let (source_plugin, source_cfg) = first_section(&config, "source")
-        .ok_or_else(|| anyhow::anyhow!("config has no source section"))?;
-    let (sink_plugin, sink_cfg) = first_section(&config, "sink")
-        .ok_or_else(|| anyhow::anyhow!("config has no sink section"))?;
+    // Pipelines: explicit `pipelines` array (multi-source / fan-out) or the
+    // legacy single source + sink sections (sink may be a list for
+    // fan-out).
+    struct LocalPipeline {
+        name: String,
+        parallelism: usize,
+        source_plugin: String,
+        source_cfg: serde_json::Value,
+        sinks: Vec<seatunnel_engine_core::connector_factory::SinkDeclaration>,
+        on_sink_failure: String,
+    }
+    let mut pipelines = Vec::new();
+    if let Some(list) = config.get("pipelines").and_then(|v| v.as_array()) {
+        for (idx, entry) in list.iter().enumerate() {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("p{}", idx));
+            let pipe_parallelism = entry
+                .get("parallelism")
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).max(1))
+                .unwrap_or(parallelism);
+            let source_section = entry
+                .get("source")
+                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has no source section", name))?;
+            let (source_plugin, source_cfg) = first_section_value(source_section)
+                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has an empty source", name))?;
+            let sink_section = entry
+                .get("sinks")
+                .or_else(|| entry.get("sink"))
+                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has no sinks section", name))?;
+            let sinks =
+                seatunnel_engine_core::connector_factory::parse_sink_declarations(sink_section)?;
+            let on_sink_failure = entry
+                .get("on-sink-failure")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    config
+                        .pointer("/env/on-sink-failure")
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("fail")
+                .to_string();
+            pipelines.push(LocalPipeline {
+                name,
+                parallelism: pipe_parallelism,
+                source_plugin,
+                source_cfg,
+                sinks,
+                on_sink_failure,
+            });
+        }
+    } else {
+        let (source_plugin, source_cfg) = first_section(&config, "source")
+            .ok_or_else(|| anyhow::anyhow!("config has no source section"))?;
+        let sink_section = config
+            .get("sink")
+            .ok_or_else(|| anyhow::anyhow!("config has no sink section"))?;
+        let sinks =
+            seatunnel_engine_core::connector_factory::parse_sink_declarations(sink_section)?;
+        pipelines.push(LocalPipeline {
+            name: "pipeline".to_string(),
+            parallelism,
+            source_plugin,
+            source_cfg: source_cfg.clone(),
+            sinks,
+            on_sink_failure: config
+                .pointer("/env/on-sink-failure")
+                .and_then(|v| v.as_str())
+                .unwrap_or("fail")
+                .to_string(),
+        });
+    }
+    println!(
+        "  Pipelines: {}",
+        pipelines
+            .iter()
+            .map(|p| format!("{}[{}: {} → {} sink(s)]", p.name, p.parallelism, p.source_plugin, p.sinks.len()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let transforms_cfg = transform_list(&config);
 
     let mut handles = Vec::new();
-    for subtask in 0..parallelism {
-        let mut source_map = json_to_config_map(source_cfg);
-        source_map.insert("subtask.index".into(), subtask.to_string());
-        source_map.insert("subtask.count".into(), parallelism.to_string());
-        let reader = create_source(&source_plugin, &source_map, parallelism, None)
-            .with_context(|| format!("creating source '{}'", source_plugin))?;
-        let transforms = create_transforms(&transforms_cfg).context("creating transforms")?;
-        let writer = create_sink(&sink_plugin, &json_to_config_map(sink_cfg))
-            .with_context(|| format!("creating sink '{}'", sink_plugin))?;
+    for (pipe_idx, pipe) in pipelines.iter().enumerate() {
+        for subtask in 0..pipe.parallelism {
+            let mut source_map = json_to_config_map(&pipe.source_cfg);
+            source_map.insert("subtask.index".into(), subtask.to_string());
+            source_map.insert("subtask.count".into(), pipe.parallelism.to_string());
+            let reader = create_source(&pipe.source_plugin, &source_map, pipe.parallelism, None)
+                .with_context(|| format!("creating source '{}'", pipe.source_plugin))?;
+            let transforms = create_transforms(&transforms_cfg).context("creating transforms")?;
+            let policy =
+                seatunnel_engine_core::fanout::SinkFailurePolicy::parse(&pipe.on_sink_failure);
+            let writer = create_sinks(&pipe.sinks, policy)
+                .with_context(|| format!("creating sinks for pipeline '{}'", pipe.name))?;
 
-        let context = TaskContext::new(
-            format!("{}-local-{}", job_name, subtask),
-            format!("local-{}", uuid_v4()),
-            "pipeline",
-            subtask,
-            parallelism,
-        );
-        handles.push(tokio::spawn(async move {
-            let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
-            group.run().await
-        }));
+            let context = TaskContext::new(
+                format!("{}-{}-local-{}", job_name, pipe.name, subtask),
+                format!("local-{}", uuid_v4()),
+                format!("p{}", pipe_idx),
+                subtask,
+                pipe.parallelism,
+            );
+            handles.push(tokio::spawn(async move {
+                let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
+                group.run().await
+            }));
+        }
     }
 
     let mut failures = Vec::new();
@@ -285,6 +369,19 @@ fn parse_config_string(content: &str, format: ConfigFormat) -> Result<serde_json
 }
 
 /// Extract `(plugin_name, config)` of the first entry of a section.
+/// First `{Plugin: {...}}` block of a raw section value.
+fn first_section_value(section: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    match section {
+        serde_json::Value::Object(map) => map.iter().next().map(|(k, v)| (k.clone(), v.clone())),
+        serde_json::Value::Array(items) => items.first().and_then(|i| {
+            i.as_object()
+                .and_then(|m| m.iter().next())
+                .map(|(k, v)| (k.clone(), v.clone()))
+        }),
+        _ => None,
+    }
+}
+
 fn first_section<'a>(
     config: &'a serde_json::Value,
     section: &str,
