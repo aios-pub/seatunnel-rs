@@ -62,7 +62,7 @@ crossterm = "0.28"
 
 # Logging & Metrics
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono", "local-time"] }
 prometheus = "0.13"
 
 # Database

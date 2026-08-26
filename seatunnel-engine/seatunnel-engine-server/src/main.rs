@@ -64,7 +64,12 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with(Layer::default())
+        .with(
+            Layer::default().with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                // "YYYY-MM-DD HH:mm:ss" in the server's local timezone.
+                "%Y-%m-%d %H:%M:%S".to_string(),
+            )),
+        )
         .init();
 
     let args = Args::parse();

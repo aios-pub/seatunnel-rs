@@ -41,6 +41,9 @@ async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%d %H:%M:%S".to_string(),
+        ))
         .with_test_writer()
         .try_init();
     let coordinator = Arc::new(JobCoordinator::new());
