@@ -36,7 +36,15 @@ pub trait SinkWriter: Send {
     }
 
     fn write(&mut self, record: Self::Input) -> WriterFuture<'_, ()>;
-    fn prepare_commit(&mut self) -> WriterFuture<'_, Vec<Self::CommitInfo>>;
+
+    /// Phase 1 of the two-phase commit at checkpoint `checkpoint_id`
+    /// (Java: `SinkWriter#prepareCommit(long)`): flush everything written
+    /// so far so it becomes durably visible, and return the per-writer
+    /// commit descriptors the engine hands to the sink's committer once
+    /// the checkpoint completes (phase 2). The id is stable across
+    /// restarts, which lets transactional sinks derive deterministic
+    /// transaction/xid names and fence zombies after a crash.
+    fn prepare_commit(&mut self, checkpoint_id: u64) -> WriterFuture<'_, Vec<Self::CommitInfo>>;
     fn snapshot_state(&mut self) -> WriterFuture<'_, Vec<u8>>;
     fn close(&mut self) -> WriterFuture<'_, ()>;
 

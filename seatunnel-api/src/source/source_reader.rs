@@ -39,6 +39,16 @@ pub trait SourceReader: Send {
     fn open(&mut self) -> ReaderFuture<'_, ()>;
     fn poll_next(&mut self) -> ReaderFuture<'_, PollResult<Self::Output>>;
     fn snapshot_state(&mut self) -> ReaderFuture<'_, Vec<u8>>;
+
+    /// Notified when checkpoint `checkpoint_id` is durably persisted and
+    /// its sink commits completed (Java: `CheckpointListener#notifyCheckpointComplete`).
+    /// Sources that track external positions (e.g. a Kafka consumer group)
+    /// commit them here instead of inside `snapshot_state`, so an aborted
+    /// checkpoint never advances the external position.
+    fn notify_checkpoint_complete(&mut self, _checkpoint_id: u64) -> ReaderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn add_splits(&mut self, splits: Vec<Self::Split>);
     fn handle_no_more_splits(&mut self);
     fn close(&mut self) -> ReaderFuture<'_, ()>;

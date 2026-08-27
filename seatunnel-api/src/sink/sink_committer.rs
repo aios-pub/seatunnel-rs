@@ -18,6 +18,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
+/// Boxed future returned by async [`SinkCommitter`] operations.
+pub type CommitterFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
 pub trait SinkCommitter: Send {
     type CommitInfo: serde::Serialize + Send + Sync;
     type AggregatedCommitInfo: serde::Serialize + Send + Sync;
@@ -25,9 +28,6 @@ pub trait SinkCommitter: Send {
     fn commit(
         &mut self,
         commit_infos: Vec<Self::CommitInfo>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Self::AggregatedCommitInfo>> + '_>>;
-    fn abort(
-        &mut self,
-        commit_infos: Vec<Self::CommitInfo>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>>;
+    ) -> CommitterFuture<'_, Self::AggregatedCommitInfo>;
+    fn abort(&mut self, commit_infos: Vec<Self::CommitInfo>) -> CommitterFuture<'_, ()>;
 }
