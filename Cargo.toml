@@ -11,6 +11,7 @@ members = [
     "seatunnel-transforms",
     "seatunnel-cli",
     "seatunnel-macros",
+    "seatunnel-web",
     "seatunnel-e2e",
     "seatunnel-connectors/seatunnel-connector-common",
     "seatunnel-connectors/seatunnel-connector-kafka",
@@ -21,16 +22,19 @@ members = [
     "seatunnel-connectors/seatunnel-connector-jdbc",
     "seatunnel-connectors/seatunnel-connector-redis",
     "seatunnel-connectors/seatunnel-connector-elasticsearch",
+    "seatunnel-connectors/seatunnel-connector-rabbitmq",
+    "seatunnel-connectors/seatunnel-connector-http",
+    "seatunnel-connectors/seatunnel-connector-clickhouse",
     "seatunnel-benchmarks",
 ]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 license = "Apache-2.0"
 authors = ["SeaTunnel Rust Team <dev@seatunnel.apache.org>"]
-repository = "https://github.com/apache/seatunnel-rs"
-homepage = "https://seatunnel.apache.org"
+repository = "https://github.com/aios-pub/seatunnel-rs"
+homepage = "https://aios.pub/setunnel-rs"
 
 [workspace.dependencies]
 # Async runtime
@@ -52,13 +56,14 @@ tonic-build = "0.12"
 prost-build = "0.13"
 
 # HTTP / REST
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rust-embed = "8"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Logging & Metrics
 tracing = "0.1"
@@ -66,7 +71,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chron
 prometheus = "0.13"
 
 # Database
-mysql_async = { version = "0.34", features = ["native-tls-tls", "binlog"] }
+mysql_async = { version = "0.37", features = ["binlog","default-rustls"] }
 
 tokio-postgres = "0.7"
 postgres-types = "0.2"
@@ -76,6 +81,12 @@ rustcdc = { version = "0.12", default-features = false, features = ["postgres"] 
 
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster", "cluster-async"] }
+
+# RabbitMQ (AMQP)
+lapin = "4"
+
+# ClickHouse
+clickhouse = { version = "0.15", features = ["rustls-tls-ring", "rustls-tls-webpki-roots"] }
 
 # TiDB / TiKV
 tikv-client = "0.4"
@@ -137,6 +148,7 @@ seatunnel-formats = { path = "seatunnel-formats" }
 seatunnel-transforms = { path = "seatunnel-transforms" }
 seatunnel-cli = { path = "seatunnel-cli" }
 seatunnel-macros = { path = "seatunnel-macros" }
+seatunnel-web = { path = "seatunnel-web" }
 seatunnel-connector-common = { path = "seatunnel-connectors/seatunnel-connector-common" }
 seatunnel-connector-kafka = { path = "seatunnel-connectors/seatunnel-connector-kafka" }
 seatunnel-connector-cdc-base = { path = "seatunnel-connectors/seatunnel-connector-cdc-base" }
@@ -146,6 +158,9 @@ seatunnel-connector-cdc-postgres = { path = "seatunnel-connectors/seatunnel-conn
 seatunnel-connector-jdbc = { path = "seatunnel-connectors/seatunnel-connector-jdbc" }
 seatunnel-connector-redis = { path = "seatunnel-connectors/seatunnel-connector-redis" }
 seatunnel-connector-elasticsearch = { path = "seatunnel-connectors/seatunnel-connector-elasticsearch" }
+seatunnel-connector-rabbitmq = { path = "seatunnel-connectors/seatunnel-connector-rabbitmq" }
+seatunnel-connector-http = { path = "seatunnel-connectors/seatunnel-connector-http" }
+seatunnel-connector-clickhouse = { path = "seatunnel-connectors/seatunnel-connector-clickhouse" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
