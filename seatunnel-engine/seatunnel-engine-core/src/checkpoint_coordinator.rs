@@ -215,7 +215,7 @@ impl CheckpointCoordinator {
     pub fn last_completed(&self) -> Option<&CompletedCheckpoint> {
         self.completed_checkpoints
             .iter()
-            .max_by_key(|(&id, _)| id)
+            .max_by_key(|(id, _)| **id)
             .map(|(_, v)| v)
     }
 

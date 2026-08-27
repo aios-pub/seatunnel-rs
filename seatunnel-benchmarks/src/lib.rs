@@ -25,13 +25,13 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use seatunnel_api::{
+    ColumnType,
     row::{Row, RowKind},
     schema::{ColumnDef, TableSchema},
-    ColumnType,
 };
 use seatunnel_formats::MessageFormat;
 
@@ -60,7 +60,7 @@ fn make_row(rng: &mut SmallRng) -> Row {
         seatunnel_api::Field::String(format!("{}@example.com", rng.gen_range(0..100_000))),
     );
     row.set(3, seatunnel_api::Field::Float64(rng.gen_range(0.0..100.0)));
-    row.set(4, seatunnel_api::Field::Bool(rng.gen()));
+    row.set(4, seatunnel_api::Field::Bool(rng.r#gen()));
     row
 }
 

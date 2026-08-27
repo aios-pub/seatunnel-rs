@@ -68,9 +68,9 @@ pub type BoxedSinkWriter =
 /// Type-erased 2PC committer operating on JSON-serialized commit infos.
 pub type BoxedSinkCommitter = Box<
     dyn seatunnel_api::sink::sink_committer::SinkCommitter<
-        CommitInfo = Vec<u8>,
-        AggregatedCommitInfo = serde_json::Value,
-    >,
+            CommitInfo = Vec<u8>,
+            AggregatedCommitInfo = serde_json::Value,
+        >,
 >;
 
 /// Adapts a typed [`SinkCommitter`] to the byte-serialized engine surface,
@@ -516,11 +516,7 @@ impl Transform for FilterByIndexTransform {
                     },
                     _ => false,
                 };
-                if self.op == CompareOp::Eq {
-                    eq
-                } else {
-                    !eq
-                }
+                if self.op == CompareOp::Eq { eq } else { !eq }
             }
             CompareOp::Gt | CompareOp::Lt | CompareOp::Gte | CompareOp::Lte => {
                 let (Some(a), Some(b)) = (
@@ -820,6 +816,82 @@ pub fn create_source(
                 Err(anyhow::anyhow!("Elasticsearch connector not compiled in"))
             }
         }
+        "rabbitmq" | "rabbitmqsource" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_rabbitmq::{RabbitMqConfig, RabbitMqSourceReader};
+                let cfg = RabbitMqConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: RabbitMQ source queue={} at {}:{} vhost={}",
+                    cfg.queue_name,
+                    cfg.host,
+                    cfg.port,
+                    cfg.virtual_host
+                );
+                // Position restore is implicit: unacked deliveries are
+                // redelivered by the broker after a restart.
+                let _ = restore_state;
+                Ok(Box::new(ReaderAdapter {
+                    inner: RabbitMqSourceReader::new(cfg),
+                    warned_splits: false,
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("RabbitMQ connector not compiled in"))
+            }
+        }
+        "http" | "httpsource" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_http::{HttpSourceConfig, HttpSourceReader};
+                let cfg = HttpSourceConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: HTTP source {} {} (poll={}ms)",
+                    cfg.method,
+                    cfg.url,
+                    cfg.poll_interval_ms
+                );
+                let _ = restore_state;
+                Ok(Box::new(ReaderAdapter {
+                    inner: HttpSourceReader::new(cfg),
+                    warned_splits: false,
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("HTTP connector not compiled in"))
+            }
+        }
+        "clickhouse" | "clickhousesource" | "chsource" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_clickhouse::{ClickHouseConfig, ClickHouseSourceReader};
+                let cfg = ClickHouseConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: ClickHouse source {} ({})",
+                    cfg.qualified_table(),
+                    cfg.url
+                );
+                let mut reader = ClickHouseSourceReader::new(cfg);
+                if let Some(bytes) = restore_state {
+                    reader
+                        .restore_from_state_bytes(bytes)
+                        .map_err(|e| anyhow::anyhow!("restore ClickHouse source state: {}", e))?;
+                }
+                Ok(Box::new(ReaderAdapter {
+                    inner: reader,
+                    warned_splits: false,
+                }))
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                let _ = (parallelism, restore_state);
+                Err(anyhow::anyhow!("ClickHouse connector not compiled in"))
+            }
+        }
         "fake" | "fake source" | "fakesource" => {
             let _ = (parallelism, restore_state);
             let total = config
@@ -861,7 +933,9 @@ pub fn create_sink_with_restore(
         "kafka" | "kafkasink" => {
             #[cfg(feature = "connectors")]
             {
-                use seatunnel_connector_kafka::{KafkaSinkConfig, KafkaSinkCommitter, KafkaSinkWriter};
+                use seatunnel_connector_kafka::{
+                    KafkaSinkCommitter, KafkaSinkConfig, KafkaSinkWriter,
+                };
                 let cfg = KafkaSinkConfig::from_config(&conn);
                 tracing::info!(
                     "factory: Kafka sink topic={} brokers={} acks={} txn={}",
@@ -983,6 +1057,86 @@ pub fn create_sink_with_restore(
                 Err(anyhow::anyhow!("Elasticsearch connector not compiled in"))
             }
         }
+        "rabbitmq" | "rabbitmqsink" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_rabbitmq::{RabbitMqConfig, RabbitMqSinkWriter};
+                let cfg = RabbitMqConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: RabbitMQ sink exchange='{}' routing_key='{}' at {}:{} (confirm={})",
+                    cfg.exchange,
+                    if cfg.routing_key.is_empty() {
+                        &cfg.queue_name
+                    } else {
+                        &cfg.routing_key
+                    },
+                    cfg.host,
+                    cfg.port,
+                    cfg.publisher_confirm
+                );
+                let mut writer = RabbitMqSinkWriter::new(cfg);
+                if let Some(bytes) = restore {
+                    let _ = writer.restore_from_state_bytes(bytes);
+                }
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter { inner: writer }),
+                    committer: None,
+                })
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                Err(anyhow::anyhow!("RabbitMQ connector not compiled in"))
+            }
+        }
+        "http" | "httpsink" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_http::{HttpSinkConfig, HttpSinkWriter};
+                let cfg = HttpSinkConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: HTTP sink {} {} (batch-size={})",
+                    cfg.method,
+                    cfg.url,
+                    cfg.batch_size
+                );
+                let mut writer = HttpSinkWriter::new(cfg, None);
+                if let Some(bytes) = restore {
+                    let _ = writer.restore_from_state_bytes(bytes);
+                }
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter { inner: writer }),
+                    committer: None,
+                })
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                Err(anyhow::anyhow!("HTTP connector not compiled in"))
+            }
+        }
+        "clickhouse" | "clickhousesink" | "chsink" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_clickhouse::{ClickHouseConfig, ClickHouseSinkWriter};
+                let cfg = ClickHouseConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: ClickHouse sink {} ({})",
+                    cfg.qualified_table(),
+                    cfg.url
+                );
+                let mut writer = ClickHouseSinkWriter::new(cfg, None);
+                if let Some(bytes) = restore {
+                    let _ = writer.restore_from_state_bytes(bytes);
+                }
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter { inner: writer }),
+                    committer: None,
+                })
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                Err(anyhow::anyhow!("ClickHouse connector not compiled in"))
+            }
+        }
         "console" | "consolesink" | "" => Ok(SinkPipeline {
             writer: Box::new(SinkWriterAdapter {
                 inner: ConsoleSinkWriter::new("[console] "),
@@ -992,7 +1146,6 @@ pub fn create_sink_with_restore(
         other => Err(anyhow::anyhow!("unknown sink plugin '{}'", other)),
     }
 }
-
 
 /// One sink declaration of a pipeline: plugin name + its config object.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1005,7 +1158,9 @@ pub struct SinkDeclaration {
 /// - array of single-key blocks: `[{Kafka: {...}}, {JDBC: {...}}]`
 /// - multi-key map: `{Kafka: {...}, JDBC: {...}}` (order not guaranteed)
 /// - a single block map (legacy `sink:` shape)
-pub fn parse_sink_declarations(section: &serde_json::Value) -> anyhow::Result<Vec<SinkDeclaration>> {
+pub fn parse_sink_declarations(
+    section: &serde_json::Value,
+) -> anyhow::Result<Vec<SinkDeclaration>> {
     let blocks: Vec<serde_json::Value> = match section {
         serde_json::Value::Array(items) => items.clone(),
         serde_json::Value::Object(_) => vec![section.clone()],
@@ -1069,8 +1224,10 @@ pub fn create_sink_pipeline(
         writers.push((name.clone(), pipeline.writer));
         committers.push((name, pipeline.committer));
     }
-    let mux: BoxedSinkWriter =
-        Box::new(crate::fanout::FanoutSinkWriter::new(writers, failure_policy));
+    let mux: BoxedSinkWriter = Box::new(crate::fanout::FanoutSinkWriter::new(
+        writers,
+        failure_policy,
+    ));
     let committer = crate::fanout::FanoutCommitter::new(committers)
         .map(|committer| Box::new(committer) as BoxedSinkCommitter);
     Ok(SinkPipeline {
@@ -1114,7 +1271,7 @@ pub fn create_transforms(configs: &[serde_json::Value]) -> anyhow::Result<Vec<Bo
                 return Err(anyhow::anyhow!(
                     "unknown transform plugin '{}' (supported: filter)",
                     other
-                ))
+                ));
             }
         }
     }

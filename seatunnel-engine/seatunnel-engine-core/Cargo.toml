@@ -31,6 +31,9 @@ seatunnel-connector-jdbc = { path = "../../seatunnel-connectors/seatunnel-connec
 seatunnel-connector-kafka = { path = "../../seatunnel-connectors/seatunnel-connector-kafka", optional = true }
 seatunnel-connector-redis = { path = "../../seatunnel-connectors/seatunnel-connector-redis", optional = true }
 seatunnel-connector-elasticsearch = { path = "../../seatunnel-connectors/seatunnel-connector-elasticsearch", optional = true }
+seatunnel-connector-rabbitmq = { path = "../../seatunnel-connectors/seatunnel-connector-rabbitmq", optional = true }
+seatunnel-connector-http = { path = "../../seatunnel-connectors/seatunnel-connector-http", optional = true }
+seatunnel-connector-clickhouse = { path = "../../seatunnel-connectors/seatunnel-connector-clickhouse", optional = true }
 
 [features]
 default = ["connectors"]
@@ -43,6 +46,9 @@ connectors = [
     "dep:seatunnel-connector-kafka",
     "dep:seatunnel-connector-redis",
     "dep:seatunnel-connector-elasticsearch",
+    "dep:seatunnel-connector-rabbitmq",
+    "dep:seatunnel-connector-http",
+    "dep:seatunnel-connector-clickhouse",
 ]
 connector-mysql = ["connectors"]
 connector-postgres = ["connectors"]
