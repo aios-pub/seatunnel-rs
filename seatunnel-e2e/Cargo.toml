@@ -11,6 +11,11 @@ name = "e2e"
 path = "tests/e2e.rs"
 harness = true
 
+[[test]]
+name = "checkpoint_recovery"
+path = "tests/checkpoint_recovery.rs"
+harness = true
+
 [dependencies]
 tokio = { workspace = true }
 tokio-stream = "0.1"
