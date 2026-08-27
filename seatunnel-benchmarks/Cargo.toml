@@ -12,4 +12,9 @@ seatunnel-formats = { path = "../seatunnel-formats" }
 seatunnel-connector-kafka = { path = "../seatunnel-connectors/seatunnel-connector-kafka" }
 tokio = { workspace = true }
 criterion = "0.5"
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
+anyhow = { workspace = true }
+mysql_async = { workspace = true }
+rdkafka = { workspace = true }
+serde_json = { workspace = true }
+seatunnel-engine-core = { path = "../seatunnel-engine/seatunnel-engine-core" }

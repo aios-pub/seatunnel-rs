@@ -1,0 +1,11 @@
+{
+  "batch": 1,
+  "databases": 2,
+  "elapsed_sec": 120.054238667,
+  "failed": 0,
+  "rows": 179475,
+  "rows_per_sec": 1494.9492995230107,
+  "tables": 250,
+  "target_rate": 2000.0,
+  "workers": 8
+}

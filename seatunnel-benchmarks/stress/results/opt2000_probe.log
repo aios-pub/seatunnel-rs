@@ -1,0 +1,207 @@
+stress-probe[opt2000]: subscribed to opt2000_a1,opt2000_a2,opt2000_b1,opt2000_b2 (group stress-probe-opt2000-1787802815397)
+stress-probe[opt2000] PROGRESS t=    5s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[11565, 10594, 11308, 10355]
+stress-probe[opt2000] PROGRESS t=   10s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[22021, 20992, 21841, 20838]
+stress-probe[opt2000] PROGRESS t=   15s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   20s total_load=514 window(5s): n=514 avg=85.2ms max=108ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   25s total_load=17813 window(5s): n=17299 avg=77.2ms max=114ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   30s total_load=34329 window(5s): n=16516 avg=80.1ms max=131ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   35s total_load=44018 window(5s): n=9689 avg=128.5ms max=583ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   40s total_load=56803 window(5s): n=12785 avg=83.3ms max=145ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   45s total_load=69305 window(5s): n=12502 avg=110.2ms max=446ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   50s total_load=79213 window(5s): n=9908 avg=117.9ms max=638ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   55s total_load=90451 window(5s): n=11238 avg=86.8ms max=397ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   60s total_load=107219 window(5s): n=16768 avg=80.5ms max=155ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   65s total_load=124185 window(5s): n=16966 avg=78.9ms max=123ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   70s total_load=139281 window(5s): n=15096 avg=93.1ms max=560ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   75s total_load=156347 window(5s): n=17066 avg=77.1ms max=122ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   80s total_load=168662 window(5s): n=12315 avg=115.2ms max=516ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   85s total_load=182452 window(5s): n=13790 avg=100.8ms max=518ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   90s total_load=196373 window(5s): n=13921 avg=105.3ms max=515ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=   95s total_load=210537 window(5s): n=14164 avg=104.6ms max=528ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  100s total_load=222089 window(5s): n=11552 avg=120.0ms max=669ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  105s total_load=239466 window(5s): n=17377 avg=85.2ms max=473ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  110s total_load=256004 window(5s): n=16538 avg=79.6ms max=211ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  115s total_load=271793 window(5s): n=15789 avg=102.1ms max=743ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  120s total_load=290109 window(5s): n=18316 avg=78.6ms max=216ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  125s total_load=306967 window(5s): n=16858 avg=79.0ms max=276ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  130s total_load=325011 window(5s): n=18044 avg=74.7ms max=120ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  135s total_load=342448 window(5s): n=17437 avg=78.3ms max=135ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  140s total_load=358950 window(5s): n=16502 avg=80.6ms max=207ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  145s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  150s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  155s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  160s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  165s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  170s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  175s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  180s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  185s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  191s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000] PROGRESS t=  196s total_load=358950 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt2000]: idle exit
+{
+  "elapsed_sec": 200.541565,
+  "overall": {
+    "avg_ms": 90.01417467613874,
+    "load_count": 358950,
+    "max_ms": 743,
+    "p50_ms": 82,
+    "p90_ms": 111,
+    "p95_ms": 158,
+    "p999_ms": 552,
+    "p99_ms": 328
+  },
+  "per_topic": {
+    "opt2000_a1": {
+      "avg_ms": 85.43908934899373,
+      "load_count": 89738,
+      "max_ms": 667,
+      "p50_ms": 81,
+      "p90_ms": 107,
+      "p95_ms": 126,
+      "p999_ms": 509,
+      "p99_ms": 285,
+      "snapshot_count": 25000
+    },
+    "opt2000_a2": {
+      "avg_ms": 94.08220597740087,
+      "load_count": 89738,
+      "max_ms": 667,
+      "p50_ms": 84,
+      "p90_ms": 118,
+      "p95_ms": 184,
+      "p999_ms": 551,
+      "p99_ms": 395,
+      "snapshot_count": 25000
+    },
+    "opt2000_b1": {
+      "avg_ms": 85.98612612411826,
+      "load_count": 89737,
+      "max_ms": 669,
+      "p50_ms": 80,
+      "p90_ms": 107,
+      "p95_ms": 130,
+      "p999_ms": 513,
+      "p99_ms": 299,
+      "snapshot_count": 25000
+    },
+    "opt2000_b2": {
+      "avg_ms": 94.54928290448755,
+      "load_count": 89737,
+      "max_ms": 743,
+      "p50_ms": 84,
+      "p90_ms": 127,
+      "p95_ms": 180,
+      "p999_ms": 665,
+      "p99_ms": 400,
+      "snapshot_count": 25000
+    }
+  },
+  "series_10s": [
+    {
+      "avg_ms": 78.64900662251655,
+      "count": 32918,
+      "max_ms": 131,
+      "p99_ms": 109,
+      "t_sec": 20
+    },
+    {
+      "avg_ms": 102.08500021884711,
+      "count": 22847,
+      "max_ms": 583,
+      "p99_ms": 445,
+      "t_sec": 30
+    },
+    {
+      "avg_ms": 113.21117764471057,
+      "count": 22545,
+      "max_ms": 638,
+      "p99_ms": 419,
+      "t_sec": 40
+    },
+    {
+      "avg_ms": 83.78624631268437,
+      "count": 27120,
+      "max_ms": 397,
+      "p99_ms": 147,
+      "t_sec": 50
+    },
+    {
+      "avg_ms": 85.79318529623036,
+      "count": 32019,
+      "max_ms": 560,
+      "p99_ms": 216,
+      "t_sec": 60
+    },
+    {
+      "avg_ms": 90.07093279709393,
+      "count": 30832,
+      "max_ms": 516,
+      "p99_ms": 311,
+      "t_sec": 70
+    },
+    {
+      "avg_ms": 102.63082463089665,
+      "count": 27770,
+      "max_ms": 518,
+      "p99_ms": 407,
+      "t_sec": 80
+    },
+    {
+      "avg_ms": 107.85645035183737,
+      "count": 25580,
+      "max_ms": 564,
+      "p99_ms": 500,
+      "t_sec": 90
+    },
+    {
+      "avg_ms": 87.36953926220725,
+      "count": 32665,
+      "max_ms": 669,
+      "p99_ms": 387,
+      "t_sec": 100
+    },
+    {
+      "avg_ms": 90.19762588437287,
+      "count": 33781,
+      "max_ms": 743,
+      "p99_ms": 500,
+      "t_sec": 110
+    },
+    {
+      "avg_ms": 76.72955956925531,
+      "count": 35102,
+      "max_ms": 276,
+      "p99_ms": 109,
+      "t_sec": 120
+    },
+    {
+      "avg_ms": 78.69781824428792,
+      "count": 34926,
+      "max_ms": 207,
+      "p99_ms": 117,
+      "t_sec": 130
+    },
+    {
+      "avg_ms": 104.96686390532544,
+      "count": 845,
+      "max_ms": 195,
+      "p99_ms": 190,
+      "t_sec": 140
+    }
+  ],
+  "snapshot_counts": [
+    25000,
+    25000,
+    25000,
+    25000
+  ],
+  "tag": "opt2000",
+  "topics": [
+    "opt2000_a1",
+    "opt2000_a2",
+    "opt2000_b1",
+    "opt2000_b2"
+  ],
+  "total_load_messages": 358950
+}

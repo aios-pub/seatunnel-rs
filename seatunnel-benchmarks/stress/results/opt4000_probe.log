@@ -1,0 +1,236 @@
+stress-probe[opt4000]: subscribed to opt4000_a1,opt4000_a2,opt4000_b1,opt4000_b2 (group stress-probe-opt4000-1787803154749)
+stress-probe[opt4000] PROGRESS t=    5s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[243, 254, 233, 248]
+stress-probe[opt4000] PROGRESS t=   10s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[541, 554, 519, 551]
+stress-probe[opt4000] PROGRESS t=   15s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[809, 829, 778, 825]
+stress-probe[opt4000] PROGRESS t=   20s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[1251, 1277, 1199, 1283]
+stress-probe[opt4000] PROGRESS t=   25s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[1548, 1583, 1481, 1597]
+stress-probe[opt4000] PROGRESS t=   30s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[2088, 2140, 2002, 2149]
+stress-probe[opt4000] PROGRESS t=   35s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[2557, 2607, 2455, 2625]
+stress-probe[opt4000] PROGRESS t=   40s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[3185, 3243, 3046, 3255]
+stress-probe[opt4000] PROGRESS t=   45s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[3890, 3938, 3713, 3970]
+stress-probe[opt4000] PROGRESS t=   50s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[4281, 4339, 4086, 4392]
+stress-probe[opt4000] PROGRESS t=   55s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[4819, 4877, 4584, 4951]
+stress-probe[opt4000] PROGRESS t=   60s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[5307, 5364, 5053, 5448]
+stress-probe[opt4000] PROGRESS t=   65s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[8035, 8199, 7582, 8278]
+stress-probe[opt4000] PROGRESS t=   70s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[20747, 21098, 19583, 20593]
+stress-probe[opt4000] PROGRESS t=   75s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=   80s total_load=29031 window(5s): n=29031 avg=440.3ms max=700ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=   85s total_load=64844 window(5s): n=35813 avg=666.6ms max=1527ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=   90s total_load=100100 window(5s): n=35256 avg=1418.4ms max=2380ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=   95s total_load=134492 window(5s): n=34392 avg=1854.7ms max=3004ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  100s total_load=169393 window(5s): n=34901 avg=2262.1ms max=3760ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  105s total_load=205807 window(5s): n=36414 avg=2664.4ms max=4357ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  110s total_load=240483 window(5s): n=34676 avg=3116.5ms max=5174ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  115s total_load=275697 window(5s): n=35214 avg=3778.8ms max=5955ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  120s total_load=310656 window(5s): n=34959 avg=4182.0ms max=6663ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  125s total_load=344779 window(5s): n=34123 avg=4775.5ms max=7461ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  130s total_load=379800 window(5s): n=35021 avg=5130.3ms max=8256ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  135s total_load=413163 window(5s): n=33363 avg=5984.0ms max=9210ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  140s total_load=451080 window(5s): n=37917 avg=6312.2ms max=9527ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  145s total_load=481983 window(5s): n=30903 avg=6730.0ms max=10839ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  150s total_load=515370 window(5s): n=33387 avg=7828.0ms max=11800ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  155s total_load=550853 window(5s): n=35483 avg=8202.7ms max=12494ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  160s total_load=579826 window(5s): n=28973 avg=9032.3ms max=13778ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  165s total_load=610602 window(5s): n=30776 avg=10288.9ms max=14959ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  170s total_load=643782 window(5s): n=33180 avg=10937.2ms max=15973ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  175s total_load=682917 window(5s): n=39135 avg=11205.8ms max=16172ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  180s total_load=712758 window(5s): n=29841 avg=11177.9ms max=17015ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  185s total_load=741587 window(5s): n=28829 avg=12859.6ms max=18535ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  190s total_load=778201 window(5s): n=36614 avg=13350.5ms max=18964ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  195s total_load=807119 window(5s): n=28918 avg=14093.7ms max=20545ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  200s total_load=848352 window(5s): n=41233 avg=14693.1ms max=20852ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  205s total_load=886872 window(5s): n=38520 avg=14723.9ms max=20110ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  210s total_load=913766 window(5s): n=26894 avg=17598.2ms max=19088ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  215s total_load=922256 window(5s): n=8490 avg=16422.1ms max=16982ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  220s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  225s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  230s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  235s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  240s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  245s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  250s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  255s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  260s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  265s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000] PROGRESS t=  270s total_load=922256 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[opt4000]: idle exit
+{
+  "elapsed_sec": 272.818122708,
+  "overall": {
+    "avg_ms": 7613.832763354209,
+    "load_count": 922256,
+    "max_ms": 20852,
+    "p50_ms": 6509,
+    "p90_ms": 17599,
+    "p95_ms": 19163,
+    "p999_ms": 20818,
+    "p99_ms": 20419
+  },
+  "per_topic": {
+    "opt4000_a1": {
+      "avg_ms": 4784.283509134123,
+      "load_count": 230564,
+      "max_ms": 9970,
+      "p50_ms": 4057,
+      "p90_ms": 9157,
+      "p95_ms": 9522,
+      "p999_ms": 9947,
+      "p99_ms": 9820,
+      "snapshot_count": 25000
+    },
+    "opt4000_a2": {
+      "avg_ms": 4258.662388751062,
+      "load_count": 230564,
+      "max_ms": 9427,
+      "p50_ms": 3523,
+      "p90_ms": 8591,
+      "p95_ms": 8973,
+      "p999_ms": 9413,
+      "p99_ms": 9310,
+      "snapshot_count": 25000
+    },
+    "opt4000_b1": {
+      "avg_ms": 11015.409235613539,
+      "load_count": 230564,
+      "max_ms": 20852,
+      "p50_ms": 10965,
+      "p90_ms": 19520,
+      "p95_ms": 20259,
+      "p999_ms": 20834,
+      "p99_ms": 20776,
+      "snapshot_count": 25000
+    },
+    "opt4000_b2": {
+      "avg_ms": 10396.975919918114,
+      "load_count": 230564,
+      "max_ms": 20323,
+      "p50_ms": 10259,
+      "p90_ms": 18962,
+      "p95_ms": 19625,
+      "p999_ms": 20296,
+      "p99_ms": 20231,
+      "snapshot_count": 25000
+    }
+  },
+  "series_10s": [
+    {
+      "avg_ms": 430.80582957971933,
+      "count": 26863,
+      "max_ms": 687,
+      "p99_ms": 676,
+      "t_sec": 70
+    },
+    {
+      "avg_ms": 1012.2091289911316,
+      "count": 71377,
+      "max_ms": 2360,
+      "p99_ms": 2325,
+      "t_sec": 80
+    },
+    {
+      "avg_ms": 2028.9622608569143,
+      "count": 68735,
+      "max_ms": 3711,
+      "p99_ms": 3668,
+      "t_sec": 90
+    },
+    {
+      "avg_ms": 2849.2961045190964,
+      "count": 70877,
+      "max_ms": 5148,
+      "p99_ms": 5110,
+      "t_sec": 100
+    },
+    {
+      "avg_ms": 3955.250581944895,
+      "count": 70883,
+      "max_ms": 6558,
+      "p99_ms": 6481,
+      "t_sec": 110
+    },
+    {
+      "avg_ms": 4916.1765713953755,
+      "count": 68856,
+      "max_ms": 8169,
+      "p99_ms": 7890,
+      "t_sec": 120
+    },
+    {
+      "avg_ms": 6131.662516040782,
+      "count": 70913,
+      "max_ms": 9527,
+      "p99_ms": 9488,
+      "t_sec": 130
+    },
+    {
+      "avg_ms": 7225.90623302026,
+      "count": 64415,
+      "max_ms": 11754,
+      "p99_ms": 11700,
+      "t_sec": 140
+    },
+    {
+      "avg_ms": 8543.636226970808,
+      "count": 65189,
+      "max_ms": 13677,
+      "p99_ms": 13597,
+      "t_sec": 150
+    },
+    {
+      "avg_ms": 10573.832845271072,
+      "count": 63175,
+      "max_ms": 15936,
+      "p99_ms": 15863,
+      "t_sec": 160
+    },
+    {
+      "avg_ms": 11174.04766150145,
+      "count": 70665,
+      "max_ms": 16791,
+      "p99_ms": 16669,
+      "t_sec": 170
+    },
+    {
+      "avg_ms": 13123.839241472802,
+      "count": 64177,
+      "max_ms": 18880,
+      "p99_ms": 18824,
+      "t_sec": 180
+    },
+    {
+      "avg_ms": 14415.706992713207,
+      "count": 69029,
+      "max_ms": 20852,
+      "p99_ms": 20824,
+      "t_sec": 190
+    },
+    {
+      "avg_ms": 15802.936491043993,
+      "count": 66715,
+      "max_ms": 20364,
+      "p99_ms": 20127,
+      "t_sec": 200
+    },
+    {
+      "avg_ms": 16493.830557427555,
+      "count": 10387,
+      "max_ms": 17211,
+      "p99_ms": 17199,
+      "t_sec": 210
+    }
+  ],
+  "snapshot_counts": [
+    25000,
+    25000,
+    25000,
+    25000
+  ],
+  "tag": "opt4000",
+  "topics": [
+    "opt4000_a1",
+    "opt4000_a2",
+    "opt4000_b1",
+    "opt4000_b2"
+  ],
+  "total_load_messages": 922256
+}

@@ -1,0 +1,89 @@
+{
+  "elapsed_sec": 504.1776935,
+  "overall": {
+    "avg_ms": 197925.128,
+    "load_count": 4000,
+    "max_ms": 200534,
+    "p50_ms": 197913,
+    "p90_ms": 199966,
+    "p95_ms": 200220,
+    "p999_ms": 200520,
+    "p99_ms": 200431
+  },
+  "per_topic": {
+    "baseline2000_a1": {
+      "avg_ms": 197870.737,
+      "load_count": 1000,
+      "max_ms": 200416,
+      "p50_ms": 197858,
+      "p90_ms": 199906,
+      "p95_ms": 200160,
+      "p999_ms": 200411,
+      "p99_ms": 200363,
+      "snapshot_count": 25000
+    },
+    "baseline2000_a2": {
+      "avg_ms": 197871.189,
+      "load_count": 1000,
+      "max_ms": 200422,
+      "p50_ms": 197852,
+      "p90_ms": 199912,
+      "p95_ms": 200165,
+      "p999_ms": 200417,
+      "p99_ms": 200369,
+      "snapshot_count": 25000
+    },
+    "baseline2000_b1": {
+      "avg_ms": 197978.204,
+      "load_count": 1000,
+      "max_ms": 200523,
+      "p50_ms": 197972,
+      "p90_ms": 200012,
+      "p95_ms": 200268,
+      "p999_ms": 200519,
+      "p99_ms": 200474,
+      "snapshot_count": 25000
+    },
+    "baseline2000_b2": {
+      "avg_ms": 197980.382,
+      "load_count": 1000,
+      "max_ms": 200534,
+      "p50_ms": 197966,
+      "p90_ms": 200023,
+      "p95_ms": 200280,
+      "p999_ms": 200530,
+      "p99_ms": 200486,
+      "snapshot_count": 25000
+    }
+  },
+  "series_10s": [
+    {
+      "avg_ms": 196313.17050067658,
+      "count": 1478,
+      "max_ms": 197251,
+      "p99_ms": 197224,
+      "t_sec": 430
+    },
+    {
+      "avg_ms": 198869.80412371134,
+      "count": 2522,
+      "max_ms": 200534,
+      "p99_ms": 200468,
+      "t_sec": 440
+    }
+  ],
+  "snapshot_counts": [
+    25000,
+    25000,
+    25000,
+    25000
+  ],
+  "tag": "baseline2000",
+  "topics": [
+    "baseline2000_a1",
+    "baseline2000_a2",
+    "baseline2000_b1",
+    "baseline2000_b2"
+  ],
+  "total_load_messages": 4000
+}

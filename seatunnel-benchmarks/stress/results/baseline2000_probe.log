@@ -1,0 +1,191 @@
+stress-probe[baseline2000]: subscribed to baseline2000_a1,baseline2000_a2,baseline2000_b1,baseline2000_b2 (group stress-probe-baseline2000-1787799024567)
+stress-probe[baseline2000] PROGRESS t=    5s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[209, 209, 213, 206]
+stress-probe[baseline2000] PROGRESS t=   10s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[569, 563, 578, 560]
+stress-probe[baseline2000] PROGRESS t=   15s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[983, 959, 988, 961]
+stress-probe[baseline2000] PROGRESS t=   20s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[1384, 1363, 1398, 1362]
+stress-probe[baseline2000] PROGRESS t=   25s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[1800, 1780, 1815, 1770]
+stress-probe[baseline2000] PROGRESS t=   30s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[2200, 2183, 2225, 2170]
+stress-probe[baseline2000] PROGRESS t=   35s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[2543, 2515, 2568, 2497]
+stress-probe[baseline2000] PROGRESS t=   40s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[2922, 2891, 2950, 2877]
+stress-probe[baseline2000] PROGRESS t=   45s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[3189, 3150, 3214, 3129]
+stress-probe[baseline2000] PROGRESS t=   50s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[3548, 3506, 3578, 3483]
+stress-probe[baseline2000] PROGRESS t=   55s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[3937, 3885, 3968, 3863]
+stress-probe[baseline2000] PROGRESS t=   60s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[4275, 4216, 4296, 4190]
+stress-probe[baseline2000] PROGRESS t=   65s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[4685, 4620, 4706, 4589]
+stress-probe[baseline2000] PROGRESS t=   70s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[5153, 5079, 5174, 5050]
+stress-probe[baseline2000] PROGRESS t=   75s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[5933, 5861, 5958, 5832]
+stress-probe[baseline2000] PROGRESS t=   80s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[6744, 6667, 6765, 6638]
+stress-probe[baseline2000] PROGRESS t=   85s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[7541, 7464, 7565, 7436]
+stress-probe[baseline2000] PROGRESS t=   90s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[8346, 8268, 8370, 8240]
+stress-probe[baseline2000] PROGRESS t=   95s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[8725, 8640, 8754, 8606]
+stress-probe[baseline2000] PROGRESS t=  100s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[9082, 8994, 9109, 8957]
+stress-probe[baseline2000] PROGRESS t=  105s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[9415, 9323, 9448, 9287]
+stress-probe[baseline2000] PROGRESS t=  110s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[9707, 9604, 9740, 9563]
+stress-probe[baseline2000] PROGRESS t=  115s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[10131, 10024, 10171, 9985]
+stress-probe[baseline2000] PROGRESS t=  120s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[10848, 10739, 10887, 10700]
+stress-probe[baseline2000] PROGRESS t=  125s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[11123, 11009, 11167, 10972]
+stress-probe[baseline2000] PROGRESS t=  130s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[11419, 11294, 11461, 11249]
+stress-probe[baseline2000] PROGRESS t=  135s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[11743, 11615, 11792, 11566]
+stress-probe[baseline2000] PROGRESS t=  140s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[12076, 11941, 12120, 11887]
+stress-probe[baseline2000] PROGRESS t=  145s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[12438, 12294, 12480, 12237]
+stress-probe[baseline2000] PROGRESS t=  150s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[12683, 12533, 12733, 12475]
+stress-probe[baseline2000] PROGRESS t=  155s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[13013, 12860, 13067, 12799]
+stress-probe[baseline2000] PROGRESS t=  160s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[13404, 13251, 13464, 13187]
+stress-probe[baseline2000] PROGRESS t=  165s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[13707, 13542, 13763, 13477]
+stress-probe[baseline2000] PROGRESS t=  170s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[14364, 14199, 14418, 14132]
+stress-probe[baseline2000] PROGRESS t=  175s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[15182, 15014, 15237, 14949]
+stress-probe[baseline2000] PROGRESS t=  180s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[15996, 15828, 16051, 15763]
+stress-probe[baseline2000] PROGRESS t=  185s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[16818, 16649, 16873, 16584]
+stress-probe[baseline2000] PROGRESS t=  190s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[17642, 17474, 17700, 17409]
+stress-probe[baseline2000] PROGRESS t=  195s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[18466, 18299, 18526, 18232]
+stress-probe[baseline2000] PROGRESS t=  200s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[19281, 19113, 19341, 19045]
+stress-probe[baseline2000] PROGRESS t=  205s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[20060, 19894, 20119, 19823]
+stress-probe[baseline2000] PROGRESS t=  210s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[20861, 20692, 20920, 20621]
+stress-probe[baseline2000] PROGRESS t=  215s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[21672, 21502, 21726, 21431]
+stress-probe[baseline2000] PROGRESS t=  220s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[22485, 22313, 22538, 22244]
+stress-probe[baseline2000] PROGRESS t=  225s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[23318, 23146, 23373, 23077]
+stress-probe[baseline2000] PROGRESS t=  230s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[24081, 23907, 24132, 23837]
+stress-probe[baseline2000] PROGRESS t=  235s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[24913, 24737, 24965, 24667]
+stress-probe[baseline2000] PROGRESS t=  240s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  245s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  250s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  255s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  260s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  265s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  270s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  275s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  280s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  285s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  290s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  295s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  300s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  305s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  310s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  315s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  320s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  325s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  330s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  335s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  340s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  345s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  350s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  355s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  360s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  366s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  371s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  376s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  381s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  386s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  391s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  396s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  401s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  406s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  411s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  416s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  421s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  426s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  431s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  436s total_load=0 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  441s total_load=2287 window(5s): n=2287 avg=196826.5ms max=198303ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  446s total_load=4000 window(5s): n=1713 avg=199391.9ms max=200534ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  451s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  456s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  461s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  466s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  471s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  476s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  481s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  486s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  491s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  496s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000] PROGRESS t=  501s total_load=4000 window(5s): n=0 avg=0.0ms max=0ms snapshot=[25000, 25000, 25000, 25000]
+stress-probe[baseline2000]: idle exit
+{
+  "elapsed_sec": 504.1776935,
+  "overall": {
+    "avg_ms": 197925.128,
+    "load_count": 4000,
+    "max_ms": 200534,
+    "p50_ms": 197913,
+    "p90_ms": 199966,
+    "p95_ms": 200220,
+    "p999_ms": 200520,
+    "p99_ms": 200431
+  },
+  "per_topic": {
+    "baseline2000_a1": {
+      "avg_ms": 197870.737,
+      "load_count": 1000,
+      "max_ms": 200416,
+      "p50_ms": 197858,
+      "p90_ms": 199906,
+      "p95_ms": 200160,
+      "p999_ms": 200411,
+      "p99_ms": 200363,
+      "snapshot_count": 25000
+    },
+    "baseline2000_a2": {
+      "avg_ms": 197871.189,
+      "load_count": 1000,
+      "max_ms": 200422,
+      "p50_ms": 197852,
+      "p90_ms": 199912,
+      "p95_ms": 200165,
+      "p999_ms": 200417,
+      "p99_ms": 200369,
+      "snapshot_count": 25000
+    },
+    "baseline2000_b1": {
+      "avg_ms": 197978.204,
+      "load_count": 1000,
+      "max_ms": 200523,
+      "p50_ms": 197972,
+      "p90_ms": 200012,
+      "p95_ms": 200268,
+      "p999_ms": 200519,
+      "p99_ms": 200474,
+      "snapshot_count": 25000
+    },
+    "baseline2000_b2": {
+      "avg_ms": 197980.382,
+      "load_count": 1000,
+      "max_ms": 200534,
+      "p50_ms": 197966,
+      "p90_ms": 200023,
+      "p95_ms": 200280,
+      "p999_ms": 200530,
+      "p99_ms": 200486,
+      "snapshot_count": 25000
+    }
+  },
+  "series_10s": [
+    {
+      "avg_ms": 196313.17050067658,
+      "count": 1478,
+      "max_ms": 197251,
+      "p99_ms": 197224,
+      "t_sec": 430
+    },
+    {
+      "avg_ms": 198869.80412371134,
+      "count": 2522,
+      "max_ms": 200534,
+      "p99_ms": 200468,
+      "t_sec": 440
+    }
+  ],
+  "snapshot_counts": [
+    25000,
+    25000,
+    25000,
+    25000
+  ],
+  "tag": "baseline2000",
+  "topics": [
+    "baseline2000_a1",
+    "baseline2000_a2",
+    "baseline2000_b1",
+    "baseline2000_b2"
+  ],
+  "total_load_messages": 4000
+}
