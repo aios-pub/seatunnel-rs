@@ -63,6 +63,9 @@ pub enum EsDataSaveMode {
     AppendData,
     DropData,
     ErrorWhenDataExists,
+    /// Run the user-supplied `custom-processing-query` (a query DSL passed
+    /// to `_delete_by_query`) instead of the blanket match_all delete.
+    CustomProcessing,
 }
 
 /// Elasticsearch configuration (source + sink).
@@ -84,6 +87,13 @@ pub struct EsConfig {
     pub query: Option<String>,
     pub schema_save_mode: EsSchemaSaveMode,
     pub data_save_mode: EsDataSaveMode,
+    /// Query DSL executed via `_delete_by_query` when data-save-mode is
+    /// CUSTOM_PROCESSING (Java `DataSaveMode.CUSTOM_PROCESSING`).
+    pub custom_processing_query: Option<String>,
+    /// Whether Delete/UpdateBefore rows are sent as bulk delete actions.
+    /// The Java connector defaults this to false; this implementation
+    /// keeps deletes enabled to preserve its historical behavior.
+    pub enable_doc_delete: bool,
 }
 
 impl Default for EsConfig {
@@ -102,6 +112,8 @@ impl Default for EsConfig {
             query: None,
             schema_save_mode: EsSchemaSaveMode::CreateWhenNotExist,
             data_save_mode: EsDataSaveMode::AppendData,
+            custom_processing_query: None,
+            enable_doc_delete: true,
         }
     }
 }
@@ -117,6 +129,7 @@ impl EsConfig {
         let parse_data_mode = |s: &str| match s.to_lowercase().replace(['-', '_'], "").as_str() {
             "dropdata" => EsDataSaveMode::DropData,
             "errorwhendataexists" => EsDataSaveMode::ErrorWhenDataExists,
+            "customprocessing" => EsDataSaveMode::CustomProcessing,
             _ => EsDataSaveMode::AppendData,
         };
         EsConfig {
@@ -157,10 +170,17 @@ impl EsConfig {
                 "schema-save-mode",
                 &config.get_string("schema_save_mode", ""),
             )),
-            data_save_mode: parse_data_mode(&config.get_string(
-                "data-save-mode",
-                &config.get_string("data_save_mode", ""),
-            )),
+            data_save_mode: parse_data_mode(
+                &config.get_string("data-save-mode", &config.get_string("data_save_mode", "")),
+            ),
+            custom_processing_query: {
+                let q = config.get_string(
+                    "custom-processing-query",
+                    &config.get_string("custom_processing_query", ""),
+                );
+                (!q.is_empty()).then_some(q)
+            },
+            enable_doc_delete: config.get_bool("enable-doc-delete", true),
         }
     }
 }
@@ -201,7 +221,9 @@ impl EsClient {
     }
 
     fn next_host(&self) -> &str {
-        let idx = self.host_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let idx = self
+            .host_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         &self.hosts[idx % self.hosts.len()]
     }
 
@@ -215,7 +237,9 @@ impl EsClient {
         let mut attempts = 0u32;
         loop {
             let host = self.next_host();
-            let mut builder = self.http.request(method.clone(), format!("{}{}", host, path));
+            let mut builder = self
+                .http
+                .request(method.clone(), format!("{}{}", host, path));
             if let Some(auth) = &self.auth_header {
                 builder = builder.header("Authorization", auth);
             }
@@ -228,8 +252,7 @@ impl EsClient {
             let status = resp.status();
             let text = resp.text().await?;
             // Retry server-side / rate-limit failures only.
-            if (status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS)
-                && attempts < 2
+            if (status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS) && attempts < 2
             {
                 attempts += 1;
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -240,11 +263,17 @@ impl EsClient {
     }
 
     pub async fn index_exists(&self, index: &str) -> anyhow::Result<bool> {
-        let (status, _) = self.request(Method::HEAD, &format!("/{}", index), None, "").await?;
+        let (status, _) = self
+            .request(Method::HEAD, &format!("/{}", index), None, "")
+            .await?;
         Ok(status == StatusCode::OK)
     }
 
-    pub async fn create_index(&self, index: &str, mappings: serde_json::Value) -> anyhow::Result<()> {
+    pub async fn create_index(
+        &self,
+        index: &str,
+        mappings: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let body = serde_json::json!({ "mappings": mappings });
         let (status, text) = self
             .request(
@@ -295,19 +324,29 @@ impl EsClient {
             return Ok(());
         }
         let (status, text) = self
-            .request(Method::POST, "/_bulk", Some(ndjson.to_string()), "application/x-ndjson")
+            .request(
+                Method::POST,
+                "/_bulk",
+                Some(ndjson.to_string()),
+                "application/x-ndjson",
+            )
             .await?;
         if !status.is_success() {
             anyhow::bail!("_bulk failed ({}): {}", status, text);
         }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if value.get("errors").and_then(|e| e.as_bool()).unwrap_or(false) {
-                let first = value
-                    .pointer("/items/0")
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
-                anyhow::bail!("_bulk reported item-level errors: {}", first);
-            }
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+        let has_item_errors = parsed
+            .as_ref()
+            .and_then(|value| value.get("errors"))
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false);
+        if has_item_errors {
+            let first = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/items/0"))
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            anyhow::bail!("_bulk reported item-level errors: {}", first);
         }
         Ok(())
     }
@@ -325,6 +364,16 @@ impl EsClient {
 
     pub async fn delete_by_query(&self, index: &str) -> anyhow::Result<()> {
         let body = serde_json::json!({ "query": { "match_all": {} } });
+        self.delete_by_query_with(index, body).await
+    }
+
+    /// Delete documents matching a user-supplied query DSL body (the full
+    /// `_delete_by_query` request body).
+    pub async fn delete_by_query_with(
+        &self,
+        index: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<()> {
         let (status, text) = self
             .request(
                 Method::POST,
@@ -348,8 +397,9 @@ impl EsClient {
         size: usize,
     ) -> anyhow::Result<(Option<String>, Vec<serde_json::Value>)> {
         let query_dsl: serde_json::Value = match query {
-            Some(q) => serde_json::from_str(q)
-                .map_err(|e| anyhow::anyhow!("invalid query DSL: {}", e))?,
+            Some(q) => {
+                serde_json::from_str(q).map_err(|e| anyhow::anyhow!("invalid query DSL: {}", e))?
+            }
             None => serde_json::json!({ "match_all": {} }),
         };
         let body = serde_json::json!({ "size": size, "query": query_dsl });
@@ -365,7 +415,10 @@ impl EsClient {
             anyhow::bail!("scroll search on {} failed ({}): {}", index, status, text);
         }
         let value: serde_json::Value = serde_json::from_str(&text)?;
-        let scroll_id = value.get("_scroll_id").and_then(|s| s.as_str()).map(String::from);
+        let scroll_id = value
+            .get("_scroll_id")
+            .and_then(|s| s.as_str())
+            .map(String::from);
         let hits = extract_hits(&value);
         Ok((scroll_id, hits))
     }
@@ -423,8 +476,12 @@ pub fn es_property(column_type: &ColumnType) -> serde_json::Value {
         ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 => {
             serde_json::json!({ "type": "integer" })
         }
-        ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::Int64
-        | ColumnType::UInt64 | ColumnType::Duration => serde_json::json!({ "type": "long" }),
+        ColumnType::UInt8
+        | ColumnType::UInt16
+        | ColumnType::UInt32
+        | ColumnType::Int64
+        | ColumnType::UInt64
+        | ColumnType::Duration => serde_json::json!({ "type": "long" }),
         ColumnType::Float32 => serde_json::json!({ "type": "float" }),
         ColumnType::Float64 | ColumnType::Decimal { .. } => {
             serde_json::json!({ "type": "double" })
@@ -493,12 +550,8 @@ fn field_to_json(field: &Field) -> serde_json::Value {
         Field::DateTime(dt) => serde_json::Value::String(dt.to_string()),
         Field::TimestampTz(ts) => serde_json::Value::String(ts.to_rfc3339()),
         Field::Duration(ns) => (*ns).into(),
-        Field::Array(items) => {
-            serde_json::Value::Array(items.iter().map(field_to_json).collect())
-        }
-        Field::Row(fields) => serde_json::Value::Array(
-            fields.iter().map(field_to_json).collect(),
-        ),
+        Field::Array(items) => serde_json::Value::Array(items.iter().map(field_to_json).collect()),
+        Field::Row(fields) => serde_json::Value::Array(fields.iter().map(field_to_json).collect()),
     }
 }
 
@@ -511,7 +564,10 @@ fn document_id(row: &Row, key_fields: &[String], delimiter: &str) -> Option<Stri
     let mut parts = Vec::with_capacity(key_fields.len());
     for selector in key_fields {
         let field = if let Some(ordinal) = selector.strip_prefix('#') {
-            ordinal.parse::<usize>().ok().and_then(|i| row.fields.get(i))
+            ordinal
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| row.fields.get(i))
         } else {
             selector
                 .strip_prefix('f')
@@ -533,6 +589,10 @@ pub struct EsSinkWriter {
     client: Option<EsClient>,
     /// Field names from the provided schema (positional rows otherwise).
     field_names: Option<Vec<String>>,
+    /// (`database_or_schema`, `table`) from the upstream table identifier;
+    /// fills the `${database_name}`/`${schema_name}`/`${table_name}` index
+    /// template placeholders (Java IndexTemplate).
+    table_parts: Option<(String, String)>,
     buffer: Vec<Row>,
     written: u64,
     save_mode_applied: bool,
@@ -540,11 +600,20 @@ pub struct EsSinkWriter {
 
 impl EsSinkWriter {
     pub fn new(config: EsConfig, schema: Option<TableSchema>) -> Self {
-        let field_names = schema.map(|s| s.columns.iter().map(|c| c.name.clone()).collect());
+        let field_names = schema
+            .as_ref()
+            .map(|s| s.columns.iter().map(|c| c.name.clone()).collect());
+        // Identifiers look like "database.table" / "schema.table".
+        let table_parts = schema.and_then(|s| {
+            s.table_identifier
+                .rsplit_once('.')
+                .map(|(head, table)| (head.to_string(), table.to_string()))
+        });
         EsSinkWriter {
             config,
             client: None,
             field_names,
+            table_parts,
             buffer: Vec::new(),
             written: 0,
             save_mode_applied: false,
@@ -553,17 +622,24 @@ impl EsSinkWriter {
 
     fn resolve_index(&self, row: Option<&Row>) -> String {
         let mut index = self.config.index.clone();
-        if let Some(row) = row {
-            if index.contains("${") {
-                for i in 0..row.field_count() {
-                    let placeholder = format!("${{f{}}}", i);
-                    let value = match row.get(i) {
-                        Field::String(s) => s.clone(),
-                        Field::Null => String::new(),
-                        other => format!("{}", other),
-                    };
-                    index = index.replace(&placeholder, &value);
-                }
+        if let Some((namespace, table)) = &self.table_parts {
+            index = index
+                .replace("${database_name}", namespace)
+                .replace("${schema_name}", namespace)
+                .replace("${table_name}", table);
+        }
+        let Some(row) = row else {
+            return index;
+        };
+        if index.contains("${") {
+            for i in 0..row.field_count() {
+                let placeholder = format!("${{f{}}}", i);
+                let value = match row.get(i) {
+                    Field::String(s) => s.clone(),
+                    Field::Null => String::new(),
+                    other => format!("{}", other),
+                };
+                index = index.replace(&placeholder, &value);
             }
         }
         index
@@ -600,8 +676,27 @@ impl EsSinkWriter {
             _ => {}
         }
         match self.config.data_save_mode {
-            EsDataSaveMode::DropData if exists || self.config.schema_save_mode != EsSchemaSaveMode::Ignore => {
+            EsDataSaveMode::DropData
+                if exists || self.config.schema_save_mode != EsSchemaSaveMode::Ignore =>
+            {
                 client.delete_by_query(&index).await?;
+            }
+            EsDataSaveMode::CustomProcessing
+                if exists || self.config.schema_save_mode != EsSchemaSaveMode::Ignore =>
+            {
+                let dsl = self
+                    .config
+                    .custom_processing_query
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "data-save-mode CUSTOM_PROCESSING requires 'custom-processing-query'"
+                        )
+                    })?;
+                let query: serde_json::Value = serde_json::from_str(dsl)
+                    .map_err(|e| anyhow::anyhow!("invalid custom-processing-query DSL: {}", e))?;
+                client.delete_by_query_with(&index, query).await?;
+                tracing::info!("ES sink: custom processing deleted documents on {}", index);
             }
             EsDataSaveMode::ErrorWhenDataExists if exists => {
                 let count = client.count(&index).await?;
@@ -643,10 +738,7 @@ impl EsSinkWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let sample_fields = self
-            .buffer
-            .first()
-            .map(|row| row.fields.clone());
+        let sample_fields = self.buffer.first().map(|row| row.fields.clone());
         let sample = sample_fields.as_ref().map(|fields| {
             let mut row = Row::new(RowKind::Insert, fields.len());
             for (i, f) in fields.iter().enumerate() {
@@ -694,18 +786,24 @@ impl EsSinkWriter {
                         }
                     }
                 }
-                RowKind::Delete | RowKind::UpdateBefore => match id {
-                    Some(id) => {
-                        body.push_str(
-                            &serde_json::json!({ "delete": { "_index": index, "_id": id } })
-                                .to_string(),
-                        );
-                        body.push('\n');
+                RowKind::Delete | RowKind::UpdateBefore => {
+                    if !self.config.enable_doc_delete {
+                        tracing::debug!("ES sink: doc delete disabled; delete row skipped");
+                        continue;
                     }
-                    None => {
-                        tracing::warn!("ES sink: delete without primary key skipped");
+                    match id {
+                        Some(id) => {
+                            body.push_str(
+                                &serde_json::json!({ "delete": { "_index": index, "_id": id } })
+                                    .to_string(),
+                            );
+                            body.push('\n');
+                        }
+                        None => {
+                            tracing::warn!("ES sink: delete without primary key skipped");
+                        }
                     }
-                },
+                }
             }
         }
 
@@ -816,7 +914,9 @@ impl SinkWriter for EsSinkWriter {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let written = self.written;
         Box::pin(async move {
-            Ok(serde_json::to_vec(&serde_json::json!({ "written": written }))?)
+            Ok(serde_json::to_vec(
+                &serde_json::json!({ "written": written }),
+            )?)
         })
     }
 
@@ -855,14 +955,14 @@ impl SinkWriter for EsSinkWriter {
                                 _ => continue,
                             };
                             let mut props = serde_json::Map::new();
-                            props.insert(
-                                column.name.clone(),
-                                es_property(&column.column_type),
-                            );
+                            props.insert(column.name.clone(), es_property(&column.column_type));
                             client
                                 .update_mapping(&index, serde_json::Value::Object(props))
                                 .await?;
-                            tracing::info!("ES sink: mapping updated with column '{}'", column.name);
+                            tracing::info!(
+                                "ES sink: mapping updated with column '{}'",
+                                column.name
+                            );
                         }
                         // Elasticsearch cannot drop fields or change their
                         // mapping type in place.
@@ -872,7 +972,9 @@ impl SinkWriter for EsSinkWriter {
                                 column_name
                             );
                         }
-                        seatunnel_api::SchemaChange::RenameColumn { old_name, new_name, .. } => {
+                        seatunnel_api::SchemaChange::RenameColumn {
+                            old_name, new_name, ..
+                        } => {
                             tracing::warn!(
                                 "ES sink: RENAME COLUMN '{}' -> '{}' cannot be applied to mapping (unsupported by Elasticsearch)",
                                 old_name,
@@ -909,9 +1011,18 @@ impl Sink for EsSink {
         &self,
         _ctx: &SinkWriterContext,
     ) -> anyhow::Result<
-        Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>,
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
     > {
-        Ok(Box::new(EsSinkWriter::new(self.config.clone(), self.schema.clone())))
+        Ok(Box::new(EsSinkWriter::new(
+            self.config.clone(),
+            self.schema.clone(),
+        )))
     }
 
     fn restore_writer(
@@ -919,9 +1030,18 @@ impl Sink for EsSink {
         _ctx: &SinkWriterContext,
         _states: &[Vec<u8>],
     ) -> anyhow::Result<
-        Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>,
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
     > {
-        Ok(Box::new(EsSinkWriter::new(self.config.clone(), self.schema.clone())))
+        Ok(Box::new(EsSinkWriter::new(
+            self.config.clone(),
+            self.schema.clone(),
+        )))
     }
 
     fn get_input_schema(&self) -> Option<TableSchema> {
@@ -933,9 +1053,9 @@ impl Sink for EsSink {
     ) -> Option<
         Box<
             dyn seatunnel_api::sink::SinkCommitter<
-                CommitInfo = Self::CommitInfo,
-                AggregatedCommitInfo = Self::AggregatedCommitInfo,
-            >,
+                    CommitInfo = Self::CommitInfo,
+                    AggregatedCommitInfo = Self::AggregatedCommitInfo,
+                >,
         >,
     > {
         None
@@ -983,7 +1103,10 @@ impl EsSourceReader {
 
 fn hit_to_row(hit: &serde_json::Value) -> Row {
     let id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("");
-    let source = hit.get("_source").cloned().unwrap_or(serde_json::Value::Null);
+    let source = hit
+        .get("_source")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let mut fields: Vec<Field> = vec![Field::String(id.to_string())];
     match &source {
         serde_json::Value::Object(map) => {
@@ -1054,7 +1177,11 @@ impl SourceReader for EsSourceReader {
                 return Ok(PollResult::Record(hit_to_row(&hit)));
             }
             if self.done || !self.opened {
-                return Ok(if self.done { PollResult::EOF } else { PollResult::Empty });
+                return Ok(if self.done {
+                    PollResult::EOF
+                } else {
+                    PollResult::Empty
+                });
             }
             let Some(client) = &self.client else {
                 return Ok(PollResult::EOF);
@@ -1063,14 +1190,18 @@ impl SourceReader for EsSourceReader {
                 self.done = true;
                 return Ok(PollResult::EOF);
             };
-            let hits = client.scroll_next(&scroll_id, &self.config.scroll_time).await?;
+            let hits = client
+                .scroll_next(&scroll_id, &self.config.scroll_time)
+                .await?;
             if hits.is_empty() {
                 client.scroll_close(&scroll_id).await;
                 self.done = true;
                 return Ok(PollResult::EOF);
             }
             self.hits.extend(hits);
-            Ok(PollResult::Record(hit_to_row(&self.hits.pop_front().expect("non-empty"))))
+            Ok(PollResult::Record(hit_to_row(
+                &self.hits.pop_front().expect("non-empty"),
+            )))
         })
     }
 
@@ -1078,9 +1209,7 @@ impl SourceReader for EsSourceReader {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let done = self.done;
-        Box::pin(async move {
-            Ok(serde_json::to_vec(&serde_json::json!({ "done": done }))?)
-        })
+        Box::pin(async move { Ok(serde_json::to_vec(&serde_json::json!({ "done": done }))?) })
     }
 
     fn add_splits(&mut self, _splits: Vec<Self::Split>) {}
@@ -1154,7 +1283,9 @@ mod tests {
             serde_json::json!({ "type": "keyword" })
         );
         assert_eq!(
-            es_property(&ColumnType::Array { element_type: Box::new(ColumnType::Int32) }),
+            es_property(&ColumnType::Array {
+                element_type: Box::new(ColumnType::Int32)
+            }),
             serde_json::json!({ "type": "integer" })
         );
     }
@@ -1191,7 +1322,10 @@ mod tests {
         assert_eq!(config.index, "users_idx");
         assert_eq!(config.primary_keys, vec!["f0".to_string()]);
         assert_eq!(config.batch_size, 50);
-        assert_eq!(config.schema_save_mode, EsSchemaSaveMode::CreateWhenNotExist);
+        assert_eq!(
+            config.schema_save_mode,
+            EsSchemaSaveMode::CreateWhenNotExist
+        );
     }
 
     #[test]
@@ -1205,5 +1339,53 @@ mod tests {
         assert_eq!(row.get(0), &Field::String("42".to_string()));
         assert_eq!(row.get(1), &Field::Int64(30));
         assert_eq!(row.get(2), &Field::String("alice".to_string()));
+    }
+
+    #[test]
+    fn test_java_parity_options() {
+        let props: std::collections::HashMap<String, String> = [
+            ("hosts", "es1:9200"),
+            ("index", "${database_name}_v1"),
+            ("data-save-mode", "CUSTOM_PROCESSING"),
+            (
+                "custom-processing-query",
+                r#"{"query": {"term": {"stale": true}}}"#,
+            ),
+            ("enable-doc-delete", "false"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = EsConfig::from_config(&ConnectorConfig::new(props));
+        assert_eq!(config.data_save_mode, EsDataSaveMode::CustomProcessing);
+        assert!(config.custom_processing_query.is_some());
+        assert!(!config.enable_doc_delete);
+    }
+
+    #[test]
+    fn test_index_placeholders_from_schema() {
+        let schema = TableSchema::new(
+            "shop.orders",
+            vec![ColumnDef::new("id".to_string(), ColumnType::Int64)],
+        );
+        let props: std::collections::HashMap<String, String> =
+            [("index", "${database_name}-${table_name}")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let writer = EsSinkWriter::new(
+            EsConfig::from_config(&ConnectorConfig::new(props)),
+            Some(schema),
+        );
+        assert_eq!(writer.resolve_index(None), "shop-orders");
+
+        let props: std::collections::HashMap<String, String> =
+            [("index", "${schema_name}.${table_name}")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let writer = EsSinkWriter::new(EsConfig::from_config(&ConnectorConfig::new(props)), None);
+        // No schema propagated: placeholders stay literal.
+        assert_eq!(writer.resolve_index(None), "${schema_name}.${table_name}");
     }
 }
