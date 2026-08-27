@@ -691,6 +691,10 @@ pub struct KafkaSinkConfig {
     pub format: MessageFormat,
     pub acks: String,
     pub batch_size: usize,
+    /// Max time a partial batch may wait before it is flushed. Without a
+    /// linger, records under low traffic would sit in the buffer until the
+    /// batch fills (or a checkpoint/EOF flush), which is unbounded latency.
+    pub batch_timeout_ms: u64,
     /// When true a transactional producer is used: records are produced
     /// inside `begin_transaction()` … `commit_transaction()` windows aligned
     /// with checkpoint boundaries (exactly-once for downstream consumers
@@ -716,6 +720,7 @@ impl Default for KafkaSinkConfig {
             format: MessageFormat::Json,
             acks: "all".to_string(),
             batch_size: 100,
+            batch_timeout_ms: 100,
             transactions_enabled: false,
             transactional_id: None,
             message_timeout_ms: 30_000,
@@ -741,6 +746,9 @@ impl KafkaSinkConfig {
                 .unwrap_or(MessageFormat::Json),
             acks: config.get_string("acks", "all"),
             batch_size: config.get_int("batch.size", 1000).max(1) as usize,
+            batch_timeout_ms: config
+                .get_int("batch.timeout.ms", config.get_int("linger.ms", 100))
+                .max(0) as u64,
             transactions_enabled: tx_enabled,
             transactional_id: config.get("transactional.id").cloned().or_else(|| {
                 if tx_enabled {
@@ -881,6 +889,8 @@ pub struct KafkaSinkWriter {
     batch: Vec<Row>,
     total_written: usize,
     producer: Option<FutureProducer>,
+    /// When the last flush happened; drives the `batch.timeout.ms` linger.
+    last_flush: std::time::Instant,
     /// Stateful canal-client encoder (row pairing + filtering + keys).
     canal_encoder: Option<seatunnel_formats::canal_client_json::CanalClientEncoder>,
 }
@@ -898,6 +908,7 @@ impl KafkaSinkWriter {
             batch: Vec::new(),
             total_written: 0,
             producer: None,
+            last_flush: std::time::Instant::now(),
             canal_encoder,
         })
     }
@@ -920,7 +931,13 @@ impl KafkaSinkWriter {
                 "message.timeout.ms",
                 self.config.message_timeout_ms.to_string(),
             )
-            .set("acks", &self.config.acks);
+            .set("acks", &self.config.acks)
+            // librdkafka's default linger (5ms) interacts badly with
+            // proxied/NAT'd broker links (e.g. docker port-forwarding),
+            // degrading pipelined produce to ~1 message per linger window.
+            // Batch without the artificial delay and let TCP stack coalesce.
+            .set("linger.ms", "0")
+            .set("socket.nagle.disable", "true");
         if self.config.transactions_enabled {
             let tx_id = self
                 .config
@@ -944,6 +961,7 @@ impl KafkaSinkWriter {
 
     /// Deliver buffered records to Kafka, optionally inside a transaction.
     async fn flush_batch(&mut self) -> anyhow::Result<usize> {
+        self.last_flush = std::time::Instant::now();
         self.ensure_producer()?;
         let producer = match &self.producer {
             Some(p) => p.clone(),
@@ -1031,33 +1049,34 @@ impl KafkaSinkWriter {
         }
 
         let topic = self.config.topic.clone();
+        let timeout = Duration::from_millis(self.config.message_timeout_ms);
         let mut sent = 0usize;
         let mut failures = Vec::new();
-        for record in &records {
-            let payload = encode_row(record, &self.config.format, &self.config.field_delimiter);
-            let message = FutureRecord::<str, str>::to(&topic).payload(&payload);
-            match row_key(record, &self.config.partition_key_fields) {
-                Some(key) => {
-                    match producer
-                        .send(
-                            message.key(key.as_str()),
-                            Duration::from_millis(self.config.message_timeout_ms),
-                        )
-                        .await
-                    {
-                        Ok(_) => sent += 1,
-                        Err((e, _)) => failures.push(e.to_string()),
-                    }
-                }
-                None => {
-                    match producer
-                        .send(message, Duration::from_millis(self.config.message_timeout_ms))
-                        .await
-                    {
-                        Ok(_) => sent += 1,
-                        Err((e, _)) => failures.push(e.to_string()),
-                    }
-                }
+        // Enqueue every record first (librdkafka batches internally), then
+        // await the delivery reports. Awaiting each send serializes a
+        // broker round trip per record; pipelining keeps the producer
+        // queue full so batches actually form.
+        let payloads: Vec<String> = records
+            .iter()
+            .map(|record| encode_row(record, &self.config.format, &self.config.field_delimiter))
+            .collect();
+        let keys: Vec<Option<String>> = records
+            .iter()
+            .map(|record| row_key(record, &self.config.partition_key_fields))
+            .collect();
+        let mut deliveries = Vec::with_capacity(payloads.len());
+        for (payload, key) in payloads.iter().zip(keys.iter()) {
+            let message = FutureRecord::<str, str>::to(&topic).payload(payload.as_str());
+            let message = match key {
+                Some(key) => message.key(key.as_str()),
+                None => message,
+            };
+            deliveries.push(producer.send(message, timeout));
+        }
+        for delivery in deliveries {
+            match delivery.await {
+                Ok(_) => sent += 1,
+                Err((e, _)) => failures.push(e.to_string()),
             }
         }
 
@@ -1114,11 +1133,14 @@ impl SinkWriter for KafkaSinkWriter {
         &mut self,
         record: Self::Input,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
-        // Buffer the record; delivery happens at batch size or prepare_commit.
+        // Buffer the record; delivery happens at batch size, when the
+        // `batch.timeout.ms` linger elapses, or at prepare_commit/close.
         self.batch.push(record);
         let full = self.batch.len() >= self.config.batch_size;
+        let linger_due =
+            self.last_flush.elapsed() >= Duration::from_millis(self.config.batch_timeout_ms);
         Box::pin(async move {
-            if full {
+            if full || linger_due {
                 self.flush_batch().await?;
             }
             Ok(())
@@ -1153,6 +1175,20 @@ impl SinkWriter for KafkaSinkWriter {
             "pending": self.batch.len(),
         });
         Box::pin(async move { serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e)) })
+    }
+
+    fn poll_flush(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        // Flush the tail of a partial batch once the linger elapsed; without
+        // this, records buffered at the end of a burst wait for the next
+        // write or a checkpoint boundary.
+        let due = !self.batch.is_empty()
+            && self.last_flush.elapsed() >= Duration::from_millis(self.config.batch_timeout_ms);
+        Box::pin(async move {
+            if due {
+                self.flush_batch().await?;
+            }
+            Ok(())
+        })
     }
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
