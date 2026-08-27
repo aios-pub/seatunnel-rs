@@ -703,6 +703,14 @@ pub struct MySqlCdcReader {
     binlog_stream: Option<Pin<Box<BinlogStream>>>,
     /// Changes decoded from binlog events awaiting emission (ordered).
     binlog_buffer: VecDeque<BufferedChange>,
+    /// Checkpoint replay boundary: the position AFTER the XID of the last
+    /// transaction whose rows were all emitted to the engine. Resuming
+    /// here never skips buffered/un-emitted rows and never lands inside a
+    /// transaction (a mid-transaction dump start cannot decode rows).
+    safe_boundary: Option<BinlogOffset>,
+    /// Position where the current binlog dump started; fallback boundary
+    /// before the first transaction completes.
+    dump_start: Option<BinlogOffset>,
     /// Buffered rows from the current snapshot batch.
     snapshot_buffer: VecDeque<SeatunnelRow>,
     /// Cached table map events keyed by table id.
@@ -737,6 +745,8 @@ impl MySqlCdcReader {
             max_snapshot_pk: i64::MIN,
             binlog_stream: None,
             binlog_buffer: VecDeque::new(),
+            safe_boundary: None,
+            dump_start: None,
             snapshot_buffer: VecDeque::new(),
             table_maps: HashMap::new(),
             stream_broken: false,
@@ -941,6 +951,9 @@ impl MySqlCdcReader {
                 Ok(stream) => {
                     self.binlog_stream = Some(Box::pin(stream));
                     self.stream_broken = false;
+                    // Fallback checkpoint boundary until the first
+                    // transaction completes.
+                    self.dump_start = Some(self.offset.clone());
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -1083,6 +1096,14 @@ impl MySqlCdcReader {
             EventData::RowsEvent(rows) => self.absorb_rows_event(rows),
             EventData::QueryEvent(qe) => self.observe_query_event(&qe),
             EventData::RotateEvent(_) => self.track_rotation(&event),
+            EventData::XidEvent(_) if self.binlog_buffer.is_empty() => {
+                // Transaction committed. self.offset was already advanced
+                // to the position AFTER this XID at the top of absorb_event,
+                // so an empty replay buffer means every row of this (and
+                // all earlier) transactions was emitted — the position is a
+                // safe resume boundary.
+                self.safe_boundary = Some(self.offset.clone());
+            }
             _ => {}
         }
     }
@@ -1092,7 +1113,12 @@ impl MySqlCdcReader {
     fn track_rotation(&mut self, event: &Event) {
         if let Ok(Some(EventData::RotateEvent(re))) = event.read_data() {
             let name = re.name().to_string();
-            if !name.is_empty() {
+            if !name.is_empty() && name != self.offset.file {
+                // Positions in the old file are meaningless in the new one;
+                // the new file's start (re.position) is itself a safe
+                // between-transactions boundary.
+                self.safe_boundary = None;
+                self.dump_start = None;
                 self.offset.file = name;
                 self.offset.position = re.position();
             }
@@ -1497,7 +1523,17 @@ impl SourceReader for MySqlCdcReader {
     fn snapshot_state(
         &mut self,
     ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
-        let mut offset = self.offset.to_hashmap();
+        // Checkpoint boundary correctness: report the last transaction
+        // boundary whose rows were all EMITTED. self.offset tracks the
+        // stream position, which can be ahead (decoded rows still sit in
+        // the replay buffer, and their transaction may be uncommitted);
+        // restoring from an ahead position would silently skip them.
+        let boundary = self
+            .safe_boundary
+            .clone()
+            .or_else(|| self.dump_start.clone())
+            .unwrap_or_else(|| self.offset.clone());
+        let mut offset = boundary.to_hashmap();
         offset.insert(
             "current_idx".to_string(),
             self.current_idx.get().to_string(),
