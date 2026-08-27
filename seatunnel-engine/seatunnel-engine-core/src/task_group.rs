@@ -30,7 +30,7 @@
 //!      any completed checkpoint replays at least once without losing records.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use seatunnel_api::row::Row;
 use seatunnel_api::schema::TableSchema;
@@ -94,6 +94,17 @@ impl TaskContext {
     }
 }
 
+/// Live status publish interval for the shared `TaskStatus`. Locking the
+/// status mutex on every record dominated the hot loop; observers only need
+/// a near-real-time view (the exact final count is published on exit).
+const STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Idle backoff schedule after `PollResult::Empty`. The first miss yields
+/// immediately (data often arrives within the same scheduler tick), then
+/// sleeps escalate to a small cap so idle CPU stays bounded without adding
+/// fixed latency when traffic resumes.
+const IDLE_BACKOFF_MS: [u64; 5] = [1, 2, 5, 10, 20];
+
 /// The main task execution group over type-erased connectors.
 pub struct TaskGroup {
     context: TaskContext,
@@ -105,6 +116,8 @@ pub struct TaskGroup {
     records_processed: u64,
     checkpoints_completed: u64,
     last_checkpoint_at: Option<i64>,
+    last_status_publish: Option<Instant>,
+    empty_streak: u32,
 }
 
 impl TaskGroup {
@@ -120,6 +133,8 @@ impl TaskGroup {
             records_processed: 0,
             checkpoints_completed: 0,
             last_checkpoint_at: None,
+            last_status_publish: None,
+            empty_streak: 0,
         }
     }
 
@@ -180,12 +195,10 @@ impl TaskGroup {
 
             match self.reader.poll_next().await {
                 Ok(PollResult::Record(output)) => {
+                    self.empty_streak = 0;
                     let rows = self.apply_transforms(output)?;
                     self.records_processed += rows.len() as u64;
-                    {
-                        let mut status = self.status.lock().await;
-                        status.processed_records = self.records_processed;
-                    }
+                    self.publish_status_throttled().await;
                     for row in rows {
                         self.sink.write(row).await?;
                     }
@@ -208,7 +221,18 @@ impl TaskGroup {
                     }
                 }
                 Ok(PollResult::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    // Give buffering sinks a chance to flush tail records
+                    // (linger-based flush), then back off adaptively.
+                    self.sink.poll_flush().await?;
+                    match self.empty_streak {
+                        0 => tokio::task::yield_now().await,
+                        n => {
+                            let delay =
+                                IDLE_BACKOFF_MS[(n as usize - 1).min(IDLE_BACKOFF_MS.len() - 1)];
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                    }
+                    self.empty_streak = self.empty_streak.saturating_add(1);
                 }
                 Ok(PollResult::EOF) => break,
                 Err(e) => {
@@ -264,6 +288,23 @@ impl TaskGroup {
         );
 
         Ok(self.status.lock().await.clone())
+    }
+
+    /// Publish the processed-records counter to the shared status at most
+    /// every [`STATUS_PUBLISH_INTERVAL`]; the exact final count is written
+    /// once at task exit.
+    async fn publish_status_throttled(&mut self) {
+        let now = Instant::now();
+        let due = match self.last_status_publish {
+            Some(last) => now.duration_since(last) >= STATUS_PUBLISH_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_status_publish = Some(now);
+        let records = self.records_processed;
+        self.status.lock().await.processed_records = records;
     }
 
     /// Trigger a checkpoint when the configured interval has elapsed.

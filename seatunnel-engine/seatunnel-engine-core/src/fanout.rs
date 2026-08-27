@@ -93,13 +93,31 @@ enum SinkCommand {
 /// diagnostics.
 type SinkErrors = Arc<Mutex<HashMap<String, String>>>;
 
+/// How long a fan-out worker waits for a command before nudging the inner
+/// writer's idle flush (`SinkWriter::poll_flush`).
+const FANOUT_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
 async fn run_sink_worker(
     name: String,
     mut writer: BoxedSinkWriter,
     mut rx: mpsc::Receiver<SinkCommand>,
     errors: SinkErrors,
 ) {
-    while let Some(command) = rx.recv().await {
+    loop {
+        let command = match tokio::time::timeout(FANOUT_IDLE_TICK, rx.recv()).await {
+            Ok(Some(command)) => command,
+            Ok(None) => break, // multiplexer dropped the channel
+            Err(_) => {
+                // Idle tick: flush tail records whose linger has elapsed so
+                // they do not wait for the next write or checkpoint.
+                if let Err(e) = writer.poll_flush().await {
+                    tracing::error!("fan-out sink '{}' idle flush failed: {}", name, e);
+                    errors.lock().await.insert(name.clone(), e.to_string());
+                    break;
+                }
+                continue;
+            }
+        };
         let result: anyhow::Result<()> = match command {
             SinkCommand::Open(ack) => {
                 let _ = ack.send(writer.open().await);
@@ -305,7 +323,16 @@ impl SinkWriter for FanoutSinkWriter {
 
     fn write(&mut self, record: Self::Input) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
         Box::pin(async move {
-            for idx in self.alive() {
+            // The last live sink receives the record by move; the rest clone.
+            // Scanning backwards also avoids a per-write allocation.
+            let Some(last) = (0..self.handles.len()).rev().find(|i| !self.handles[*i].dead)
+            else {
+                return Ok(());
+            };
+            for idx in 0..last {
+                if self.handles[idx].dead {
+                    continue;
+                }
                 if self.handles[idx]
                     .tx
                     .as_ref()
@@ -316,6 +343,16 @@ impl SinkWriter for FanoutSinkWriter {
                 {
                     self.on_channel_closed(idx)?;
                 }
+            }
+            if self.handles[last]
+                .tx
+                .as_ref()
+                .expect("opened")
+                .send(SinkCommand::Write(record))
+                .await
+                .is_err()
+            {
+                self.on_channel_closed(last)?;
             }
             Ok(())
         })

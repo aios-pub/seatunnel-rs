@@ -188,6 +188,10 @@ where
         let event = event.clone();
         Box::pin(async move { self.inner.apply_schema_change(&event).await })
     }
+
+    fn poll_flush(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.poll_flush().await })
+    }
 }
 
 // ---------------------------------------------------------------------------
