@@ -151,6 +151,7 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
                 version: env!("CARGO_PKG_VERSION").into(),
                 resources: Default::default(),
                 heartbeat_interval_ms: 200,
+                running_task_ids: Vec::new(),
             },
         ))
         .await?;
