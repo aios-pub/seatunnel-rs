@@ -8,6 +8,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use seatunnel_engine_client::EngineClient;
@@ -43,6 +44,14 @@ pub enum Commands {
         /// Parallelism override
         #[arg(long)]
         parallelism: Option<usize>,
+        /// Stable job identity for local checkpointing / restart restore
+        /// (defaults to env.job.id, else a fresh random id)
+        #[arg(long)]
+        job_id: Option<String>,
+        /// Local checkpoint state directory (defaults to
+        /// SEATUNNEL_STATE_DIR, else ./state)
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
         /// Follow the submitted cluster job until it finishes
         #[arg(long, default_value_t = true)]
         watch: bool,
@@ -107,10 +116,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
             mode,
             address,
             parallelism,
+            job_id,
+            state_dir,
             watch,
         }) => {
             if mode == "local" {
-                run_local(config, parallelism).await?;
+                run_local(config, parallelism, job_id, state_dir).await?;
             } else if mode == "cluster" {
                 let job_id = submit_config(&config, &address, None, parallelism).await?;
                 println!("Submitted job {}", job_id);
@@ -153,9 +164,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Run a job fully in-process using the same connector factory as workers.
-async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) -> Result<()> {
+async fn run_local(
+    config_path: PathBuf,
+    parallelism_override: Option<usize>,
+    job_id_override: Option<String>,
+    state_dir_override: Option<PathBuf>,
+) -> Result<()> {
     use seatunnel_engine_core::connector_factory::{
-        create_sinks, create_source, create_transforms, json_to_config_map,
+        create_sink_pipeline, create_source, create_transforms, json_to_config_map,
+    };
+    use seatunnel_engine_core::local_checkpoint::{
+        LocalCheckpointPlan, TaskRegistration, DEFAULT_CHECKPOINT_INTERVAL_MS,
     };
     use seatunnel_engine_core::task_group::{TaskContext, TaskGroup};
 
@@ -177,10 +196,49 @@ async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) ->
             .max(1) as usize
     });
 
+    // Stable job identity: without one, checkpoints cannot be addressed
+    // across restarts, so checkpointing stays on but restore never matches.
+    let job_id = job_id_override
+        .or_else(|| {
+            config
+                .get("env")
+                .and_then(|e| e.get("job"))
+                .and_then(|j| j.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("local-{}", uuid_v4()));
+    let state_root = state_dir_override
+        .or_else(|| std::env::var("SEATUNNEL_STATE_DIR").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("./state"));
+    // env.checkpoint.interval (nested or dotted); 0 disables checkpointing.
+    let checkpoint_interval_ms = config
+        .get("env")
+        .and_then(|env| {
+            let nested = env.get("checkpoint").and_then(|c| match c {
+                serde_json::Value::Number(n) => n.as_u64(),
+                serde_json::Value::Object(m) => m.get("interval").and_then(|i| i.as_u64()),
+                _ => None,
+            });
+            let flat = env.get("checkpoint.interval").and_then(|v| v.as_u64());
+            nested.or(flat)
+        })
+        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL_MS);
+    let checkpointing = checkpoint_interval_ms > 0;
+
     println!("========================================");
     println!("  SeaTunnel Rust v{} (local)", env!("CARGO_PKG_VERSION"));
     println!("  Config: {}", config_path.display());
     println!("  Job: {} × parallelism {}", job_name, parallelism);
+    if checkpointing {
+        println!(
+            "  Checkpoint: every {}ms, state dir {}",
+            checkpoint_interval_ms,
+            state_root.display()
+        );
+    } else {
+        println!("  Checkpoint: disabled (env.checkpoint.interval=0)");
+    }
     println!("========================================");
 
     // Pipelines: explicit `pipelines` array (multi-source / fan-out) or the
@@ -267,34 +325,143 @@ async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) ->
             .join(", ")
     );
 
+    // Checkpoint plan: register every task before spawning so the driver
+    // knows the full task set, and load the restore point if one exists.
+    let mut plan = if checkpointing {
+        let mut plan = LocalCheckpointPlan::new(
+            &state_root,
+            &job_id,
+            std::time::Duration::from_millis(checkpoint_interval_ms),
+        );
+        plan = plan.restore_from_latest()?;
+        if let Some(envelope) = plan.restore_envelope() {
+            println!(
+                "  Restore: job {} from checkpoint {} ({})",
+                job_id,
+                envelope.checkpoint_id,
+                if envelope.is_final { "final" } else { "interval" }
+            );
+        }
+        plan
+    } else {
+        LocalCheckpointPlan::new(&state_root, &job_id, std::time::Duration::from_millis(1))
+    };
+    let restore_envelope = plan.restore_envelope().cloned();
+
+    let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     let transforms_cfg = transform_list(&config);
 
     let mut handles = Vec::new();
-    for (pipe_idx, pipe) in pipelines.iter().enumerate() {
+    for pipe in &pipelines {
         for subtask in 0..pipe.parallelism {
+            let task_id = format!("{}-{}-local-{}", job_name, pipe.name, subtask);
+            let gate = if checkpointing {
+                Some(plan.register(TaskRegistration {
+                    task_id: task_id.clone(),
+                    pipeline: pipe.name.clone(),
+                    subtask,
+                    parallelism: pipe.parallelism,
+                }))
+            } else {
+                None
+            };
+
+            // Reader: restore state comes from the envelope's task entry.
             let mut source_map = json_to_config_map(&pipe.source_cfg);
             source_map.insert("subtask.index".into(), subtask.to_string());
             source_map.insert("subtask.count".into(), pipe.parallelism.to_string());
-            let reader = create_source(&pipe.source_plugin, &source_map, pipe.parallelism, None)
-                .with_context(|| format!("creating source '{}'", pipe.source_plugin))?;
+            let reader_state = restore_envelope
+                .as_ref()
+                .and_then(|e| e.task_state(&pipe.name, subtask))
+                .map(|t| t.reader_state.clone());
+            let reader = create_source(
+                &pipe.source_plugin,
+                &source_map,
+                pipe.parallelism,
+                reader_state.as_deref(),
+            )
+            .with_context(|| format!("creating source '{}'", pipe.source_plugin))?;
             let transforms = create_transforms(&transforms_cfg).context("creating transforms")?;
             let policy =
                 seatunnel_engine_core::fanout::SinkFailurePolicy::parse(&pipe.on_sink_failure);
-            let writer = create_sinks(&pipe.sinks, policy)
+
+            // Sink: namespace transactional ids per job/pipeline/subtask and
+            // restore the writer state (last committed window). Only keys
+            // the user did not set are injected.
+            let writer_state = restore_envelope
+                .as_ref()
+                .and_then(|e| e.task_state(&pipe.name, subtask))
+                .map(|t| t.writer_state.clone());
+            let mut sinks = pipe.sinks.clone();
+            for sink in &mut sinks {
+                if let serde_json::Value::Object(map) = &mut sink.config {
+                    map.entry("job.id")
+                        .or_insert_with(|| serde_json::json!(job_id));
+                    map.entry("pipeline.name")
+                        .or_insert_with(|| serde_json::json!(pipe.name));
+                    map.entry("subtask.index")
+                        .or_insert_with(|| serde_json::json!(subtask));
+                }
+            }
+            let sink_pipeline = create_sink_pipeline(&sinks, policy, writer_state.as_deref())
                 .with_context(|| format!("creating sinks for pipeline '{}'", pipe.name))?;
 
-            let context = TaskContext::new(
-                format!("{}-{}-local-{}", job_name, pipe.name, subtask),
-                format!("local-{}", uuid_v4()),
-                format!("p{}", pipe_idx),
+            let mut context = TaskContext::new(
+                task_id,
+                job_id.clone(),
+                pipe.name.clone(),
                 subtask,
                 pipe.parallelism,
-            );
+            )
+            .with_cancel_token(Arc::clone(&cancel));
+            if let Some(gate) = gate {
+                context = context.with_checkpoint_handle(gate);
+            }
+            let committer = sink_pipeline.committer;
+            let writer = sink_pipeline.writer;
             handles.push(tokio::spawn(async move {
-                let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
+                let mut group = TaskGroup::new(context, reader, writer)
+                    .with_transforms(transforms)
+                    .with_committer(committer);
                 group.run().await
             }));
         }
+    }
+    let _ = &pipelines;
+
+    // Checkpoint driver + graceful shutdown on SIGINT/SIGTERM.
+    let driver_join = if checkpointing {
+        let driver = plan.build();
+        let shutdown = shutdown.clone();
+        Some(tokio::spawn(driver.run(shutdown, Arc::clone(&cancel))))
+    } else {
+        None
+    };
+    {
+        let shutdown = shutdown.clone();
+        let cancel = Arc::clone(&cancel);
+        let has_driver = driver_join.is_some();
+        tokio::spawn(async move {
+            let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+            let mut sigterm = match sigterm {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            println!("shutdown signal received, stopping gracefully...");
+            // Without a checkpoint driver, cancel the tasks directly; with
+            // one, the driver takes a final checkpoint first and then
+            // cancels the tasks itself.
+            if !has_driver {
+                cancel.cancel();
+            }
+            shutdown.cancel();
+        });
     }
 
     let mut failures = Vec::new();
@@ -307,6 +474,11 @@ async fn run_local(config_path: PathBuf, parallelism_override: Option<usize>) ->
         if let Some(err) = &status.error {
             failures.push(err.clone());
         }
+    }
+    if let Some(join) = driver_join {
+        join.await
+            .context("checkpoint driver panicked")?
+            .context("checkpoint driver failed")?;
     }
     if !failures.is_empty() {
         bail!("local run failed: {}", failures.join("; "));
@@ -624,7 +796,7 @@ sink:
             "env:\n  job.name: cli-test\nsource:\n  Fake:\n    row.num: 2\nsink:\n  Console:\n"
         )
         .unwrap();
-        let result = run_local(PathBuf::from("/tmp/st-cli-local.yaml"), None).await;
+        let result = run_local(PathBuf::from("/tmp/st-cli-local.yaml"), None, None, None).await;
         assert!(result.is_ok(), "{result:?}");
         fs::remove_file("/tmp/st-cli-local.yaml").ok();
     }
