@@ -45,10 +45,11 @@ use std::sync::Arc;
 
 use seatunnel_api::row::Row;
 use seatunnel_api::schema::SchemaChangeEvent;
+use seatunnel_api::sink::sink_committer::SinkCommitter;
 use seatunnel_api::sink::sink_writer::SinkWriter;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::connector_factory::BoxedSinkWriter;
+use crate::connector_factory::{BoxedSinkCommitter, BoxedSinkWriter};
 
 /// Bounded per-sink buffer; a slow sink backpressures the reader only
 /// after this many queued commands.
@@ -83,7 +84,7 @@ enum SinkCommand {
         Box<SchemaChangeEvent>,
         oneshot::Sender<anyhow::Result<()>>,
     ),
-    PrepareCommit(oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>),
+    PrepareCommit(u64, oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>),
     SnapshotState(oneshot::Sender<anyhow::Result<Vec<u8>>>),
     Close(oneshot::Sender<anyhow::Result<()>>),
 }
@@ -128,8 +129,8 @@ async fn run_sink_worker(
                 let _ = ack.send(writer.apply_schema_change(&event).await);
                 continue;
             }
-            SinkCommand::PrepareCommit(ack) => {
-                let _ = ack.send(writer.prepare_commit().await);
+            SinkCommand::PrepareCommit(checkpoint_id, ack) => {
+                let _ = ack.send(writer.prepare_commit(checkpoint_id).await);
                 continue;
             }
             SinkCommand::SnapshotState(ack) => {
@@ -360,16 +361,30 @@ impl SinkWriter for FanoutSinkWriter {
 
     fn prepare_commit(
         &mut self,
+        checkpoint_id: u64,
     ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>> {
         Box::pin(async move {
+            let cp_id = checkpoint_id;
             let commits = self
-                .broadcast_and_await(|| {
+                .broadcast_and_await(move || {
                     let (ack_tx, ack_rx) = oneshot::channel();
-                    (SinkCommand::PrepareCommit(ack_tx), ack_rx)
+                    (SinkCommand::PrepareCommit(cp_id, ack_tx), ack_rx)
                 })
                 .await?;
-            // Flatten the per-sink CommitInfo vectors.
-            Ok(commits.into_iter().flatten().collect())
+            // Encode per-sink commit-info groups so the fan-out committer
+            // can route phase 2 to each sink's own committer (a flat list
+            // would lose the sink boundaries).
+            let entries: Vec<FanoutCommitEntry> = self
+                .alive()
+                .into_iter()
+                .enumerate()
+                .map(|(i, idx)| FanoutCommitEntry {
+                    sink: self.handles[idx].name.clone(),
+                    infos: commits.get(i).cloned().unwrap_or_default(),
+                })
+                .collect();
+            let encoded = serde_json::to_vec(&FanoutCommitInfos { entries })?;
+            Ok(vec![encoded])
         })
     }
 
@@ -428,6 +443,84 @@ impl SinkWriter for FanoutSinkWriter {
             })
             .await
             .map(|_| ())
+        })
+    }
+}
+
+/// Per-sink commit-info group produced by [`FanoutSinkWriter::prepare_commit`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FanoutCommitInfos {
+    pub entries: Vec<FanoutCommitEntry>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FanoutCommitEntry {
+    pub sink: String,
+    pub infos: Vec<Vec<u8>>,
+}
+
+/// Fan-out 2PC committer: parses the structured commit info produced by
+/// [`FanoutSinkWriter::prepare_commit`] and routes each sink's phase-2
+/// commit/abort to its own committer. Sinks without committers are skipped.
+pub struct FanoutCommitter {
+    committers: Vec<(String, Option<BoxedSinkCommitter>)>,
+}
+
+impl FanoutCommitter {
+    /// `None` when no inner sink has a committer (nothing to do at phase 2).
+    pub fn new(committers: Vec<(String, Option<BoxedSinkCommitter>)>) -> Option<Self> {
+        if committers.iter().any(|(_, c)| c.is_some()) {
+            Some(FanoutCommitter { committers })
+        } else {
+            None
+        }
+    }
+
+    fn split(commit_infos: Vec<Vec<u8>>) -> anyhow::Result<HashMap<String, Vec<Vec<u8>>>> {
+        let Some(first) = commit_infos.into_iter().next() else {
+            return Ok(HashMap::new());
+        };
+        let parsed: FanoutCommitInfos = serde_json::from_slice(&first)
+            .map_err(|e| anyhow::anyhow!("fan-out commit info decode: {}", e))?;
+        Ok(parsed.entries.into_iter().map(|e| (e.sink, e.infos)).collect())
+    }
+}
+
+impl SinkCommitter for FanoutCommitter {
+    type CommitInfo = Vec<u8>;
+    type AggregatedCommitInfo = serde_json::Value;
+
+    fn commit(
+        &mut self,
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> seatunnel_api::sink::sink_committer::CommitterFuture<'_, Self::AggregatedCommitInfo> {
+        Box::pin(async move {
+            let groups = Self::split(commit_infos)?;
+            let mut aggregated = serde_json::Map::new();
+            for (name, committer) in &mut self.committers {
+                if let (Some(committer), Some(infos)) = (committer, groups.get(name)) {
+                    aggregated.insert(
+                        name.clone(),
+                        committer.commit(infos.clone()).await?,
+                    );
+                }
+            }
+            Ok(serde_json::Value::Object(aggregated))
+        })
+    }
+
+    fn abort(
+        &mut self,
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> seatunnel_api::sink::sink_committer::CommitterFuture<'_, ()> {
+        Box::pin(async move {
+            let groups = Self::split(commit_infos)?;
+            for (name, committer) in &mut self.committers {
+                if let (Some(committer), Some(infos)) = (committer, groups.get(name)) {
+                    committer.abort(infos.clone()).await?;
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -508,6 +601,7 @@ mod tests {
 
         fn prepare_commit(
             &mut self,
+            _checkpoint_id: u64,
         ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>> {
             self.log("flush");
             let commit = format!("{}-commit", self.name);
@@ -550,7 +644,7 @@ mod tests {
         mux.open().await.unwrap();
         mux.write(row(1)).await.unwrap();
         mux.write(row(2)).await.unwrap();
-        mux.prepare_commit().await.unwrap();
+        mux.prepare_commit(1).await.unwrap();
         mux.close().await.unwrap();
 
         let ops = ops.lock().unwrap().clone();
@@ -595,7 +689,7 @@ mod tests {
         assert!(!ops.lock().unwrap().contains(&"slow:write1".to_string()));
 
         // prepare_commit waits for BOTH (flush ordering guarantee).
-        mux.prepare_commit().await.unwrap();
+        mux.prepare_commit(1).await.unwrap();
         assert!(ops.lock().unwrap().contains(&"slow:write1".to_string()));
         assert!(ops.lock().unwrap().contains(&"slow:flush".to_string()));
         mux.close().await.unwrap();
@@ -638,7 +732,7 @@ mod tests {
         mux.write(row(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await; // doomed dies
         mux.write(row(2)).await.unwrap(); // skipped for doomed, ok for healthy
-        mux.prepare_commit().await.unwrap(); // doomed skipped, healthy flushes
+        mux.prepare_commit(1).await.unwrap(); // doomed skipped, healthy flushes
         mux.close().await.unwrap();
 
         let ops = ops.lock().unwrap().clone();
@@ -676,6 +770,7 @@ mod tests {
             }
             fn prepare_commit(
                 &mut self,
+                _checkpoint_id: u64,
             ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>> {
                 Box::pin(async { Ok(vec![]) })
             }

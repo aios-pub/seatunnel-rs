@@ -20,6 +20,7 @@ pub mod checkpoint_storage;
 pub mod connector_factory;
 pub mod dag;
 pub mod execution;
+pub mod local_checkpoint;
 pub mod recovery;
 pub mod resource;
 pub mod savepoint;

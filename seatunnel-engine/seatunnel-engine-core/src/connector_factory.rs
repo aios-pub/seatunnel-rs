@@ -65,6 +65,71 @@ pub type BoxedSourceReader = Box<dyn SourceReader<Output = Row, Split = AnySplit
 pub type BoxedSinkWriter =
     Box<dyn SinkWriter<Input = Row, WriterState = Vec<u8>, CommitInfo = Vec<u8>>>;
 
+/// Type-erased 2PC committer operating on JSON-serialized commit infos.
+pub type BoxedSinkCommitter = Box<
+    dyn seatunnel_api::sink::sink_committer::SinkCommitter<
+        CommitInfo = Vec<u8>,
+        AggregatedCommitInfo = serde_json::Value,
+    >,
+>;
+
+/// Adapts a typed [`SinkCommitter`] to the byte-serialized engine surface,
+/// mirroring what [`SinkWriterAdapter`] does for writers.
+pub(crate) struct CommitterAdapter<C> {
+    pub(crate) inner: C,
+}
+
+impl<C> seatunnel_api::sink::sink_committer::SinkCommitter for CommitterAdapter<C>
+where
+    C: seatunnel_api::sink::sink_committer::SinkCommitter + Send,
+    C::CommitInfo: serde::de::DeserializeOwned + Serialize + Send + Sync,
+    C::AggregatedCommitInfo: Serialize + Send + Sync,
+{
+    type CommitInfo = Vec<u8>;
+    type AggregatedCommitInfo = serde_json::Value;
+
+    fn commit(
+        &mut self,
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> seatunnel_api::sink::sink_committer::CommitterFuture<'_, Self::AggregatedCommitInfo> {
+        Box::pin(async move {
+            let mut typed = Vec::with_capacity(commit_infos.len());
+            for bytes in commit_infos {
+                typed.push(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("deserialize commit info: {}", e))?,
+                );
+            }
+            let aggregated = self.inner.commit(typed).await?;
+            serde_json::to_value(&aggregated)
+                .map_err(|e| anyhow::anyhow!("serialize aggregated commit info: {}", e))
+        })
+    }
+
+    fn abort(
+        &mut self,
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> seatunnel_api::sink::sink_committer::CommitterFuture<'_, ()> {
+        Box::pin(async move {
+            let mut typed = Vec::with_capacity(commit_infos.len());
+            for bytes in commit_infos {
+                typed.push(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| anyhow::anyhow!("deserialize commit info: {}", e))?,
+                );
+            }
+            self.inner.abort(typed).await
+        })
+    }
+}
+
+/// One pipeline's sink side: the (possibly multiplexed) writer plus the
+/// optional 2PC committer driven by the engine at checkpoint completion.
+pub struct SinkPipeline {
+    pub writer: BoxedSinkWriter,
+    pub committer: Option<BoxedSinkCommitter>,
+}
+
 /// Type-erased transform chain element.
 pub type BoxedTransform = Box<dyn Transform<Input = Row, Output = Row>>;
 
@@ -106,6 +171,13 @@ where
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         Box::pin(async move { self.inner.snapshot_state().await })
+    }
+
+    fn notify_checkpoint_complete(
+        &mut self,
+        checkpoint_id: u64,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.inner.notify_checkpoint_complete(checkpoint_id).await })
     }
 
     fn add_splits(&mut self, _splits: Vec<Self::Split>) {
@@ -158,9 +230,10 @@ where
 
     fn prepare_commit(
         &mut self,
+        checkpoint_id: u64,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
         Box::pin(async move {
-            let infos = self.inner.prepare_commit().await?;
+            let infos = self.inner.prepare_commit(checkpoint_id).await?;
             Ok(infos
                 .iter()
                 .map(|info| serde_json::to_vec(info).unwrap_or_default())
@@ -171,10 +244,9 @@ where
     fn snapshot_state(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
-        Box::pin(async move {
-            let state = self.inner.snapshot_state().await?;
-            serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("serialize writer state: {}", e))
-        })
+        // The inner writer already returns serialized bytes; forwarding them
+        // directly keeps the payload single-encoded for restore.
+        Box::pin(async move { self.inner.snapshot_state().await })
     }
 
     fn close(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
@@ -293,6 +365,7 @@ impl SinkWriter for ConsoleSinkWriter {
 
     fn prepare_commit(
         &mut self,
+        _checkpoint_id: u64,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -763,10 +836,23 @@ pub fn create_source(
 }
 
 /// Build the sink writer described by `plugin` + flat config.
+/// Build one sink writer. Legacy entry point (no restore, no committer).
 pub fn create_sink(
     plugin: &str,
     config: &HashMap<String, String>,
 ) -> anyhow::Result<BoxedSinkWriter> {
+    Ok(create_sink_with_restore(plugin, config, None)?.writer)
+}
+
+/// Build one sink writer plus its optional 2PC committer. `restore` is the
+/// writer state captured at the checkpoint being restored from (serialized
+/// `snapshot_state` payload, possibly the fan-out `{name: state}` map for
+/// a specific sink); sinks without meaningful writer state ignore it.
+pub fn create_sink_with_restore(
+    plugin: &str,
+    config: &HashMap<String, String>,
+    restore: Option<&[u8]>,
+) -> anyhow::Result<SinkPipeline> {
     use seatunnel_connector_common::ConnectorConfig;
     let conn = ConnectorConfig::new(config.clone());
     let lower = plugin.to_lowercase().replace(['-', '_'], "");
@@ -775,17 +861,25 @@ pub fn create_sink(
         "kafka" | "kafkasink" => {
             #[cfg(feature = "connectors")]
             {
-                use seatunnel_connector_kafka::{KafkaSinkConfig, KafkaSinkWriter};
+                use seatunnel_connector_kafka::{KafkaSinkConfig, KafkaSinkCommitter, KafkaSinkWriter};
                 let cfg = KafkaSinkConfig::from_config(&conn);
                 tracing::info!(
-                    "factory: Kafka sink topic={} brokers={} acks={}",
+                    "factory: Kafka sink topic={} brokers={} acks={} txn={}",
                     cfg.topic,
                     cfg.bootstrap_servers,
-                    cfg.acks
+                    cfg.acks,
+                    cfg.transactions_enabled
                 );
-                Ok(Box::new(SinkWriterAdapter {
-                    inner: KafkaSinkWriter::new(cfg)?,
-                }))
+                let mut writer = KafkaSinkWriter::new(cfg)?;
+                if let Some(bytes) = restore {
+                    writer.restore_from_state_bytes(bytes)?;
+                }
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter { inner: writer }),
+                    committer: Some(Box::new(CommitterAdapter {
+                        inner: KafkaSinkCommitter::new(),
+                    })),
+                })
             }
             #[cfg(not(feature = "connectors"))]
             {
@@ -798,13 +892,50 @@ pub fn create_sink(
                 use seatunnel_connector_jdbc::{JdbcSinkConfig, JdbcSinkWriter};
                 let cfg = JdbcSinkConfig::from_config(&conn);
                 tracing::info!("factory: JDBC sink");
-                Ok(Box::new(SinkWriterAdapter {
-                    inner: JdbcSinkWriter::new(cfg, None),
-                }))
+                if restore.is_some() {
+                    tracing::debug!("factory: JDBC sink writer state restore ignored (stateless)");
+                }
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter {
+                        inner: JdbcSinkWriter::new(cfg, None),
+                    }),
+                    committer: None,
+                })
             }
             #[cfg(not(feature = "connectors"))]
             {
                 Err(anyhow::anyhow!("JDBC connector not compiled in"))
+            }
+        }
+        "jdbcxa" | "jdbc-xa" | "xa" | "mysqlxa" => {
+            #[cfg(feature = "connectors")]
+            {
+                use seatunnel_connector_jdbc::{XaSinkCommitter, XaSinkConfig, XaSinkWriter};
+                let cfg = XaSinkConfig::from_config(&conn);
+                tracing::info!(
+                    "factory: JDBC XA sink table={} url={} xid-prefix={}",
+                    cfg.table,
+                    cfg.url,
+                    cfg.xid_prefix
+                );
+                let mut writer = XaSinkWriter::new(cfg.clone());
+                if let Some(bytes) = restore {
+                    writer.restore_from_state_bytes(bytes)?;
+                }
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter { inner: writer }),
+                    committer: Some(Box::new(CommitterAdapter {
+                        inner: XaSinkCommitter::new(
+                            cfg.url.clone(),
+                            cfg.username.clone(),
+                            cfg.password.clone(),
+                        ),
+                    })),
+                })
+            }
+            #[cfg(not(feature = "connectors"))]
+            {
+                Err(anyhow::anyhow!("JDBC XA connector not compiled in"))
             }
         }
         "redis" | "redissink" => {
@@ -818,9 +949,12 @@ pub fn create_sink(
                     cfg.port,
                     cfg.data_type
                 );
-                Ok(Box::new(SinkWriterAdapter {
-                    inner: RedisSinkWriter::new(cfg),
-                }))
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter {
+                        inner: RedisSinkWriter::new(cfg),
+                    }),
+                    committer: None,
+                })
             }
             #[cfg(not(feature = "connectors"))]
             {
@@ -837,18 +971,24 @@ pub fn create_sink(
                     cfg.index,
                     cfg.hosts
                 );
-                Ok(Box::new(SinkWriterAdapter {
-                    inner: EsSinkWriter::new(cfg, None),
-                }))
+                Ok(SinkPipeline {
+                    writer: Box::new(SinkWriterAdapter {
+                        inner: EsSinkWriter::new(cfg, None),
+                    }),
+                    committer: None,
+                })
             }
             #[cfg(not(feature = "connectors"))]
             {
                 Err(anyhow::anyhow!("Elasticsearch connector not compiled in"))
             }
         }
-        "console" | "consolesink" | "" => Ok(Box::new(SinkWriterAdapter {
-            inner: ConsoleSinkWriter::new("[console] "),
-        })),
+        "console" | "consolesink" | "" => Ok(SinkPipeline {
+            writer: Box::new(SinkWriterAdapter {
+                inner: ConsoleSinkWriter::new("[console] "),
+            }),
+            committer: None,
+        }),
         other => Err(anyhow::anyhow!("unknown sink plugin '{}'", other)),
     }
 }
@@ -897,24 +1037,46 @@ pub fn create_sinks(
     sinks: &[SinkDeclaration],
     failure_policy: crate::fanout::SinkFailurePolicy,
 ) -> anyhow::Result<BoxedSinkWriter> {
+    Ok(create_sink_pipeline(sinks, failure_policy, None)?.writer)
+}
+
+/// Build a pipeline's full sink side (writer + optional 2PC committer).
+///
+/// `restore_writer_state` is the pipeline's writer state captured at the
+/// checkpoint being restored from: for a single sink the sink's own
+/// payload, for fan-out the merged `{sink-name: state}` JSON map which is
+/// split back per sink here.
+pub fn create_sink_pipeline(
+    sinks: &[SinkDeclaration],
+    failure_policy: crate::fanout::SinkFailurePolicy,
+    restore_writer_state: Option<&[u8]>,
+) -> anyhow::Result<SinkPipeline> {
     if sinks.len() == 1 {
         let sink = &sinks[0];
         let config = json_to_config_map(&sink.config);
-        return create_sink(&sink.plugin, &config);
+        return create_sink_with_restore(&sink.plugin, &config, restore_writer_state);
     }
-    let writers = sinks
-        .iter()
-        .enumerate()
-        .map(|(idx, sink)| {
-            let config = json_to_config_map(&sink.config);
-            Ok((
-                format!("{}#{}", sink.plugin, idx),
-                create_sink(&sink.plugin, &config)?,
-            ))
-        })
-        .collect::<anyhow::Result<Vec<(String, BoxedSinkWriter)>>>()?;
-    let mux: BoxedSinkWriter = Box::new(crate::fanout::FanoutSinkWriter::new(writers, failure_policy));
-    Ok(mux)
+    let merged: HashMap<String, Vec<u8>> = restore_writer_state
+        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+        .unwrap_or_default();
+    let mut writers = Vec::new();
+    let mut committers = Vec::new();
+    for (idx, sink) in sinks.iter().enumerate() {
+        let config = json_to_config_map(&sink.config);
+        let name = format!("{}#{}", sink.plugin, idx);
+        let state = merged.get(&name).map(|v| v.as_slice());
+        let pipeline = create_sink_with_restore(&sink.plugin, &config, state)?;
+        writers.push((name.clone(), pipeline.writer));
+        committers.push((name, pipeline.committer));
+    }
+    let mux: BoxedSinkWriter =
+        Box::new(crate::fanout::FanoutSinkWriter::new(writers, failure_policy));
+    let committer = crate::fanout::FanoutCommitter::new(committers)
+        .map(|committer| Box::new(committer) as BoxedSinkCommitter);
+    Ok(SinkPipeline {
+        writer: mux,
+        committer,
+    })
 }
 
 /// Build a transform chain from the ordered list of transform configs.
