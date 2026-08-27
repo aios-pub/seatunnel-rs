@@ -317,6 +317,9 @@ pub struct KafkaSourceReader {
     restore_offsets: HashMap<String, i64>,
     /// Highest consumed offset per `topic-partition`, captured at checkpoint.
     last_offsets: HashMap<String, i64>,
+    /// Offsets captured at the last `snapshot_state`; committed to the
+    /// consumer group only when that checkpoint completes.
+    checkpoint_offsets: HashMap<String, i64>,
     /// Rows decoded from a multi-row message (e.g. Debezium UPDATE) awaiting
     /// emission.
     pending: VecDeque<Row>,
@@ -346,6 +349,7 @@ impl KafkaSourceReader {
             schema,
             restore_offsets: HashMap::new(),
             last_offsets: HashMap::new(),
+            checkpoint_offsets: HashMap::new(),
             pending: VecDeque::new(),
             consumer: None,
             assigned: Vec::new(),
@@ -460,12 +464,16 @@ impl KafkaSourceReader {
 
     /// Commit the last consumed offsets (+1) to the consumer group.
     fn commit_offsets(&self) {
+        self.commit_specific_offsets(&self.last_offsets);
+    }
+
+    fn commit_specific_offsets(&self, offsets: &HashMap<String, i64>) {
         if let Some(consumer) = &self.consumer {
-            if self.last_offsets.is_empty() {
+            if offsets.is_empty() {
                 return;
             }
             let mut tpl = TopicPartitionList::new();
-            for (key, offset) in &self.last_offsets {
+            for (key, offset) in offsets {
                 if let Some((topic, partition)) = key.rsplit_once('-') {
                     if let Ok(p) = partition.parse::<i32>() {
                         let _ = tpl.add_partition_offset(topic, p, Offset::Offset(offset + 1));
@@ -601,12 +609,31 @@ impl SourceReader for KafkaSourceReader {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         Box::pin(async move {
-            // Commit-on-checkpoint (Java `commit_on_checkpoint`).
-            self.commit_offsets();
+            // Commit-on-checkpoint (Java `commit_on_checkpoint`): capture
+            // now, commit in notify_checkpoint_complete so an aborted
+            // checkpoint never advances the consumer group.
+            self.checkpoint_offsets = self.last_offsets.clone();
             let state = KafkaSourceState {
                 offsets: self.last_offsets.clone(),
             };
             serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e))
+        })
+    }
+
+    fn notify_checkpoint_complete(
+        &mut self,
+        checkpoint_id: u64,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.checkpoint_offsets.is_empty() {
+                tracing::debug!(
+                    "KafkaSourceReader: committing consumer offsets for checkpoint {}",
+                    checkpoint_id
+                );
+                self.commit_specific_offsets(&self.checkpoint_offsets);
+                self.checkpoint_offsets.clear();
+            }
+            Ok(())
         })
     }
 
@@ -655,6 +682,9 @@ impl SourceSplit for KafkaSinkSplit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaCommitInfo {
     pub transaction_id: String,
+    /// Checkpoint whose transaction this info describes; lets the
+    /// committer aggregate per-checkpoint statistics.
+    pub checkpoint_id: u64,
     pub messages_count: usize,
 }
 
@@ -695,13 +725,22 @@ pub struct KafkaSinkConfig {
     /// linger, records under low traffic would sit in the buffer until the
     /// batch fills (or a checkpoint/EOF flush), which is unbounded latency.
     pub batch_timeout_ms: u64,
-    /// When true a transactional producer is used: records are produced
-    /// inside `begin_transaction()` … `commit_transaction()` windows aligned
-    /// with checkpoint boundaries (exactly-once for downstream consumers
-    /// configured with `read_committed`).
+    /// When true a transactional producer is used: every checkpoint gets
+    /// one Kafka transaction opened right after the previous commit and
+    /// committed in `prepare_commit(checkpoint_id)`. Downstream consumers
+    /// with `isolation.level=read_committed` never observe partial
+    /// checkpoints. The transactional id is stable across restarts
+    /// (`{prefix}-{pipeline}-{subtask}`), so a restarted writer fences
+    /// (and thereby aborts the open transaction of) any zombie producer
+    /// from a previous process run.
     pub transactions_enabled: bool,
-    /// Transactional id; required when `transactions_enabled` is true.
+    /// Transactional id PREFIX; required when `transactions_enabled` is
+    /// true. The full transactional id appends `-{pipeline}-{subtask}`.
     pub transactional_id: Option<String>,
+    /// Pipeline name injected by the engine (transaction id namespace).
+    pub context_pipeline: String,
+    /// Subtask index injected by the engine (transaction id namespace).
+    pub context_subtask: usize,
     /// Delivery timeout per record.
     pub message_timeout_ms: u64,
     /// Field names (or `#ordinal` like `#0`) routed into the message key.
@@ -723,6 +762,8 @@ impl Default for KafkaSinkConfig {
             batch_timeout_ms: 100,
             transactions_enabled: false,
             transactional_id: None,
+            context_pipeline: "p0".to_string(),
+            context_subtask: 0,
             message_timeout_ms: 30_000,
             partition_key_fields: Vec::new(),
             field_delimiter: ",".to_string(),
@@ -752,11 +793,13 @@ impl KafkaSinkConfig {
             transactions_enabled: tx_enabled,
             transactional_id: config.get("transactional.id").cloned().or_else(|| {
                 if tx_enabled {
-                    Some(format!("seatunnel-sink-{}", uuid::Uuid::new_v4()))
+                    Some(format!("seatunnel-{}", config.get_string("job.id", "local")))
                 } else {
                     None
                 }
             }),
+            context_pipeline: config.get_string("pipeline.name", "p0"),
+            context_subtask: config.get_int("subtask.index", 0).max(0) as usize,
             message_timeout_ms: config.get_int("message.timeout.ms", 30_000) as u64,
             partition_key_fields: config
                 .get_string("partition-key-fields", &config.get_string("partition_key_fields", ""))
@@ -847,7 +890,7 @@ impl Sink for KafkaSink {
     fn restore_writer(
         &self,
         _ctx: &SinkWriterContext,
-        _states: &[Vec<u8>],
+        states: &[Vec<u8>],
     ) -> anyhow::Result<
         Box<
             dyn SinkWriter<
@@ -857,7 +900,11 @@ impl Sink for KafkaSink {
             >,
         >,
     > {
-        Ok(Box::new(KafkaSinkWriter::new(self.config.clone())?))
+        let mut writer = KafkaSinkWriter::new(self.config.clone())?;
+        if let Some(bytes) = states.last() {
+            writer.restore_from_state_bytes(bytes)?;
+        }
+        Ok(Box::new(writer))
     }
 
     fn get_input_schema(&self) -> Option<TableSchema> {
@@ -880,10 +927,18 @@ impl Sink for KafkaSink {
 
 /// Kafka Sink writer with batching and optional transactions.
 ///
-/// Records are buffered by `write()` and delivered either when the batch
-/// reaches `batch_size` or during `prepare_commit()` (checkpoint boundary).
-/// With `transactions.enabled=true` the batch is produced inside a Kafka
-/// transaction committed in the same window.
+/// Records are buffered by `write()` and delivered when the batch reaches
+/// `batch_size`, when the `batch.timeout.ms` linger elapses, or at
+/// `prepare_commit()` (checkpoint boundary).
+///
+/// With `transactions.enabled=true` exactly one Kafka transaction spans each
+/// checkpoint window: `open()` initializes the transactional producer
+/// (fencing any zombie from a previous run, which aborts its hanging
+/// transaction) and begins the first transaction; every flush only DELIVERS
+/// records into the open transaction; `prepare_commit(checkpoint_id)`
+/// commits it and immediately begins the next one. `read_committed`
+/// consumers therefore observe checkpoint windows atomically and never see
+/// partial batches.
 pub struct KafkaSinkWriter {
     config: KafkaSinkConfig,
     batch: Vec<Row>,
@@ -893,6 +948,15 @@ pub struct KafkaSinkWriter {
     last_flush: std::time::Instant,
     /// Stateful canal-client encoder (row pairing + filtering + keys).
     canal_encoder: Option<seatunnel_formats::canal_client_json::CanalClientEncoder>,
+    /// Full transactional id (`{prefix}-{pipeline}-{subtask}`); stable
+    /// across restarts of the same job so zombies can be fenced.
+    txn_base: Option<String>,
+    /// Whether a transaction is currently open (begin issued, not committed).
+    txn_open: bool,
+    /// Messages delivered inside the currently open transaction.
+    txn_messages: usize,
+    /// Last checkpoint id whose transaction this writer committed.
+    last_committed_checkpoint: u64,
 }
 
 impl KafkaSinkWriter {
@@ -903,6 +967,17 @@ impl KafkaSinkWriter {
             .map(seatunnel_formats::canal_client_json::CanalClientEncoder::new)
             .transpose()
             .map_err(|e| anyhow::anyhow!("canal-client format config: {}", e))?;
+        let txn_base = config.transactions_enabled.then(|| {
+            format!(
+                "{}-{}-{}",
+                config
+                    .transactional_id
+                    .clone()
+                    .unwrap_or_else(|| "seatunnel-local".to_string()),
+                config.context_pipeline,
+                config.context_subtask
+            )
+        });
         Ok(KafkaSinkWriter {
             config,
             batch: Vec::new(),
@@ -910,7 +985,34 @@ impl KafkaSinkWriter {
             producer: None,
             last_flush: std::time::Instant::now(),
             canal_encoder,
+            txn_base,
+            txn_open: false,
+            txn_messages: 0,
+            last_committed_checkpoint: 0,
         })
+    }
+
+    /// Restore the writer's checkpoint progress (last committed checkpoint
+    /// and totals) from a serialized `snapshot_state` payload. The next
+    /// `open()` re-initializes the same transactional id, which fences any
+    /// zombie producer left by the crashed run.
+    pub fn restore_from_state_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let state: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| anyhow::anyhow!("kafka writer state: {}", e))?;
+        self.total_written = state
+            .get("total_written")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        self.last_committed_checkpoint = state
+            .get("last_committed_checkpoint")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        tracing::info!(
+            "KafkaSinkWriter: restored state (last committed checkpoint {}, total written {})",
+            self.last_committed_checkpoint,
+            self.total_written
+        );
+        Ok(())
     }
 
     /// Whether the canal-client stateful encoder is active (diagnostics).
@@ -938,19 +1040,18 @@ impl KafkaSinkWriter {
             // Batch without the artificial delay and let TCP stack coalesce.
             .set("linger.ms", "0")
             .set("socket.nagle.disable", "true");
-        if self.config.transactions_enabled {
-            let tx_id = self
-                .config
-                .transactional_id
-                .clone()
-                .unwrap_or_else(|| format!("seatunnel-sink-{}", uuid::Uuid::new_v4()));
-            tracing::info!("Kafka sink: transactional producer id={}", tx_id);
-            builder.set("transactional.id", &tx_id);
+        if let Some(txn_base) = &self.txn_base {
+            tracing::info!("Kafka sink: transactional producer id={}", txn_base);
+            builder.set("transactional.id", txn_base);
         }
         let producer: FutureProducer = builder
             .create()
             .map_err(|e| anyhow::anyhow!("Failed to create Kafka producer: {}", e))?;
-        if self.config.transactions_enabled {
+        if self.txn_base.is_some() {
+            // init_transactions on the stable transactional id bumps the
+            // epoch: any producer instance from a previous (crashed) run
+            // is fenced and its hanging transaction aborted by the
+            // transaction coordinator.
             producer
                 .init_transactions(std::time::Duration::from_secs(30))
                 .map_err(|e| anyhow::anyhow!("init_transactions failed: {}", e))?;
@@ -959,7 +1060,9 @@ impl KafkaSinkWriter {
         Ok(())
     }
 
-    /// Deliver buffered records to Kafka, optionally inside a transaction.
+    /// Deliver buffered records to Kafka. With transactions enabled the
+    /// records are produced into the currently OPEN transaction but never
+    /// committed here — only `prepare_commit` (checkpoint boundary) commits.
     async fn flush_batch(&mut self) -> anyhow::Result<usize> {
         self.last_flush = std::time::Instant::now();
         self.ensure_producer()?;
@@ -974,11 +1077,6 @@ impl KafkaSinkWriter {
         // message. Runs even for empty batches so held before-images
         // whose pairing window expired are emitted as real deletes.
         if let Some(encoder) = &mut self.canal_encoder {
-            if self.config.transactions_enabled {
-                producer
-                    .begin_transaction()
-                    .map_err(|e| anyhow::anyhow!("begin_transaction failed: {}", e))?;
-            }
             let topic = self.config.topic.clone();
             let mut sent = 0usize;
             let mut failures = Vec::new();
@@ -1016,36 +1114,19 @@ impl KafkaSinkWriter {
                 }
             }
             if !failures.is_empty() {
-                if self.config.transactions_enabled {
-                    let _ = producer.abort_transaction(Duration::from_secs(10));
-                }
                 anyhow::bail!(
                     "failed to deliver {} record(s): {}",
                     failures.len(),
                     failures.first().map(String::as_str).unwrap_or("unknown")
                 );
             }
-            if self.config.transactions_enabled {
-                producer
-                    .commit_transaction(Duration::from_secs(30))
-                    .map_err(|e| {
-                        let _ = producer.abort_transaction(Duration::from_secs(10));
-                        anyhow::anyhow!("commit_transaction failed: {}", e)
-                    })?;
-            }
             self.total_written += sent;
+            self.txn_messages += sent;
             return Ok(sent);
         }
 
         if records.is_empty() {
             return Ok(0);
-        }
-
-        let transactional = self.config.transactions_enabled;
-        if transactional {
-            producer
-                .begin_transaction()
-                .map_err(|e| anyhow::anyhow!("begin_transaction failed: {}", e))?;
         }
 
         let topic = self.config.topic.clone();
@@ -1080,14 +1161,6 @@ impl KafkaSinkWriter {
             }
         }
 
-        if transactional && !failures.is_empty() {
-            let _ = producer.abort_transaction(Duration::from_secs(10));
-            anyhow::bail!(
-                "transactional produce failed for {} record(s): {}",
-                failures.len(),
-                failures.first().map(String::as_str).unwrap_or("unknown")
-            );
-        }
         if !failures.is_empty() {
             // At-least-once delivery contract: surface partial failures so
             // the engine can retry from the last checkpoint.
@@ -1098,16 +1171,8 @@ impl KafkaSinkWriter {
             );
         }
 
-        if transactional {
-            producer
-                .commit_transaction(Duration::from_secs(30))
-                .map_err(|e| {
-                    let _ = producer.abort_transaction(Duration::from_secs(10));
-                    anyhow::anyhow!("commit_transaction failed: {}", e)
-                })?;
-        }
-
         self.total_written += sent;
+        self.txn_messages += sent;
         Ok(sent)
     }
 }
@@ -1120,10 +1185,23 @@ impl SinkWriter for KafkaSinkWriter {
     fn open(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             self.ensure_producer()?;
+            if self.txn_base.is_some() {
+                // Open the first checkpoint window's transaction. Any zombie
+                // transaction from a previous run was already aborted by
+                // init_transactions inside ensure_producer.
+                if let Some(producer) = &self.producer {
+                    producer
+                        .begin_transaction()
+                        .map_err(|e| anyhow::anyhow!("begin_transaction failed: {}", e))?;
+                    self.txn_open = true;
+                }
+            }
             tracing::info!(
-                "KafkaSinkWriter: producer ready for topic {} via {}",
+                "KafkaSinkWriter: producer ready for topic {} via {} (txn={:?}, last_committed_cp={})",
                 self.config.topic,
-                self.config.bootstrap_servers
+                self.config.bootstrap_servers,
+                self.txn_base,
+                self.last_committed_checkpoint
             );
             Ok(())
         })
@@ -1149,17 +1227,45 @@ impl SinkWriter for KafkaSinkWriter {
 
     fn prepare_commit(
         &mut self,
+        checkpoint_id: u64,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
         Box::pin(async move {
             let pending = self.batch.len();
             let delivered = self.flush_batch().await?;
-            let info = KafkaCommitInfo {
-                transaction_id: format!("txn-{}", uuid::Uuid::new_v4()),
+            let mut info = KafkaCommitInfo {
+                transaction_id: self
+                    .txn_base
+                    .clone()
+                    .unwrap_or_else(|| format!("non-txn-{}", self.config.topic)),
+                checkpoint_id,
                 messages_count: delivered,
             };
+            if self.txn_base.is_some() {
+                let producer = self
+                    .producer
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("kafka producer unavailable"))?;
+                // Checkpoint boundary: make the whole window visible in one
+                // atomic transaction, then immediately open the next one.
+                producer
+                    .commit_transaction(Duration::from_secs(30))
+                    .map_err(|e| {
+                        let _ = producer.abort_transaction(Duration::from_secs(10));
+                        anyhow::anyhow!("commit_transaction failed: {}", e)
+                    })?;
+                self.txn_open = false;
+                info.messages_count = self.txn_messages;
+                self.txn_messages = 0;
+                self.last_committed_checkpoint = checkpoint_id;
+                producer
+                    .begin_transaction()
+                    .map_err(|e| anyhow::anyhow!("begin_transaction failed: {}", e))?;
+                self.txn_open = true;
+            }
             tracing::info!(
-                "KafkaSinkWriter: checkpoint commit flushed {} record(s) (pending={}, total={})",
-                delivered,
+                "KafkaSinkWriter: checkpoint {} committed {} message(s) (pending_rows={}, total={})",
+                checkpoint_id,
+                info.messages_count,
                 pending,
                 self.total_written
             );
@@ -1173,6 +1279,8 @@ impl SinkWriter for KafkaSinkWriter {
         let state = serde_json::json!({
             "total_written": self.total_written,
             "pending": self.batch.len(),
+            "transactional_base": self.txn_base,
+            "last_committed_checkpoint": self.last_committed_checkpoint,
         });
         Box::pin(async move { serde_json::to_vec(&state).map_err(|e| anyhow::anyhow!("{}", e)) })
     }
@@ -1214,6 +1322,25 @@ impl SinkWriter for KafkaSinkWriter {
                         .await
                     {
                         tracing::warn!("KafkaSinkWriter: canal-client final flush failed: {}", e);
+                    }
+                }
+            }
+            // Transactional mode: the graceful path committed at the final
+            // checkpoint; whatever landed in the still-open transaction
+            // above (no final checkpoint ran, e.g. after a task error) is
+            // committed so it is not stranded invisible. A restore replays
+            // from the last persisted checkpoint regardless.
+            if self.txn_open {
+                if let Some(producer) = &self.producer {
+                    match producer.commit_transaction(Duration::from_secs(30)) {
+                        Ok(()) => {
+                            self.txn_open = false;
+                            self.txn_messages = 0;
+                        }
+                        Err(e) => {
+                            let _ = producer.abort_transaction(Duration::from_secs(10));
+                            tracing::warn!("KafkaSinkWriter: final commit_transaction failed: {}", e);
+                        }
                     }
                 }
             }
@@ -1376,13 +1503,18 @@ impl SinkCommitter for KafkaSinkCommitter {
     fn commit(
         &mut self,
         commit_infos: Vec<Self::CommitInfo>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Self::AggregatedCommitInfo>> + '_>> {
+    ) -> seatunnel_api::sink::sink_committer::CommitterFuture<'_, Self::AggregatedCommitInfo> {
         let total = commit_infos.iter().map(|c| c.messages_count).sum();
+        let checkpoint_id = commit_infos.iter().map(|c| c.checkpoint_id).max();
         self.completed.extend(commit_infos);
         Box::pin(async move {
-            tracing::info!("KafkaSinkCommitter: committed {} messages", total);
+            tracing::info!(
+                "KafkaSinkCommitter: checkpoint {:?} committed {} messages",
+                checkpoint_id,
+                total
+            );
             Ok(KafkaAggregatedCommitInfo {
-                checkpoint_id: -1,
+                checkpoint_id: checkpoint_id.map(|v| v as i64).unwrap_or(-1),
                 total_messages: total,
             })
         })
@@ -1390,10 +1522,20 @@ impl SinkCommitter for KafkaSinkCommitter {
 
     fn abort(
         &mut self,
-        _commit_infos: Vec<Self::CommitInfo>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> seatunnel_api::sink::sink_committer::CommitterFuture<'_, ()> {
         Box::pin(async move {
-            tracing::warn!("KafkaSinkCommitter: aborting commit");
+            // A Kafka transaction is committed inside prepare_commit (phase
+            // 1) because rdkafka cannot resume a prepared transaction from
+            // another producer instance (Java needs a reflection hack for
+            // that). Once committed it cannot be rolled back; an aborted
+            // checkpoint replays from the previous one and message keys
+            // make the duplicate window idempotent downstream.
+            tracing::warn!(
+                "KafkaSinkCommitter: checkpoint aborted after {} commit info(s); \
+                 transactions already committed at prepare_commit cannot be rolled back",
+                commit_infos.len()
+            );
             Ok(())
         })
     }
@@ -1434,10 +1576,12 @@ mod tests {
         let infos = vec![
             KafkaCommitInfo {
                 transaction_id: "t1".to_string(),
+                checkpoint_id: 1,
                 messages_count: 10,
             },
             KafkaCommitInfo {
                 transaction_id: "t2".to_string(),
+                checkpoint_id: 1,
                 messages_count: 5,
             },
         ];
