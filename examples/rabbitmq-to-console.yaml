@@ -1,0 +1,24 @@
+# RabbitMQ source → Console sink.
+#
+# Local run:
+#   seatunnel run -m local -c examples/rabbitmq-to-console.yaml
+#
+# Publish test messages first (management UI at http://127.0.0.1:15672,
+# or any AMQP client) to the queue below. Unbounded: Ctrl-C to stop.
+
+env:
+  job.name: rabbitmq-to-console
+  checkpoint.interval: 5000
+
+source:
+  RabbitMQ:
+    host: 127.0.0.1
+    port: 5672
+    username: guest
+    password: guest
+    queue-name: seatunnel-demo
+    prefetch-count: 100
+    format: json
+
+sink:
+  Console: {}

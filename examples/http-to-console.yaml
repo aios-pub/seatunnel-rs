@@ -1,0 +1,19 @@
+# HTTP source → Console sink (single bounded fetch of a JSON array API).
+#
+# Local run:
+#   seatunnel run -m local -c examples/http-to-console.yaml
+
+env:
+  job.name: http-to-console
+  parallelism: 1
+
+source:
+  Http:
+    url: https://jsonplaceholder.typicode.com/users
+    method: GET
+    format: json
+    poll-interval-ms: 0          # 0 = fetch once (bounded)
+    max-retries: 3
+
+sink:
+  Console: {}

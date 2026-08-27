@@ -1,0 +1,25 @@
+# FakeSource → ClickHouse sink.
+#
+# Local run:
+#   seatunnel run -m local -c examples/fake-to-clickhouse.yaml
+#
+# Requires: docker compose up -d clickhouse
+# Verify:   curl 'http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20seatunnel.demo'
+
+env:
+  job.name: fake-to-clickhouse
+  parallelism: 1
+
+source:
+  FakeSource:
+    row.num: 50
+
+sinks:
+  - ClickHouse:
+      url: http://127.0.0.1:8123
+      database: default
+      table: seatunnel_demo
+      username: default
+      password: ""
+      schema-save-mode: create_when_not_exist
+      max-batch-size: 100

@@ -1,0 +1,24 @@
+# ClickHouse source → Console sink (bounded read with a pk cursor).
+#
+# Local run:
+#   seatunnel run -m local -c examples/clickhouse-to-console.yaml
+#
+# Requires: docker compose up -d clickhouse (and some rows in the table,
+# e.g. after running examples/fake-to-clickhouse.yaml).
+
+env:
+  job.name: clickhouse-to-console
+  parallelism: 1
+
+source:
+  ClickHouse:
+    url: http://127.0.0.1:8123
+    database: default
+    table: seatunnel_demo
+    username: default
+    password: ""
+    primary-keys: f0               # cursor column for resumable reads
+    fetch-size: 100
+
+sink:
+  Console: {}

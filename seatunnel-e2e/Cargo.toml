@@ -16,6 +16,11 @@ name = "checkpoint_recovery"
 path = "tests/checkpoint_recovery.rs"
 harness = true
 
+[[test]]
+name = "connectors_ext"
+path = "tests/connectors_ext.rs"
+harness = true
+
 [dependencies]
 tokio = { workspace = true }
 tokio-stream = "0.1"
@@ -24,6 +29,10 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+lapin = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
 
 seatunnel-engine-server = { path = "../seatunnel-engine/seatunnel-engine-server" }
 seatunnel-engine-client = { path = "../seatunnel-engine/seatunnel-engine-client" }

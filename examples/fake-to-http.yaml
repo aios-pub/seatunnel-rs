@@ -1,0 +1,22 @@
+# FakeSource → HTTP sink (POSTs each row as a JSON object).
+#
+# Local run:
+#   seatunnel run -m local -c examples/fake-to-http.yaml
+#
+# Point `url` at any collector; e.g. a quick echo server:
+#   python3 -m http.server  # (405s are retried then fail — use a real POST endpoint)
+
+env:
+  job.name: fake-to-http
+  parallelism: 1
+
+source:
+  FakeSource:
+    row.num: 10
+
+sinks:
+  - Http:
+      url: http://127.0.0.1:9000/collect
+      method: POST
+      max-batch-size: 1
+      max-retries: 3

@@ -35,7 +35,12 @@ seatunnel-rs/
 │   ├── seatunnel-connector-cdc-mysql/  # MySQL CDC
 │   ├── seatunnel-connector-cdc-tidb/   # TiDB CDC
 │   ├── seatunnel-connector-cdc-postgres/ # PostgreSQL CDC
-│   └── seatunnel-connector-jdbc/       # JDBC source
+│   ├── seatunnel-connector-jdbc/       # JDBC source
+│   ├── seatunnel-connector-redis/      # Redis source + sink
+│   ├── seatunnel-connector-elasticsearch/ # Elasticsearch source + sink
+│   ├── seatunnel-connector-rabbitmq/   # RabbitMQ source + sink
+│   ├── seatunnel-connector-http/       # HTTP source + sink
+│   └── seatunnel-connector-clickhouse/ # ClickHouse source + sink
 ├── seatunnel-transforms/           # Filter, Map, Fanout, Rename, Select
 ├── seatunnel-cli/                  # CLI: local runs + cluster job management
 ├── seatunnel-macros/               # Factory registration macros
@@ -128,6 +133,11 @@ source (e.g. disjoint MySQL id ranges) across subtasks distributed over workers.
 | TiDB CDC | Source | TiKV key range, resolved_ts, CDC client |
 | PostgreSQL CDC | Source | Logical replication, LSN, publication/slot |
 | JDBC | Source/Sink | MySQL/PostgreSQL dialects, batched reads, prepared writes |
+| RabbitMQ | Source/Sink | Deferred (checkpoint-driven) manual acks, publisher confirms, format encoding |
+| HTTP | Source/Sink | One-shot / interval polling, data-path extraction, batched JSON requests with retries |
+| ClickHouse | Source/Sink | JSONEachRow inserts (ReplacingMergeTree upserts), pk-cursor resumable reads |
+| Elasticsearch | Source/Sink | Scroll reads, `_bulk` upserts with save modes, schema evolution |
+| Redis | Source/Sink | Key/scan reads, value-type writes |
 | Console | Sink | JSON lines to stdout (local runs / smoke tests) |
 
 ## Documentation

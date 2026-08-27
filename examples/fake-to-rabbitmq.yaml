@@ -1,0 +1,25 @@
+# FakeSource → RabbitMQ sink (smoke test for the AMQP connector).
+#
+# Local run:
+#   seatunnel run -m local -c examples/fake-to-rabbitmq.yaml
+#
+# Requires: docker compose up -d rabbitmq
+
+env:
+  job.name: fake-to-rabbitmq
+  parallelism: 1
+
+source:
+  FakeSource:
+    row.num: 20
+
+sinks:
+  - RabbitMQ:
+      host: 127.0.0.1
+      port: 5672
+      username: guest
+      password: guest
+      queue-name: seatunnel-demo
+      persistent: true
+      publisher-confirm: true
+      format: json
