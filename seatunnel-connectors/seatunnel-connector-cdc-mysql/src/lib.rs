@@ -1607,8 +1607,27 @@ impl MySqlCdcReader {
             return Ok(PollResult::Empty);
         }
 
-        // 3b. Read one event (bounded block) and try again.
-        self.next_binlog_event_with_timeout(250).await?;
+        // 3b. Read events (bounded block) until at least one row is decoded.
+        // Binlog traffic interleaves non-row events (BEGIN/TableMap/XID/GTID)
+        // with row events; absorbing a single event per poll made every
+        // non-row event surface as `Empty`, so the engine's idle backoff
+        // throttled capture to a handful of rows per second. Drain until a
+        // row is available, the stop boundary is reached, or the deadline
+        // passes.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        while self.binlog_buffer.is_empty() && !self.stop_reached {
+            let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remain.is_zero() {
+                break;
+            }
+            match self
+                .next_binlog_event_with_timeout(remain.as_millis() as u64)
+                .await?
+            {
+                Some(()) => {}
+                None => break, // timed out or the dump stream ended
+            }
+        }
         if let Some(row) = self.next_buffered_change() {
             return Ok(PollResult::Record(MySqlCdcOutput(row)));
         }
