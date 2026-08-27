@@ -51,4 +51,13 @@ pub trait SinkWriter: Send {
     fn apply_schema_change(&mut self, _event: &SchemaChangeEvent) -> WriterFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Flush buffered records when the sink's own linger has elapsed.
+    /// Called by the engine on idle polls so tail records do not sit in a
+    /// batch buffer waiting for the next write or checkpoint. Sinks that
+    /// buffer with a time-based flush should override this; the default is
+    /// a no-op for sinks with nothing pending.
+    fn poll_flush(&mut self) -> WriterFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
