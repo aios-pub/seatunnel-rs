@@ -5035,6 +5035,7 @@ name = "seatunnel-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "seatunnel-api",
  "seatunnel-config",
@@ -5043,6 +5044,7 @@ dependencies = [
  "serde_json 1.0.151",
  "serde_yaml",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",

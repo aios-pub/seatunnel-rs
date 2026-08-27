@@ -53,13 +53,22 @@ Java keys with no equivalent yet (ignored if present): `backup-count`,
 
 ## Checkpoint & watermark status vs Java
 
-- Checkpoints are per-task, interval-driven, ordered
+- **Local mode (`seatunnel run -m local`)** ships the full Java-style
+  protocol: a `LocalCheckpointDriver` coordinates global checkpoint ids,
+  triggers a barrier on every live task (prepare_commit → sink snapshot →
+  reader snapshot), aggregates all reports into one durable envelope
+  (atomic tmp+fsync+rename), then broadcasts completion so sink committers
+  run 2PC phase 2 and readers commit external offsets. Restart restores
+  readers/writers from the newest envelope and continues the id sequence.
+  Exactly-once sinks: Kafka (per-checkpoint transactions, stable
+  transactional id fencing zombies) and JdbcXa (MySQL XA, strict 2PC with
+  `XA RECOVER` settlement). CDC checkpoints land on transaction boundaries
+  (after-XID of the last fully emitted transaction). Graceful SIGINT/SIGTERM
+  takes a final savepoint checkpoint before tasks are cancelled.
+- **Cluster mode** checkpoints remain per-task, interval-driven
   flush-sinks-then-snapshot-reader (**at-least-once**); restore works for
   all CDC sources (binlog position/GTID, TiDB resolved_ts, PG LSN) and
-  Kafka offsets. Not implemented: cross-task barrier alignment (the
-  `BarrierTracker` is bookkeeping-only) and two-phase committers —
-  sink-side state is not checkpointed (current sinks are stateless or
-  idempotent).
+  Kafka offsets.
 - Watermarks: the CDC `WatermarkBuffer` exists but no connector uses it;
   there is no event-time/watermark processing in the engine
   (processing-time pass-through).

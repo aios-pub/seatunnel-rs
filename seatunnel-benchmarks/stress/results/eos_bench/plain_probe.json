@@ -1,0 +1,43 @@
+{
+  "elapsed_sec": 5.271537917,
+  "overall": {
+    "avg_ms": 22273.233576642335,
+    "load_count": 19865,
+    "max_ms": 32243,
+    "p50_ms": 22265,
+    "p90_ms": 30222,
+    "p95_ms": 31268,
+    "p999_ms": 32224,
+    "p99_ms": 32063
+  },
+  "per_topic": {
+    "eos-bench-plain": {
+      "avg_ms": 22273.233576642335,
+      "load_count": 19865,
+      "max_ms": 32243,
+      "p50_ms": 22265,
+      "p90_ms": 30222,
+      "p95_ms": 31268,
+      "p999_ms": 32224,
+      "p99_ms": 32063,
+      "snapshot_count": 0
+    }
+  },
+  "series_10s": [
+    {
+      "avg_ms": 22273.233576642335,
+      "count": 19865,
+      "max_ms": 32243,
+      "p99_ms": 32063,
+      "t_sec": 0
+    }
+  ],
+  "snapshot_counts": [
+    0
+  ],
+  "tag": "run",
+  "topics": [
+    "eos-bench-plain"
+  ],
+  "total_load_messages": 19865
+}

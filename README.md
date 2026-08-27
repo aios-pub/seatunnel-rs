@@ -10,7 +10,7 @@ worker execution → Kafka sink → periodic checkpoints, exercised continuously
 
 - **Dual Execution Modes**: Local (embedded) and Cluster (gRPC-based Master/Worker)
 - **Chained Pipelines**: Source → Transform → Sink executed per subtask with real dataflow
-- **Checkpoint Fault Tolerance**: sink flush before offset capture (at-least-once), durable local state store, automatic resume from the last binlog position
+- **Checkpoint Fault Tolerance**: local mode runs the full Java-style coordinator protocol — global barrier checkpoints, durable envelopes, two-phase commit (Kafka transactions / MySQL XA), `kill -9` recovery with no data loss
 - **Real CDC Connectors**: MySQL (binlog+GTID, keyset-paginated snapshot, partitioned ranges), TiDB (TiKV CDC), PostgreSQL (logical replication)
 - **Kafka Source/Sink**: consumer groups, optional transactional producer, batch flush at checkpoint boundaries (KRaft-mode compose stack, no ZooKeeper)
 - **11 Data Formats**: JSON, Text, Canal JSON, Debezium JSON, Compatible Debezium, Kafka Connect, OGG JSON, Maxwell JSON, Avro, Protobuf, Native
@@ -99,7 +99,10 @@ cargo test -p seatunnel-e2e --test e2e
 4. State persists to the worker's local store and reports to the master;
    a restarted task resumes from the newest checkpoint
 
-Delivery semantics: **at-least-once** (bounded duplicate window across the
+Delivery semantics (local mode): exactly-once for MySQL XA sinks; for
+Kafka transactional sinks every checkpoint is one atomic transaction with
+**no data loss** and a bounded duplicate window across kill -9 restarts
+(keyed upserts absorb it). Cluster mode remains **at-least-once** (bounded duplicate window across the
 snapshot/stream overlap). The Kafka sink additionally supports an optional
 transactional producer (`transactions.enabled: true`) for read_committed
 consumers.
