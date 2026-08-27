@@ -127,7 +127,9 @@ pub struct JdbcSourceReader {
     range_idx: usize,
     last_pk: i64,
     offset: u64,
-    buffer: Vec<Row>,
+    /// FIFO page buffer; `VecDeque` keeps per-record pops O(1) without the
+    /// deep clone the old `Vec::remove(0)` path paid on every record.
+    buffer: std::collections::VecDeque<Row>,
     done: bool,
     restored: Option<JdbcSourceState>,
 }
@@ -148,7 +150,7 @@ impl JdbcSourceReader {
             range_idx: 0,
             last_pk: 0,
             offset: 0,
-            buffer: Vec::new(),
+            buffer: std::collections::VecDeque::new(),
             done: false,
             restored: None,
         }
@@ -349,7 +351,7 @@ impl JdbcSourceReader {
                 return Ok(false);
             }
             let result = endpoint.query(query, &[]).await?;
-            self.buffer = rows_to_records(&result, self.schema.as_ref(), dialect);
+            self.buffer = rows_to_records(&result, self.schema.as_ref(), dialect).into();
             self.offset = 1;
             return Ok(!self.buffer.is_empty());
         }
@@ -419,7 +421,7 @@ impl JdbcSourceReader {
                     .iter()
                     .position(|c| Some(c) == self.partition_column.as_ref())
             });
-        self.buffer = rows_to_records(&result, self.schema.as_ref(), dialect);
+        self.buffer = rows_to_records(&result, self.schema.as_ref(), dialect).into();
         if let Some(pos) = pk_pos {
             if let Some(last) = result.rows.last() {
                 if let Some(v) = last.get(pos) {
@@ -505,16 +507,15 @@ impl SourceReader for JdbcSourceReader {
             if self.done && self.buffer.is_empty() {
                 return Ok(PollResult::EOF);
             }
-            if !self.buffer.is_empty() {
-                return Ok(PollResult::Record(self.buffer.remove(0)));
+            if let Some(row) = self.buffer.pop_front() {
+                return Ok(PollResult::Record(row));
             }
             self.ensure_initialized().await?;
             if self.done && self.buffer.is_empty() {
                 return Ok(PollResult::EOF);
             }
             if self.fetch_next_page().await? {
-                if let Some(row) = self.buffer.first().cloned() {
-                    self.buffer.remove(0);
+                if let Some(row) = self.buffer.pop_front() {
                     return Ok(PollResult::Record(row));
                 }
             }
