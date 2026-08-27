@@ -643,6 +643,7 @@ impl SinkWriter for JdbcSinkWriter {
 
     fn prepare_commit(
         &mut self,
+        _checkpoint_id: u64,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
         Box::pin(async move {
             if self.endpoint.is_some() {

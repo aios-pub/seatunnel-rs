@@ -31,6 +31,7 @@
 //! - [`value`] — Field ↔ driver value conversions
 //! - [`catalog`] — information_schema / pg_catalog discovery
 //! - [`source`] / [`sink`] — reader & writer
+//! - [`xa_sink`] — MySQL XA exactly-once writer & committer
 
 pub mod catalog;
 pub mod conn;
@@ -39,6 +40,7 @@ pub mod sink;
 pub mod source;
 pub mod url;
 pub mod value;
+pub mod xa_sink;
 
 pub use conn::{DbEndpoint, QueryResult};
 pub use dialect::JdbcDialectKind;
@@ -50,6 +52,8 @@ pub use url::{parse_jdbc_url, JdbcUrl};
 pub use value::SqlValue;
 
 pub use source::JdbcSplit;
+
+pub use xa_sink::{XaCommitInfo, XaSink, XaSinkCommitter, XaSinkConfig, XaSinkWriter};
 
 #[cfg(test)]
 mod tests {
