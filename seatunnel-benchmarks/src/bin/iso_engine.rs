@@ -82,6 +82,7 @@ impl SinkWriter for NoopWriter {
     }
     fn prepare_commit(
         &mut self,
+        _checkpoint_id: u64,
     ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -114,7 +115,7 @@ async fn scenario_raw() -> Duration {
             _ => tokio::time::sleep(Duration::from_millis(1)).await,
         }
     }
-    sink.prepare_commit().await.unwrap();
+    sink.prepare_commit(1).await.unwrap();
     sink.close().await.unwrap();
     start.elapsed()
 }
