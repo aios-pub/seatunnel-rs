@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use seatunnel_engine_comm::{
-    CheckpointReport, Empty, HeartbeatRequest, HeartbeatResponse, MasterService, TaskDescriptor,
-    TaskStatusReport, UnregisterWorkerRequest, WorkerRegistration, WorkerRegistrationResponse,
+    CheckpointReport, Empty, FetchCheckpointRequest, FetchCheckpointResponse, HeartbeatRequest,
+    HeartbeatResponse, MasterService, TaskStatusReport, UnregisterWorkerRequest,
+    WorkerRegistration, WorkerRegistrationResponse,
 };
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -80,6 +81,8 @@ pub struct MasterHandler {
     state: Mutex<MasterState>,
     coordinator: Arc<JobCoordinator>,
     workers: WorkerRegistry,
+    /// worker_id → task ids to preempt on its next heartbeat (fencing).
+    pending_preemptions: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl MasterHandler {
@@ -88,6 +91,7 @@ impl MasterHandler {
             state: Mutex::new(MasterState::default()),
             coordinator,
             workers,
+            pending_preemptions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -112,7 +116,13 @@ impl MasterService for MasterHandler {
         request: Request<WorkerRegistration>,
     ) -> Result<Response<WorkerRegistrationResponse>, Status> {
         let reg = request.into_inner();
-        info!("Worker registering: {} at {}", reg.worker_id, reg.address);
+        let returning = self.workers.read().unwrap().contains_key(&reg.worker_id);
+        info!(
+            "Worker {} registering at {} ({} running task(s))",
+            reg.worker_id,
+            reg.address,
+            reg.running_task_ids.len()
+        );
         self.workers.write().unwrap().insert(
             reg.worker_id.clone(),
             WorkerEntry {
@@ -120,6 +130,26 @@ impl MasterService for MasterHandler {
                 last_heartbeat_ms: seatunnel_engine_core::now_millis(),
             },
         );
+        // Fencing: tasks this worker still runs but which were reassigned
+        // during its absence must stop locally (prevents double execution).
+        if returning && !reg.running_task_ids.is_empty() {
+            let preempted = self
+                .coordinator
+                .register_running_tasks(&reg.worker_id, &reg.running_task_ids);
+            if !preempted.is_empty() {
+                warn!(
+                    "Worker {} returned with {} reassigned task(s); fencing",
+                    reg.worker_id,
+                    preempted.len()
+                );
+                self.pending_preemptions
+                    .lock()
+                    .await
+                    .entry(reg.worker_id.clone())
+                    .or_default()
+                    .extend(preempted);
+            }
+        }
         let mut state = self.state.lock().await;
         state.task_assignments.retain(|_, _| true);
 
@@ -136,6 +166,35 @@ impl MasterService for MasterHandler {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let hb = request.into_inner();
         let worker_id = hb.worker_id.clone();
+
+        // A worker evicted by TTL that comes back (SIGSTOP/network
+        // glitch) may still run tasks that were reassigned in its
+        // absence — fence them from its heartbeat task list.
+        {
+            let known = {
+                let reg = self.workers.read().unwrap();
+                reg.contains_key(&worker_id)
+            };
+            if !known && !hb.tasks.is_empty() {
+                let running: Vec<String> =
+                    hb.tasks.iter().map(|t| t.task_id.clone()).collect();
+                let preempted =
+                    self.coordinator.register_running_tasks(&worker_id, &running);
+                if !preempted.is_empty() {
+                    warn!(
+                        "Worker {} returned with {} reassigned task(s); fencing via heartbeat",
+                        worker_id,
+                        preempted.len()
+                    );
+                    self.pending_preemptions
+                        .lock()
+                        .await
+                        .entry(worker_id.clone())
+                        .or_default()
+                        .extend(preempted);
+                }
+            }
+        }
 
         // Refresh liveness.
         {
@@ -156,10 +215,14 @@ impl MasterService for MasterHandler {
             }
         }
 
-        // Hand out never-dispatched tasks, then mark them as deploying so
-        // they cannot be double-assigned on the next heartbeat.
-        let pending_tasks: Vec<TaskDescriptor> =
-            self.coordinator.get_pending_tasks_for_worker(&worker_id);
+        // Failover-aware handout: pending tasks assigned to this worker
+        // PLUS orphaned tasks of evicted workers (reassigned here).
+        let pending_tasks = {
+            let live = self.workers.read().unwrap();
+            self.coordinator.claim_tasks_for_worker(&worker_id, &hb.address, &|w| {
+                live.contains_key(w)
+            })
+        };
         if !pending_tasks.is_empty() {
             info!(
                 "Dispatching {} task(s) to worker {}",
@@ -177,11 +240,20 @@ impl MasterService for MasterHandler {
         // Push cancellations so workers stop their local tasks promptly.
         let cancel_jobs = self.coordinator.cancelled_job_ids();
 
+        // Preemption fence: tasks reassigned away from this worker.
+        let preempted_task_ids = self
+            .pending_preemptions
+            .lock()
+            .await
+            .remove(&worker_id)
+            .unwrap_or_default();
+
         Ok(Response::new(HeartbeatResponse {
             worker_id,
             next_interval_ms: 2000,
             pending_tasks,
             cancel_jobs,
+            preempted_task_ids,
         }))
     }
 
@@ -229,12 +301,26 @@ impl MasterService for MasterHandler {
     ) -> Result<Response<Empty>, Status> {
         let report = request.into_inner();
         tracing::debug!(
-            "Checkpoint {} for job {} task {} success={}",
+            "Checkpoint {} for job {} task {} success={} ({} bytes)",
             report.checkpoint_id,
             report.job_id,
             report.task_id,
-            report.success
+            report.success,
+            report.checkpoint_data.len()
         );
+        // Master-backed shared store: persist the uploaded bytes so any
+        // worker can resume this task after a failover.
+        if report.success && !report.checkpoint_data.is_empty() {
+            self.coordinator
+                .checkpoint_store()
+                .save(
+                    &report.job_id,
+                    &report.task_id,
+                    report.checkpoint_id.max(0) as u64,
+                    &report.checkpoint_data,
+                )
+                .await;
+        }
         self.coordinator.report_checkpoint(
             &report.job_id,
             &report.task_id,
@@ -242,6 +328,23 @@ impl MasterService for MasterHandler {
             report.success,
         );
         Ok(Response::new(Empty {}))
+    }
+
+    async fn fetch_checkpoint(
+        &self,
+        request: Request<FetchCheckpointRequest>,
+    ) -> Result<Response<FetchCheckpointResponse>, Status> {
+        let req = request.into_inner();
+        match self.coordinator.fetch_checkpoint(&req.job_id, &req.task_id).await {
+            Some((id, data)) => Ok(Response::new(FetchCheckpointResponse {
+                checkpoint_id: id as i64,
+                checkpoint_data: data,
+            })),
+            None => Ok(Response::new(FetchCheckpointResponse {
+                checkpoint_id: 0,
+                checkpoint_data: Vec::new(),
+            })),
+        }
     }
 
     async fn unregister_worker(
@@ -252,6 +355,35 @@ impl MasterService for MasterHandler {
         warn!("Worker unregistering: {}", req.worker_id);
         self.workers.write().unwrap().remove(&req.worker_id);
         Ok(Response::new(Empty {}))
+    }
+}
+
+/// Master-to-master state replication endpoint (HA standby sync).
+pub struct ReplicationHandler {
+    coordinator: Arc<JobCoordinator>,
+}
+
+impl ReplicationHandler {
+    pub fn new(coordinator: Arc<JobCoordinator>) -> Self {
+        ReplicationHandler { coordinator }
+    }
+}
+
+#[tonic::async_trait]
+impl seatunnel_engine_comm::ReplicationService for ReplicationHandler {
+    async fn pull_state(
+        &self,
+        request: Request<seatunnel_engine_comm::PullStateRequest>,
+    ) -> Result<Response<seatunnel_engine_comm::StateSnapshot>, Status> {
+        let req = request.into_inner();
+        tracing::debug!("Replication: state pulled by {}", req.requester_id);
+        let state = self.coordinator.export_state().await;
+        let snapshot = seatunnel_engine_comm::StateSnapshot {
+            state_json: serde_json::to_string(&state)
+                .map_err(|e| Status::internal(format!("serialize state: {}", e)))?,
+            exported_at_ms: seatunnel_engine_core::now_millis(),
+        };
+        Ok(Response::new(snapshot))
     }
 }
 

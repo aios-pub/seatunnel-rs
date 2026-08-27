@@ -18,6 +18,8 @@ use tracing::info;
 /// Engine client for submitting and managing jobs.
 pub struct EngineClient {
     grpc_address: String,
+    /// All master addresses (failover order); comma list from -a/--master.
+    all_addresses: Vec<String>,
     rest_address: String,
     #[allow(dead_code)] // reserved for REST-based fallback operations
     http: HttpClient,
@@ -25,12 +27,76 @@ pub struct EngineClient {
 
 impl EngineClient {
     /// Create a new engine client pointing to the given master address.
+    /// Accepts a comma-separated list (failover order): the first
+    /// reachable master is used for every operation.
     pub fn new(master_address: &str) -> Self {
+        let all: Vec<String> = master_address
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        let primary = all.first().cloned().unwrap_or_else(|| master_address.to_string());
         EngineClient {
-            grpc_address: format!("http://{}", master_address),
-            rest_address: format!("http://{}/api/v1", master_address),
+            grpc_address: format!("http://{}", primary),
+            all_addresses: all,
+            rest_address: format!("http://{}/api/v1", primary),
             http: HttpClient::new(),
         }
+    }
+
+    /// Connect to the first reachable master (failover across
+    /// `all_addresses`).
+    async fn connect_failover(
+        &self,
+    ) -> Result<ClientServiceClient<tonic::transport::Channel>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let addresses = if self.all_addresses.is_empty() {
+            vec![self.grpc_address.clone()]
+        } else {
+            self.all_addresses
+                .iter()
+                .map(|a| format!("http://{}", a))
+                .collect()
+        };
+        let mut last_err: Option<String> = None;
+        for addr in addresses {
+            match ClientServiceClient::connect(addr.clone()).await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    info!("Master {} unreachable ({}); trying next", addr, e);
+                    last_err = Some(format!("{}: {}", addr, e));
+                }
+            }
+        }
+        Err(format!(
+            "no reachable master ({})",
+            last_err.unwrap_or_default()
+        )
+        .into())
+    }
+
+    /// Try each comma-separated master address in order; returns a client
+    /// connected to the first reachable one.
+    pub async fn connect_any(
+        master_addresses: &str,
+    ) -> Result<ClientServiceClient<tonic::transport::Channel>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut last_err: Option<String> = None;
+        for addr in master_addresses.split(',').map(|a| a.trim()).filter(|a| !a.is_empty()) {
+            match ClientServiceClient::connect(format!("http://{}", addr)).await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    info!("Master {} unreachable ({}); trying next", addr, e);
+                    last_err = Some(format!("{}: {}", addr, e));
+                }
+            }
+        }
+        Err(format!(
+            "no reachable master in '{}' ({})",
+            master_addresses,
+            last_err.unwrap_or_default()
+        )
+        .into())
     }
 
     /// Submit a job via gRPC.
@@ -41,7 +107,7 @@ impl EngineClient {
         job_config: Vec<u8>,
         parallelism: i32,
     ) -> Result<SubmitJobResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let mut client = ClientServiceClient::connect(self.grpc_address.clone()).await?;
+        let mut client = self.connect_failover().await?;
         let request = SubmitJobRequest {
             job_id: job_id.to_string(),
             job_config,
@@ -59,7 +125,7 @@ impl EngineClient {
         &self,
         job_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut client = ClientServiceClient::connect(self.grpc_address.clone()).await?;
+        let mut client = self.connect_failover().await?;
         let request = CancelJobRequest {
             job_id: job_id.to_string(),
         };
@@ -73,7 +139,7 @@ impl EngineClient {
         &self,
         job_id: &str,
     ) -> Result<JobStatus, Box<dyn std::error::Error + Send + Sync>> {
-        let mut client = ClientServiceClient::connect(self.grpc_address.clone()).await?;
+        let mut client = self.connect_failover().await?;
         let request = JobStatusRequest {
             job_id: job_id.to_string(),
         };
@@ -86,7 +152,7 @@ impl EngineClient {
         &self,
     ) -> Result<ClusterInfo, Box<dyn std::error::Error + Send + Sync>> {
         use seatunnel_engine_comm::Empty;
-        let mut client = ClientServiceClient::connect(self.grpc_address.clone()).await?;
+        let mut client = self.connect_failover().await?;
         let response = client.get_cluster_info(Request::new(Empty {})).await?;
         Ok(response.into_inner())
     }
@@ -94,7 +160,7 @@ impl EngineClient {
     /// List all jobs.
     pub async fn list_jobs(&self) -> Result<JobList, Box<dyn std::error::Error + Send + Sync>> {
         use seatunnel_engine_comm::Empty;
-        let mut client = ClientServiceClient::connect(self.grpc_address.clone()).await?;
+        let mut client = self.connect_failover().await?;
         let response = client.list_jobs(Request::new(Empty {})).await?;
         Ok(response.into_inner())
     }

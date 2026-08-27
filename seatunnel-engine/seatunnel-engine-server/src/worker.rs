@@ -59,6 +59,10 @@ type SharedMasterClient = Arc<Mutex<Option<MasterServiceClient<tonic::transport:
 pub struct WorkerNode {
     /// Auto-cleanup settings (0/None disables the cleaner).
     clean_config: Option<CleanConfig>,
+    /// Checkpoint storage backend: localfile | master | s3.
+    storage_type: String,
+    /// S3 store when storage_type = s3.
+    s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
     worker_id: String,
     #[allow(dead_code)] // reported to the master once registration is wired up
     address: String,
@@ -97,7 +101,19 @@ impl WorkerNode {
             state_store,
             running_tasks: Mutex::new(HashMap::new()),
             clean_config,
+            storage_type: "localfile".to_string(),
+            s3_store: None,
         }
+    }
+
+    /// Attach the checkpoint storage backend (master/s3) for failover.
+    pub fn with_checkpoint_storage(
+        &mut self,
+        storage_type: &str,
+        s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
+    ) {
+        self.storage_type = storage_type.to_string();
+        self.s3_store = s3_store;
     }
 
     /// Set the gRPC client used for reporting to the master.
@@ -114,6 +130,16 @@ impl WorkerNode {
     pub async fn assign_task(self: &Arc<Self>, task: TaskDescriptor) {
         let task_id = task.task_id.clone();
         let job_id = task.job_id.clone();
+
+        // Failover dedup: if this worker already runs the task (e.g. the
+        // master re-dispatched during a reconnect window), skip it.
+        if self.running_tasks.lock().await.contains_key(&task_id) {
+            info!(
+                "Worker {}: task {} already running locally — dispatch ignored",
+                self.worker_id, task_id
+            );
+            return;
+        }
 
         info!(
             "Worker {}: accepting task {} (subtask {}/{})",
@@ -133,6 +159,8 @@ impl WorkerNode {
             worker_id: self.worker_id.clone(),
             master_client: self.master_client.clone(),
             state_store: self.state_store.clone(),
+            storage_type: self.storage_type.clone(),
+            s3_store: self.s3_store.clone(),
         };
 
         let worker = Arc::clone(self);
@@ -142,6 +170,29 @@ impl WorkerNode {
             // Detach from the registry once terminal.
             worker.running_tasks.lock().await.remove(&cleanup_task_id);
         });
+    }
+
+    /// Ids of tasks currently running on this worker (fencing reports).
+    pub async fn running_task_ids(&self) -> Vec<String> {
+        self.running_tasks.lock().await.keys().cloned().collect()
+    }
+
+    /// Cancel specific tasks that were reassigned elsewhere by the master
+    /// (failover fencing) so they are not executed twice.
+    pub async fn preempt_tasks(&self, task_ids: &[String]) {
+        if task_ids.is_empty() {
+            return;
+        }
+        let mut tasks = self.running_tasks.lock().await;
+        for task_id in task_ids {
+            if let Some(handle) = tasks.get_mut(task_id) {
+                warn!(
+                    "Worker {}: preempting task {} (reassigned by the master)",
+                    self.worker_id, task_id
+                );
+                handle.cancel.cancel();
+            }
+        }
     }
 
     /// Snapshot of running tasks for the next heartbeat.
@@ -255,6 +306,34 @@ pub fn spawn_state_cleaner(worker: Arc<WorkerNode>, config: CleanConfig) -> toki
     })
 }
 
+/// Fetch the newest checkpoint from the master-backed shared store.
+async fn fetch_checkpoint_from_master(
+    master_client: &SharedMasterClient,
+    job_id: &str,
+    task_id: &str,
+) -> Option<(u64, Vec<u8>)> {
+    let mut guard = master_client.lock().await;
+    let client = guard.as_mut()?;
+    let request = tonic::Request::new(seatunnel_engine_comm::FetchCheckpointRequest {
+        job_id: job_id.to_string(),
+        task_id: task_id.to_string(),
+    });
+    match client.fetch_checkpoint(request).await {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            if inner.checkpoint_id > 0 && !inner.checkpoint_data.is_empty() {
+                Some((inner.checkpoint_id as u64, inner.checkpoint_data))
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            warn!("fetch_checkpoint for {} failed: {}", task_id, e);
+            None
+        }
+    }
+}
+
 /// Schedule deletion of a cancelled job's local state after the grace
 /// window (keeps a restore window for operator intervention).
 pub fn schedule_cancel_cleanup(
@@ -276,6 +355,10 @@ struct TaskExecCtx {
     worker_id: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
+    /// Checkpoint storage backend: localfile | master | s3.
+    storage_type: String,
+    /// S3 store (storage type = s3); workers write directly.
+    s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
 }
 
 /// Execute one descriptor end-to-end: build connectors, restore state, run
@@ -402,19 +485,60 @@ async fn run_pipeline(
     );
     let transforms_cfg: Vec<serde_json::Value> = serde_json::from_str(transform_raw)?;
 
-    // Restore from the newest durable checkpoint when one exists.
-    let restore_state = ctx
+    // Restore chain: worker-local disk > shared backend (master store /
+    // S3 by storage type) > cold start. A task taken over from a dead
+    // worker resumes from the shared checkpoint instead of re-snapshotting.
+    let restore_state = if let Some((id, data)) = ctx
         .state_store
         .load_latest_checkpoint(&task.job_id, &task.task_id)
         .ok()
         .flatten()
-        .map(|(id, data)| {
-            info!(
-                "Task {}: restoring from local checkpoint {}",
-                task.task_id, id
-            );
-            data
-        });
+    {
+        info!(
+            "Task {}: restored checkpoint cp-{} from local",
+            task.task_id, id
+        );
+        Some(data)
+    } else {
+        match ctx.storage_type.as_str() {
+            "master" => fetch_checkpoint_from_master(
+                &ctx.master_client,
+                &task.job_id,
+                &task.task_id,
+            )
+            .await
+            .map(|(id, data)| {
+                info!(
+                    "Task {}: restored checkpoint cp-{} from master",
+                    task.task_id, id
+                );
+                data
+            }),
+            "s3" => {
+                let fetched = if let Some(store) = &ctx.s3_store {
+                    store
+                        .load_latest(&task.job_id, &task.task_id)
+                        .await
+                } else {
+                    None
+                };
+                fetched.map(|(id, data)| {
+                    info!(
+                        "Task {}: restored checkpoint cp-{} from s3",
+                        task.task_id, id
+                    );
+                    data
+                })
+            }
+            _ => {
+                info!(
+                    "Task {}: no checkpoint found (cold start)",
+                    task.task_id
+                );
+                None
+            }
+        }
+    };
 
     let reader = create_source(
         source_plugin,
@@ -468,6 +592,8 @@ async fn run_pipeline(
         worker_id: ctx.worker_id.clone(),
         master_client: ctx.master_client.clone(),
         state_store: ctx.state_store.clone(),
+        upload_to_master: ctx.storage_type == "master",
+        s3_store: ctx.s3_store.clone(),
     }));
 
     let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
@@ -481,6 +607,10 @@ struct TaskCheckpointReporter {
     worker_id: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
+    /// Upload bytes to the master-backed store (storage type = master).
+    upload_to_master: bool,
+    /// Direct S3 writes (storage type = s3).
+    s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
 }
 
 impl CheckpointListener for TaskCheckpointReporter {
@@ -504,7 +634,16 @@ impl CheckpointListener for TaskCheckpointReporter {
                 );
             }
 
-            // 2. Master notification (observability).
+            // 2. S3 direct write (storage type = s3): Java external-storage
+            //    model — failures log and skip (local disk already holds
+            //    the state; restore falls back to it).
+            if let Some(store) = &self.s3_store {
+                store.save(job_id, task_id, checkpoint_id, &state).await;
+            }
+
+            // 3. Master notification; bytes ride along for the
+            //    master-backed shared store (storage type = master).
+            let upload = if self.upload_to_master { state.clone() } else { Vec::new() };
             let mut guard = self.master_client.lock().await;
             if let Some(client) = guard.as_mut() {
                 let report = CheckpointReport {
@@ -512,7 +651,7 @@ impl CheckpointListener for TaskCheckpointReporter {
                     task_id: task_id.to_string(),
                     checkpoint_id: checkpoint_id as i64,
                     timestamp,
-                    checkpoint_data: Vec::new(),
+                    checkpoint_data: upload,
                     success: true,
                 };
                 if let Err(e) = client.report_checkpoint(tonic::Request::new(report)).await {

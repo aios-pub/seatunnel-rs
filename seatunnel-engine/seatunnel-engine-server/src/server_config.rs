@@ -40,12 +40,59 @@
 
 use serde::Deserialize;
 
+
+/// Top-level `hazelcast:` section (Java cluster config adapted).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HazelcastSection {
+    #[serde(default)]
+    pub cluster_name: Option<String>,
+    #[serde(default)]
+    pub network: HazelcastNetwork,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HazelcastNetwork {
+    #[serde(default)]
+    pub join: HazelcastJoin,
+    #[serde(default)]
+    pub port: HazelcastPort,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HazelcastJoin {
+    #[serde(default)]
+    pub tcp_ip: HazelcastTcpIp,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HazelcastTcpIp {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub member_list: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HazelcastPort {
+    #[serde(default)]
+    pub auto_increment: Option<bool>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
 /// Root of `seatunnel.yaml`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ServerConfigFile {
     #[serde(default)]
     pub seatunnel: SeatunnelSection,
+    #[serde(default)]
+    pub hazelcast: HazelcastSection,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -62,6 +109,15 @@ pub struct EngineSection {
     /// artifacts are kept before expiry (default 1440 = 24h).
     #[serde(default)]
     pub history_job_expire_minutes: Option<u64>,
+    /// Heartbeat timeout before a worker is evicted (failover).
+    #[serde(default)]
+    pub worker_timeout_ms: Option<u64>,
+    /// Master-to-master state replication period (HA standby sync).
+    #[serde(default)]
+    pub replication_interval_ms: Option<u64>,
+    /// This worker's advertised address (host:port).
+    #[serde(default)]
+    pub worker_address: Option<String>,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
 }
@@ -101,6 +157,32 @@ pub struct StorageSection {
     /// How often the TTL sweep runs.
     #[serde(default)]
     pub clean_interval_minutes: Option<u64>,
+    /// S3 backend keys (`checkpoint.storage.type: s3`).
+    #[serde(default)]
+    pub plugin_config: S3PluginConfig,
+}
+
+/// `checkpoint.storage.plugin-config` block (S3/MinIO).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct S3PluginConfig {
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// S3-compatible endpoint (MinIO: http://host:9000).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub access_key: Option<String>,
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Object key prefix inside the bucket.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// MinIO needs path-style addressing.
+    #[serde(default)]
+    pub path_style: Option<bool>,
 }
 
 /// Resolved effective configuration (file + overrides merged).
@@ -121,6 +203,34 @@ pub struct EngineServerConfig {
     /// Minutes of inactivity before a job's state dir is swept
     /// (Java `history-job-expire-minutes`).
     pub history_job_expire_minutes: u64,
+    /// Heartbeat timeout before worker eviction (ms).
+    pub worker_timeout_ms: u64,
+    /// Master state replication period (ms).
+    pub replication_interval_ms: u64,
+    /// This worker's advertised address.
+    pub worker_address: String,
+    /// Checkpoint storage backend: localfile | master | s3.
+    pub storage_type: String,
+    /// S3 backend settings (when storage_type = s3).
+    pub s3: ResolvedS3Config,
+    /// Ordered master seed addresses (cluster member list).
+    pub member_list: Vec<String>,
+    /// Cluster name (informational fencing, Java key).
+    pub cluster_name: String,
+    /// Master bind port from the hazelcast section (None = keep default).
+    pub hazelcast_port: Option<u16>,
+}
+
+/// Resolved S3/MinIO checkpoint storage configuration.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedS3Config {
+    pub bucket: String,
+    pub endpoint: String,
+    pub region: String,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub prefix: String,
+    pub path_style: bool,
 }
 
 impl Default for EngineServerConfig {
@@ -133,6 +243,14 @@ impl Default for EngineServerConfig {
             clean_grace_minutes: 10,
             clean_interval_minutes: 60,
             history_job_expire_minutes: 1440,
+            worker_timeout_ms: 6_000,
+            replication_interval_ms: 5_000,
+            worker_address: "127.0.0.1:5001".to_string(),
+            storage_type: "localfile".to_string(),
+            s3: ResolvedS3Config::default(),
+            member_list: vec!["127.0.0.1:5800".to_string()],
+            cluster_name: "seatunnel".to_string(),
+            hazelcast_port: None,
         }
     }
 }
@@ -188,13 +306,58 @@ impl EngineServerConfig {
             self.clean_interval_minutes = minutes.max(1);
         }
         if let Some(kind) = storage.r#type.as_deref() {
-            if !kind.is_empty() && kind != "localfile" {
-                tracing::warn!(
-                    "checkpoint.storage.type '{}' ignored — this engine stores checkpoints \
-                     on the local filesystem (localfile) only",
-                    kind
-                );
+            if !kind.is_empty() {
+                match kind {
+                    "localfile" | "master" | "s3" => self.storage_type = kind.to_string(),
+                    other => tracing::warn!(
+                        "checkpoint.storage.type '{}' unknown, using localfile",
+                        other
+                    ),
+                }
             }
+        }
+        let plugin = &storage.plugin_config;
+        if let Some(bucket) = plugin.bucket.as_deref().filter(|b| !b.is_empty()) {
+            self.s3.bucket = bucket.to_string();
+        }
+        if let Some(endpoint) = plugin.endpoint.as_deref().filter(|e| !e.is_empty()) {
+            self.s3.endpoint = endpoint.to_string();
+        }
+        if let Some(region) = plugin.region.as_deref().filter(|r| !r.is_empty()) {
+            self.s3.region = region.to_string();
+        }
+        if let Some(key) = plugin.access_key.as_deref().filter(|k| !k.is_empty()) {
+            self.s3.access_key = Some(key.to_string());
+        }
+        if let Some(key) = plugin.secret_key.as_deref().filter(|k| !k.is_empty()) {
+            self.s3.secret_key = Some(key.to_string());
+        }
+        if let Some(prefix) = plugin.prefix.as_deref().filter(|p| !p.is_empty()) {
+            self.s3.prefix = prefix.trim_matches('/').to_string();
+        }
+        if let Some(path_style) = plugin.path_style {
+            self.s3.path_style = path_style;
+        }
+        // hazelcast section
+        let hz = &file.hazelcast;
+        if let Some(name) = hz.cluster_name.as_deref().filter(|n| !n.is_empty()) {
+            self.cluster_name = name.to_string();
+        }
+        if let Some(port) = hz.network.port.port {
+            self.hazelcast_port = Some(port);
+        }
+        if hz.network.port.auto_increment == Some(true) {
+            tracing::warn!(
+                "hazelcast.network.port.auto-increment is not supported — \
+                 member-list requires deterministic master ports"
+            );
+        }
+        let members = hz.network.join.tcp_ip.member_list.iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>();
+        if !members.is_empty() {
+            self.member_list = members;
         }
     }
 }

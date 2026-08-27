@@ -137,6 +137,8 @@ pub struct JobCoordinator {
     jobs: RwLock<HashMap<String, RunningJob>>,
     /// Full descriptors by task_id — handed to workers at dispatch time.
     all_tasks: RwLock<HashMap<String, TaskDescriptor>>,
+    /// Master-backed shared checkpoint store (storage type = master).
+    checkpoint_store: crate::checkpoint_store::MasterCheckpointStore,
 }
 
 impl Default for JobCoordinator {
@@ -252,6 +254,7 @@ impl JobCoordinator {
         JobCoordinator {
             jobs: RwLock::new(HashMap::new()),
             all_tasks: RwLock::new(HashMap::new()),
+            checkpoint_store: crate::checkpoint_store::MasterCheckpointStore::new(3),
         }
     }
 
@@ -448,6 +451,347 @@ impl JobCoordinator {
         out
     }
 
+    /// Tasks handed to a heartbeat-coming worker under the failover rule:
+    /// pending (Created/Scheduled) tasks assigned to it, plus orphaned
+    /// tasks (Deploying/Running) whose assigned worker is no longer in
+    /// the live registry — reassigned to the requester. The second arm
+    /// implements worker failover: a dead worker's tasks are taken over
+    /// by any live worker.
+    pub fn claim_tasks_for_worker(
+        &self,
+        worker_id: &str,
+        worker_addr: &str,
+        live_workers: &dyn Fn(&str) -> bool,
+    ) -> Vec<TaskDescriptor> {
+        let jobs = self.jobs.read();
+        let mut all = self.all_tasks.write();
+        let mut out = Vec::new();
+        for job in jobs.values() {
+            if job.state.is_terminal() {
+                continue;
+            }
+            let task_ids: Vec<String> = job.tasks.keys().cloned().collect();
+            for task_id in task_ids {
+                let (_assigned, eligible) = {
+                    let Some(info) = job.tasks.get(&task_id) else {
+                        continue;
+                    };
+                    if matches!(info.state, JobState::Created | JobState::Scheduled) {
+                        (info.worker_id.clone(), true)
+                    } else if matches!(info.state, JobState::Deploying | JobState::Running) {
+                        (
+                            info.worker_id.clone(),
+                            !live_workers(&info.worker_id),
+                        )
+                    } else {
+                        continue;
+                    }
+                };
+                if !eligible {
+                    continue;
+                }
+                let Some(desc) = all.get_mut(&task_id) else {
+                    continue;
+                };
+                let assigned_to_me = desc
+                    .config
+                    .get("worker_id")
+                    .map(|w| w == worker_id)
+                    .unwrap_or(false);
+                if assigned_to_me {
+                    // Regular pending handout.
+                    out.push(desc.clone());
+                } else if !live_workers(
+                    desc.config.get("worker_id").map(String::as_str).unwrap_or(""),
+                ) {
+                    // Orphan takeover: reassign to the requester.
+                    info!(
+                        "Failover: task {} reassigned from dead worker '{}' to '{}'",
+                        task_id,
+                        desc.config.get("worker_id").cloned().unwrap_or_default(),
+                        worker_id
+                    );
+                    desc.config.insert("worker_id".to_string(), worker_id.to_string());
+                    desc.config
+                        .insert("worker_address".to_string(), worker_addr.to_string());
+                    out.push(desc.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Evict a dead worker: mark its non-terminal tasks claimable again
+    /// (the heartbeat claim rule takes over from here). Returns the
+    /// affected task ids (for logging).
+    pub fn evict_worker(&self, worker_id: &str) -> Vec<String> {
+        let mut jobs = self.jobs.write();
+        let mut affected = Vec::new();
+        for job in jobs.values_mut() {
+            if job.state.is_terminal() {
+                continue;
+            }
+            for (task_id, info) in job.tasks.iter_mut() {
+                if info.worker_id == worker_id
+                    && matches!(info.state, JobState::Deploying | JobState::Running)
+                {
+                    // Deploying keeps the claim rule's orphan arm eligible;
+                    // Running tasks must go back to a claimable state.
+                    info.state = JobState::Deploying;
+                    affected.push(task_id.clone());
+                }
+            }
+        }
+        affected
+    }
+
+    /// Mark tasks reported as running by a (re)registering worker so no
+    /// other worker claims them, and return the subset this worker must
+    /// STOP because they were reassigned elsewhere (fencing).
+    pub fn register_running_tasks(
+        &self,
+        worker_id: &str,
+        running_task_ids: &[String],
+    ) -> Vec<String> {
+        if running_task_ids.is_empty() {
+            return Vec::new();
+        }
+        let jobs = self.jobs.read();
+        let all = self.all_tasks.read();
+        let mut preempted = Vec::new();
+        for task_id in running_task_ids {
+            let Some(job) = jobs.values().find(|j| j.tasks.contains_key(task_id)) else {
+                continue;
+            };
+            let Some(info) = job.tasks.get(task_id) else {
+                continue;
+            };
+            if info.worker_id == worker_id {
+                continue; // still ours
+            }
+            // Verify the current owner via the descriptor (assignment
+            // source of truth after failover reassignment).
+            let current_owner = all
+                .get(task_id)
+                .and_then(|d| d.config.get("worker_id").cloned())
+                .unwrap_or_default();
+            if current_owner == worker_id {
+                continue; // descriptor reassigned back to us
+            }
+            info!(
+                "Fencing: task '{}' reported by worker '{}' but owned by '{}' — preempting",
+                task_id, worker_id, current_owner
+            );
+            preempted.push(task_id.clone());
+        }
+        preempted
+    }
+
+    /// Serialize the full coordinator state (HA replication snapshot).
+    pub async fn export_state(&self) -> serde_json::Value {
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct TaskInfoDto {
+            task_id: String,
+            stage_id: String,
+            worker_id: String,
+            state: String,
+            processed_records: u64,
+            error: Option<String>,
+        }
+        #[derive(Serialize)]
+        struct JobDto {
+            job_id: String,
+            job_name: String,
+            state: String,
+            parallelism: usize,
+            start_time: i64,
+            end_time: Option<i64>,
+            error_message: Option<String>,
+            checkpoint_interval_ms: u64,
+            checkpoints_completed: u64,
+            tasks: Vec<TaskInfoDto>,
+        }
+        let job_dtos: Vec<JobDto> = {
+            let jobs = self.jobs.read();
+            jobs.values()
+                .map(|job| JobDto {
+                    job_id: job.job_id.clone(),
+                    job_name: job.job_name.clone(),
+                    state: job.state.to_wire().to_string(),
+                    parallelism: job.parallelism,
+                    start_time: job.start_time,
+                    end_time: job.end_time,
+                    error_message: job.error_message.clone(),
+                    checkpoint_interval_ms: job.checkpoint_interval_ms,
+                    checkpoints_completed: job.checkpoints_completed,
+                    tasks: job
+                        .tasks
+                        .values()
+                        .map(|t| TaskInfoDto {
+                            task_id: t.task_id.clone(),
+                            stage_id: t.stage_id.clone(),
+                            worker_id: t.worker_id.clone(),
+                            state: t.state.to_wire().to_string(),
+                            processed_records: t.processed_records,
+                            error: t.error.clone(),
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+        let tasks_semantic: Vec<serde_json::Value> = {
+            let all_tasks = self.all_tasks.read();
+            all_tasks
+                .values()
+                .map(|d| {
+                    serde_json::json!({
+                        "task_id": d.task_id,
+                        "job_id": d.job_id,
+                        "stage_id": d.stage_id,
+                        "task_name": d.task_name,
+                        "task_index": d.task_index,
+                        "parallelism": d.parallelism,
+                        "config": d.config,
+                    })
+                })
+                .collect()
+        };
+        let checkpoints = self.checkpoint_store.export().await;
+        serde_json::json!({
+            "jobs": job_dtos,
+            "tasks": tasks_semantic,
+            "checkpoints": checkpoints,
+        })
+    }
+
+    /// Merge a replication snapshot: only fill gaps — local state always
+    /// wins (the live master receives the authoritative reports).
+    pub async fn import_state(&self, snapshot: &serde_json::Value) {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct TaskInfoDto {
+            task_id: String,
+            stage_id: String,
+            worker_id: String,
+            state: String,
+            processed_records: u64,
+            error: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct JobDto {
+            job_id: String,
+            job_name: String,
+            state: String,
+            parallelism: usize,
+            start_time: i64,
+            end_time: Option<i64>,
+            #[serde(default)]
+            error_message: Option<String>,
+            #[serde(default)]
+            checkpoint_interval_ms: u64,
+            #[serde(default)]
+            checkpoints_completed: u64,
+            tasks: Vec<TaskInfoDto>,
+        }
+        let Ok(jobs_dto) =
+            serde_json::from_value::<Vec<JobDto>>(snapshot.get("jobs").cloned().unwrap_or_default())
+        else {
+            warn!("state import: malformed jobs section, skipped");
+            return;
+        };
+        let mut imported = 0usize;
+        {
+            let mut jobs = self.jobs.write();
+            for dto in jobs_dto {
+                if jobs.contains_key(&dto.job_id) {
+                    continue; // local wins
+                }
+                let tasks: HashMap<String, TaskInfo> = dto
+                    .tasks
+                    .into_iter()
+                    .map(|t| {
+                        (
+                            t.task_id.clone(),
+                            TaskInfo {
+                                task_id: t.task_id,
+                                stage_id: t.stage_id,
+                                worker_id: t.worker_id,
+                                state: JobState::from(t.state.as_str()),
+                                processed_records: t.processed_records,
+                                error: t.error,
+                            },
+                        )
+                    })
+                    .collect();
+                jobs.insert(
+                    dto.job_id.clone(),
+                    RunningJob {
+                        job_id: dto.job_id,
+                        job_name: dto.job_name,
+                        state: JobState::from(dto.state.as_str()),
+                        parallelism: dto.parallelism,
+                        tasks,
+                        start_time: dto.start_time,
+                        end_time: dto.end_time,
+                        error_message: dto.error_message,
+                        checkpoint_interval_ms: dto.checkpoint_interval_ms,
+                        checkpoints_completed: dto.checkpoints_completed,
+                    },
+                );
+                imported += 1;
+            }
+        }
+        // Task descriptors (semantic fields only — enough for dispatch).
+        let mut tasks_imported = 0usize;
+        if let Some(tasks) = snapshot.get("tasks").and_then(|t| t.as_array()) {
+            let mut all = self.all_tasks.write();
+            for t in tasks {
+                let Ok(task_id) =
+                    serde_json::from_value::<String>(t.get("task_id").cloned().unwrap_or_default())
+                else {
+                    continue;
+                };
+                if all.contains_key(&task_id) {
+                    continue;
+                }
+                let Ok(config) = serde_json::from_value::<HashMap<String, String>>(
+                    t.get("config").cloned().unwrap_or_default(),
+                ) else {
+                    continue;
+                };
+                all.insert(
+                    task_id.clone(),
+                    TaskDescriptor {
+                        task_id,
+                        job_id: t.get("job_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        stage_id: t.get("stage_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        task_name: t.get("task_name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        task_index: t.get("task_index").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        source_config_json: String::new(),
+                        sink_config_json: String::new(),
+                        parallelism: t.get("parallelism").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+                        config,
+                    },
+                );
+                tasks_imported += 1;
+            }
+        }
+        // Master-backed checkpoint store.
+        if let Some(checkpoints) = snapshot.get("checkpoints").cloned() {
+            if let Ok(entries) = serde_json::from_value::<
+                Vec<((String, String), crate::checkpoint_store::TaskCheckpoints)>,
+            >(checkpoints)
+            {
+                self.checkpoint_store.import(entries).await;
+            }
+        }
+        info!(
+            "state import: {} job(s), {} task descriptor(s) merged",
+            imported, tasks_imported
+        );
+    }
+
     /// Mark tasks as handed to a worker so they are never re-dispatched.
     pub fn mark_tasks_dispatched(&self, task_ids: &[String], worker_id: &str) {
         let mut jobs = self.jobs.write();
@@ -538,6 +882,16 @@ impl JobCoordinator {
                 }
             }
         }
+    }
+
+    /// Newest checkpoint bytes for a task from the master store.
+    pub async fn fetch_checkpoint(&self, job_id: &str, task_id: &str) -> Option<(u64, Vec<u8>)> {
+        self.checkpoint_store.load_latest(job_id, task_id).await
+    }
+
+    /// The master-backed checkpoint store (async access).
+    pub fn checkpoint_store(&self) -> &crate::checkpoint_store::MasterCheckpointStore {
+        &self.checkpoint_store
     }
 
     /// Record a checkpoint reported by a worker.
@@ -655,6 +1009,134 @@ mod tests {
             .collect()
     }
 
+
+
+    #[test]
+    fn test_claim_orphan_reassigns_dead_worker_tasks() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "job.name": "j", "parallelism": 2 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_job, tasks) = coordinator
+            .compile_and_schedule("j1", "j", &config, None, &workers(2))
+            .unwrap();
+        // Dispatch both tasks to their assigned workers.
+        let ids: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        coordinator.mark_tasks_dispatched(&ids, "worker-0");
+        coordinator.mark_tasks_dispatched(&ids[1..], "worker-1");
+
+        // worker-1 dies: its task becomes claimable by worker-0.
+        let dead = "worker-1";
+        let claimed = coordinator.claim_tasks_for_worker("worker-0", "127.0.0.1:9999", &|w| {
+            w != dead
+        });
+        assert!(claimed
+            .iter()
+            .any(|t| t.config.get("worker_id").map(String::as_str) == Some("worker-0")));
+        // The task descriptor was reassigned.
+        let reassigned = claimed
+            .iter()
+            .find(|t| t.task_id == ids[1])
+            .expect("orphan task claimed");
+        assert_eq!(
+            reassigned.config.get("worker_id").map(String::as_str),
+            Some("worker-0")
+        );
+    }
+
+    #[test]
+    fn test_evict_worker_releases_running_tasks() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = coordinator
+            .compile_and_schedule("j2", "j", &config, None, &workers(1))
+            .unwrap();
+        let ids: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        coordinator.mark_tasks_dispatched(&ids, "worker-0");
+        // Simulate RUNNING.
+        coordinator.report_task_status("j2", &ids[0], "RUNNING", 5, None);
+
+        let affected = coordinator.evict_worker("worker-0");
+        assert_eq!(affected, vec![ids[0].clone()]);
+        // Now claimable by a replacement worker.
+        let claimed = coordinator.claim_tasks_for_worker("worker-1", "a", &|w| w != "worker-0");
+        assert!(claimed.iter().any(|t| t.task_id == ids[0]));
+    }
+
+    #[test]
+    fn test_fence_preempts_reassigned_tasks() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = coordinator
+            .compile_and_schedule("j3", "j", &config, None, &workers(1))
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+        // Failover: reassigned to worker-1.
+        coordinator.evict_worker("worker-0");
+        let _ = coordinator.claim_tasks_for_worker("worker-1", "a", &|w| w != "worker-0");
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-1");
+
+        // worker-0 comes back still running the task → must be fenced.
+        let preempted =
+            coordinator.register_running_tasks("worker-0", std::slice::from_ref(&task_id));
+        assert_eq!(preempted, vec![task_id.clone()]);
+        // worker-1's own report is not fenced.
+        assert!(coordinator
+            .register_running_tasks("worker-1", &[task_id])
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_export_import_state_roundtrip() {
+        let source = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        source
+            .compile_and_schedule("jx", "j", &config, None, &workers(1))
+            .unwrap();
+        source
+            .checkpoint_store()
+            .save("jx", "jx-p0-0", 7, b"cp-seven")
+            .await;
+        let snapshot = source.export_state().await;
+
+        // Empty standby imports it.
+        let standby = JobCoordinator::new();
+        standby.import_state(&snapshot).await;
+        let (id, data) = standby
+            .checkpoint_store()
+            .load_latest("jx", "jx-p0-0")
+            .await
+            .unwrap();
+        assert_eq!((id, data.as_slice()), (7, b"cp-seven".as_slice()));
+        // Imported job schedules tasks.
+        let claimed = standby.claim_tasks_for_worker("worker-0", "a", &|_| true);
+        assert!(!claimed.is_empty());
+
+        // Local state wins: importing again does not duplicate.
+        standby.import_state(&snapshot).await;
+        let count = standby
+            .export_state()
+            .await
+            .get("jobs")
+            .and_then(|j| j.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+    }
 
     #[test]
     fn test_compile_multi_pipeline_with_fanout() {

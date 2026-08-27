@@ -3,6 +3,7 @@
 - [Quickstart](quickstart.md)
 - [Architecture](architecture.md)
 - [Engine Configuration (seatunnel.yaml)](engine-config.md)
+- [Production Readiness](production-readiness.md)
 
 # Connectors
 

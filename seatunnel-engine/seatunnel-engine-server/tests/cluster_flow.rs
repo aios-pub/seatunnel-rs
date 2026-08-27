@@ -85,6 +85,7 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
     client
         .register_worker(tonic::Request::new(
             seatunnel_engine_comm::WorkerRegistration {
+                running_task_ids: Vec::new(),
                 worker_id: "it-worker-1".into(),
                 address: worker_addr,
                 version: "test".into(),

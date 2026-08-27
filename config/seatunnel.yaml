@@ -7,11 +7,35 @@
 #
 # Precedence: --state-dir > SEATUNNEL_STATE_DIR > this file > defaults.
 
+hazelcast:
+  # Java cluster config adapted (merged into one file; Java splits into
+  # hazelcast{,-master,-worker}.yaml). Ordered member-list = failover
+  # priority; workers connect to the first reachable master and fail over
+  # to the next after 3 consecutive heartbeat failures.
+  cluster-name: seatunnel
+  network:
+    join:
+      tcp-ip:
+        enabled: true
+        member-list: ["127.0.0.1:5800"]
+    port:
+      # Master gRPC bind port (--addr overrides). auto-increment is NOT
+      # supported — member-list requires deterministic ports.
+      auto-increment: false
+      port: 5800
+
 seatunnel:
   engine:
     # Java key. Minutes a finished/cancelled job's local state survives
-    # (TTL sweep removes anything idle longer than this).
+    # (TTL sweep removes anything idle longer than this; also drives the
+    # S3 checkpoint sweep).
     history-job-expire-minutes: 1440
+    # Worker heartbeat timeout before eviction + task failover (ms).
+    worker-timeout-ms: 6000
+    # Master-to-master state replication period for HA standby (ms).
+    replication-interval-ms: 5000
+    # This worker's advertised address (host:port).
+    worker-address: 127.0.0.1:5001
 
     checkpoint:
       # Engine-wide default checkpoint interval (ms); a job's
@@ -34,6 +58,17 @@ seatunnel:
         #   - cancelled jobs are deleted clean-grace-minutes after cancel
         #   - everything idle beyond history-job-expire-minutes is swept
         #     every clean-interval-minutes (and once at startup)
+        #   - the S3 backend gets the same three-layer cleanup (write-time
+        #     retention, cancel/TTL master sweep)
         auto-clean: true
         clean-grace-minutes: 10
         clean-interval-minutes: 60
+        # S3 backend example (MinIO/AWS) — set type: s3 to activate:
+        # plugin-config:
+        #   bucket: seatunnel-checkpoints
+        #   endpoint: http://127.0.0.1:9000
+        #   region: us-east-1
+        #   access-key: minioadmin
+        #   secret-key: minioadmin
+        #   prefix: checkpoints
+        #   path-style: true   # MinIO: bucket in the path

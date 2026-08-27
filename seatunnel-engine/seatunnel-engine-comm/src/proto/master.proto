@@ -9,6 +9,17 @@ service MasterService {
   rpc ReportTaskStatus(TaskStatusReport) returns (Empty);
   rpc ReportCheckpoint(CheckpointReport) returns (Empty);
   rpc UnregisterWorker(UnregisterWorkerRequest) returns (Empty);
+  // Failover support ------------------------------------------------------
+  // Fetch the newest checkpoint bytes for a task from the master-backed
+  // shared checkpoint store (storage type = master).
+  rpc FetchCheckpoint(FetchCheckpointRequest) returns (FetchCheckpointResponse);
+}
+
+// Master-to-master state replication (HA standby sync).
+service ReplicationService {
+  // Full coordinator state snapshot (jobs, tasks, assignments and the
+  // master-backed checkpoint store) for standby import.
+  rpc PullState(PullStateRequest) returns (StateSnapshot);
 }
 
 service ClientService {
@@ -28,6 +39,10 @@ message WorkerRegistration {
   string version = 3;
   map<string, string> resources = 4;
   int64 heartbeat_interval_ms = 5;
+  // Tasks this worker is currently executing (failover fencing: the
+  // master marks them Running for this worker so other workers do not
+  // take them over while it reconnects).
+  repeated string running_task_ids = 6;
 }
 
 message WorkerRegistrationResponse {
@@ -55,6 +70,10 @@ message HeartbeatResponse {
   repeated TaskDescriptor pending_tasks = 3;
   // Jobs the master has cancelled; workers must stop their local tasks for them.
   repeated string cancel_jobs = 4;
+  // Tasks this worker still reports as running but which the master has
+  // reassigned elsewhere (worker-failover fencing): stop them locally to
+  // avoid duplicate execution.
+  repeated string preempted_task_ids = 5;
 }
 
 message TaskHeartbeat {
@@ -186,4 +205,25 @@ enum JobState {
   JOB_COMPLETED = 4;
   JOB_FAILED = 5;
   JOB_CANCELLED = 6;
+}
+
+message FetchCheckpointRequest {
+  string job_id = 1;
+  string task_id = 2;
+}
+
+message FetchCheckpointResponse {
+  // Highest checkpoint id available for the task (0 = none).
+  int64 checkpoint_id = 1;
+  bytes checkpoint_data = 2;
+}
+
+message PullStateRequest {
+  string requester_id = 1;
+}
+
+message StateSnapshot {
+  // Serialized coordinator state (jobs + tasks + checkpoint store).
+  string state_json = 1;
+  int64 exported_at_ms = 2;
 }
