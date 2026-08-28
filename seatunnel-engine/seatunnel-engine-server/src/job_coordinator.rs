@@ -849,11 +849,26 @@ impl JobCoordinator {
     }
 
     /// IDs of cancelled jobs whose workers still need to be told to stop.
+    ///
+    /// This rides on every heartbeat response, so it must only hold jobs
+    /// whose cancel is still in flight: at least one task is actively
+    /// sitting on a worker (`Running`/`Deploying`). Workers report a
+    /// terminal transition after acting on the cancel, so once every
+    /// task is terminal the job stops being broadcast; never-dispatched
+    /// tasks need no cancel either (a terminal job is never dispatched).
+    /// Without this narrowing, the master re-sends the full cancelled
+    /// list forever and every worker re-runs its cancel handling (and
+    /// re-logs the cleanup) on each heartbeat until history expiry.
     pub fn cancelled_job_ids(&self) -> Vec<String> {
         self.jobs
             .read()
             .values()
             .filter(|j| j.state == JobState::Cancelled)
+            .filter(|j| {
+                j.tasks
+                    .values()
+                    .any(|t| matches!(t.state, JobState::Running | JobState::Deploying))
+            })
             .map(|j| j.job_id.clone())
             .collect()
     }
@@ -1008,16 +1023,23 @@ impl JobCoordinator {
         let mut jobs = self.jobs.write();
         let mut affected = Vec::new();
         for job in jobs.values_mut() {
-            if job.state.is_terminal() {
-                continue;
-            }
             for (task_id, info) in job.tasks.iter_mut() {
                 if info.worker_id == worker_id
                     && matches!(info.state, JobState::Deploying | JobState::Running)
                 {
-                    // Deploying keeps the claim rule's orphan arm eligible;
-                    // Running tasks must go back to a claimable state.
-                    info.state = JobState::Deploying;
+                    if job.state.is_terminal() {
+                        // The job is already over (cancelled/failed): the
+                        // task can never be reassigned, so the only truthful
+                        // state is cancelled. Leaving it Running would freeze
+                        // the UI view of the job and keep it in the cancel
+                        // broadcast forever (the dead worker will never
+                        // report a terminal transition).
+                        info.state = JobState::Cancelled;
+                    } else {
+                        // Deploying keeps the claim rule's orphan arm eligible;
+                        // Running tasks must go back to a claimable state.
+                        info.state = JobState::Deploying;
+                    }
                     affected.push(task_id.clone());
                 }
             }
@@ -1054,6 +1076,20 @@ impl JobCoordinator {
             let Some(info) = job.tasks.get(task_id) else {
                 continue;
             };
+            if job.state.is_terminal() || info.state.is_terminal() {
+                // The engine has already closed this task (the job is over,
+                // or the task was terminalized while the worker was away —
+                // e.g. an evict-marked cancelled task). The reporting worker
+                // must stop it locally, never resume it: adopting would
+                // either flip the state back or leave a zombie running
+                // under a terminal job outside the cancel broadcast.
+                info!(
+                    "Task '{}' reported running by '{}' but already terminal ({:?}) — preempting",
+                    task_id, worker_id, info.state
+                );
+                preempted.push(task_id.clone());
+                continue;
+            }
             if info.worker_id == worker_id {
                 adopt.push(task_id.clone());
                 continue; // still ours
@@ -2731,11 +2767,109 @@ mod tests {
             "source": { "Fake": {} },
             "sink": { "Console": {} }
         });
+
+        // Cancel before any task was dispatched: nothing runs anywhere,
+        // so the cancel needs no heartbeat broadcast at all.
         let (job_id, _) = coordinator
             .compile_and_install("jc", "c", &config, Some(1), &workers(1))
             .unwrap();
         assert!(coordinator.cancel_job(&job_id));
-        assert_eq!(coordinator.cancelled_job_ids(), vec![job_id]);
+        assert!(
+            coordinator.cancelled_job_ids().is_empty(),
+            "never-dispatched cancelled job needs no broadcast"
+        );
+
+        // Cancel while a task is RUNNING: the job rides on heartbeats
+        // until the worker acknowledges.
+        let (job_id, tasks) = coordinator
+            .compile_and_install("jc2", "c2", &config, Some(1), &workers(1))
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+        coordinator.report_task_status(&job_id, &task_id, "RUNNING", 5, None);
+        assert!(coordinator.cancel_job(&job_id));
+        assert_eq!(coordinator.cancelled_job_ids(), vec![job_id.clone()]);
+
+        // The worker acted on the cancel and reported the task terminal:
+        // the broadcast is complete and must stop — otherwise every
+        // worker re-runs its cancel handling (and re-logs the state
+        // cleanup) on each heartbeat until history expiry.
+        coordinator.report_task_status(&job_id, &task_id, "CANCELLED", 5, None);
+        assert!(
+            coordinator.cancelled_job_ids().is_empty(),
+            "fully-acknowledged cancel must stop being broadcast"
+        );
+    }
+
+    #[test]
+    fn test_evict_worker_terminalizes_cancelled_job_orphans() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (job_id, tasks) = coordinator
+            .compile_and_install("j4", "d", &config, Some(1), &workers(1))
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+        coordinator.report_task_status(&job_id, &task_id, "RUNNING", 5, None);
+        assert!(coordinator.cancel_job(&job_id));
+
+        // The worker dies before it can report the cancel: eviction must
+        // terminalize the orphaned task — it can never be reassigned
+        // under a terminal job, and leaving it Running would freeze the
+        // job view and keep the cancel broadcast alive forever.
+        let affected = coordinator.evict_worker("worker-0");
+        assert_eq!(affected, vec![task_id.clone()]);
+        assert_eq!(
+            coordinator.get_job(&job_id).unwrap().tasks[&task_id].state,
+            JobState::Cancelled
+        );
+        assert!(
+            coordinator.cancelled_job_ids().is_empty(),
+            "terminalized orphan stops the broadcast"
+        );
+        // A replacement worker must not be handed the task either.
+        let claimed = coordinator.claim_tasks_for_worker(
+            "worker-1",
+            "d",
+            &live(&[
+                ("worker-0", WorkerState::Dead),
+                ("worker-1", WorkerState::Healthy),
+            ]),
+        );
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
+    fn test_register_running_tasks_rejects_terminal_tasks() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (job_id, tasks) = coordinator
+            .compile_and_install("j5", "e", &config, Some(1), &workers(1))
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+        coordinator.report_task_status(&job_id, &task_id, "RUNNING", 5, None);
+        assert!(coordinator.cancel_job(&job_id));
+        // Worker dies; eviction closes its orphaned task as Cancelled.
+        assert_eq!(coordinator.evict_worker("worker-0"), vec![task_id.clone()]);
+
+        // The "dead" worker actually comes back still running the task:
+        // it must be preempted (told to stop), never re-adopted — the
+        // engine has already closed it under the cancelled job.
+        let preempted =
+            coordinator.register_running_tasks("worker-0", std::slice::from_ref(&task_id));
+        assert_eq!(preempted, vec![task_id.clone()]);
+        // And the registry state stays terminal (no adopt resurrection).
+        assert_eq!(
+            coordinator.get_job(&job_id).unwrap().tasks[&task_id].state,
+            JobState::Cancelled
+        );
     }
 
     #[test]

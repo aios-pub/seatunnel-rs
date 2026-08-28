@@ -35,9 +35,7 @@ use seatunnel_engine_comm::{
     CheckpointPhase, CheckpointReport, HeartbeatResponse, TaskDescriptor, TaskStatusReport,
     generated::master_service_client::MasterServiceClient,
 };
-use seatunnel_engine_core::connector_factory::{
-    create_source, create_transforms,
-};
+use seatunnel_engine_core::connector_factory::{create_source, create_transforms};
 use seatunnel_engine_core::local_checkpoint::{
     CheckpointEvent, GateControl, TaskToDriver, task_gate,
 };
