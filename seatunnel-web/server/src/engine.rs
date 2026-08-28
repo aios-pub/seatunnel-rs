@@ -339,6 +339,7 @@ impl FakeEngine {
             error_message: String::new(),
             checkpoint_interval_ms: 10_000,
             checkpoints_completed: 3,
+            job_config: r#"{"env":{"job.name":"demo"},"source":{"Fake":{"row.num":1}},"sink":{"Console":{}}}"#.to_string(),
             tasks: vec![TaskStatusDto {
                 task_id: "task-0".to_string(),
                 stage_id: "0".to_string(),
@@ -364,6 +365,25 @@ impl FakeEngine {
 #[cfg(test)]
 #[async_trait]
 impl EngineOps for FakeEngine {
+    async fn update_job(
+        &self,
+        job_id: &str,
+        _job_name: &str,
+        _config_bytes: Vec<u8>,
+        _parallelism: i32,
+        _cancel_timeout_secs: u64,
+    ) -> Result<UpdateResultDto, EngineError> {
+        if self.unreachable {
+            return Err(self.err());
+        }
+        Ok(UpdateResultDto {
+            job_id: job_id.to_string(),
+            cancelled: true,
+            cancel_wait_ms: 1,
+            message: "updated (fake)".to_string(),
+        })
+    }
+
     async fn list_jobs(&self) -> Result<Vec<JobSummaryDto>, EngineError> {
         if self.unreachable {
             return Err(self.err());
@@ -413,6 +433,7 @@ impl EngineOps for FakeEngine {
             error_message: String::new(),
             checkpoint_interval_ms: 0,
             checkpoints_completed: 0,
+            job_config: String::new(),
             tasks: Vec::new(),
         });
         Ok(SubmitResultDto {
@@ -438,11 +459,17 @@ impl EngineOps for FakeEngine {
             return Err(self.err());
         }
         Ok(ClusterInfoDto {
+            leader_term: 1,
+            leader_role: "master".to_string(),
             leader_id: "self".to_string(),
             available_workers: 1,
             total_tasks: 1,
             running_tasks: 1,
             workers: vec![WorkerDto {
+                load_score_permille: 100,
+                lag_ms: 20,
+                mem_permille: 300,
+                can_accept: true,
                 worker_id: "worker-1".to_string(),
                 address: "127.0.0.1:5801".to_string(),
                 last_heartbeat_ms: 99,

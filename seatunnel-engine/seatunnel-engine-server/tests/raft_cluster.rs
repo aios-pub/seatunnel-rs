@@ -157,6 +157,7 @@ async fn single_voter_elects_and_applies() {
         checkpoint_interval_ms: 30_000,
         checkpoints_completed: 0,
         next_checkpoint_id: 1,
+        raw_config: String::new(),
         tasks: vec![],
     };
     node.writes
@@ -198,6 +199,7 @@ async fn three_voters_failover_without_dual_writes() {
         checkpoint_interval_ms: 30_000,
         checkpoints_completed: 0,
         next_checkpoint_id: 1,
+        raw_config: String::new(),
         tasks: vec![],
     };
     nodes[leader_idx]
