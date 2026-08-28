@@ -48,7 +48,9 @@ use seatunnel_api::source::source_reader::PollResult;
 use crate::barrier::{BarrierTracker, CheckpointBarrier, StreamElement};
 use crate::checkpoint::CheckpointConfig;
 use crate::checkpoint_listener::CheckpointListener;
-use crate::connector_factory::{BoxedSinkCommitter, BoxedSinkWriter, BoxedSourceReader, BoxedTransform};
+use crate::connector_factory::{
+    BoxedSinkCommitter, BoxedSinkWriter, BoxedSourceReader, BoxedTransform,
+};
 use crate::local_checkpoint::{CheckpointEvent, TaskToDriver};
 use crate::state::TaskState;
 use crate::task::{TaskId, TaskStatus};
@@ -127,6 +129,24 @@ const STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
 /// fixed latency when traffic resumes.
 const IDLE_BACKOFF_MS: [u64; 5] = [1, 2, 5, 10, 20];
 
+/// Sample one DATA log line every N processed records so the console can
+/// show live data flow without flooding the task log ring.
+const DATA_LOG_SAMPLE: u64 = 100;
+
+/// Compact `f0=.., f1=..` rendering of a row for DATA log lines.
+fn row_summary(row: &seatunnel_api::Row) -> String {
+    let mut parts = Vec::new();
+    for i in 0..row.field_count() {
+        parts.push(format!("f{}={:?}", i, row.get(i)));
+    }
+    let joined = parts.join(", ");
+    if joined.len() > 200 {
+        format!("{}…", &joined[..200])
+    } else {
+        joined
+    }
+}
+
 /// Checkpoint id used for the final checkpoint at task exit (Java's
 /// `Barrier#PREPARE_CLOSE_BARRIER_ID` semantics: a last durable snapshot
 /// so a restart resumes where the job stopped instead of replaying).
@@ -149,6 +169,13 @@ pub struct TaskGroup {
     last_checkpoint_at: Option<i64>,
     last_status_publish: Option<Instant>,
     empty_streak: u32,
+    /// Epoch-ms of the most recent record; published with the throttled
+    /// status update so heartbeats can report task liveness.
+    last_record_at: i64,
+    /// (id, state size) of the most recent completed checkpoint.
+    last_checkpoint_meta: (u64, u64),
+    /// Bounded task log ring surfaced through the worker heartbeat.
+    logs: crate::task_log::TaskLogRing,
 }
 
 impl TaskGroup {
@@ -168,6 +195,9 @@ impl TaskGroup {
             last_checkpoint_at: None,
             last_status_publish: None,
             empty_streak: 0,
+            last_record_at: 0,
+            last_checkpoint_meta: (0, 0),
+            logs: crate::task_log::TaskLogRing::default(),
         }
     }
 
@@ -190,6 +220,11 @@ impl TaskGroup {
         self.status.clone()
     }
 
+    /// Task log ring, shared with the worker for heartbeat shipping.
+    pub fn logs(&self) -> &crate::task_log::TaskLogRing {
+        &self.logs
+    }
+
     /// Number of checkpoints this group completed successfully so far.
     pub fn checkpoints_completed(&self) -> u64 {
         self.checkpoints_completed
@@ -202,6 +237,10 @@ impl TaskGroup {
             status.state = TaskState::Running;
             status.start_time = crate::now_millis();
         }
+        self.logs.info(format!(
+            "task started (job={}, parallelism={})",
+            self.context.job_id, self.context.parallelism
+        ));
 
         // Open the source reader, then the sink writer.
         self.reader.open().await?;
@@ -255,6 +294,10 @@ impl TaskGroup {
                 barrier_tracker.receive(StreamElement::CheckpointBarrier(barrier));
                 self.checkpoints_completed += 1;
                 self.last_checkpoint_at = Some(now);
+                self.logs.info(format!(
+                    "checkpoint #{} completed (records={})",
+                    cp_id, self.records_processed
+                ));
             }
 
             match self.reader.poll_next().await {
@@ -262,6 +305,18 @@ impl TaskGroup {
                     self.empty_streak = 0;
                     let rows = self.apply_transforms(output)?;
                     self.records_processed += rows.len() as u64;
+                    self.last_record_at = crate::now_millis();
+                    // Sample one row per DATA_LOG_SAMPLE records so the
+                    // console can show live data without flooding the ring.
+                    if self.records_processed % DATA_LOG_SAMPLE == 0 || self.records_processed == rows.len() as u64 {
+                        if let Some(row) = rows.last() {
+                            self.logs.push("DATA", format!(
+                                "record #{}: {}",
+                                self.records_processed,
+                                row_summary(row)
+                            ));
+                        }
+                    }
                     self.publish_status_throttled().await;
                     for row in rows {
                         self.sink.write(row).await?;
@@ -277,6 +332,11 @@ impl TaskGroup {
                         event.changes.len(),
                         event.statement
                     );
+                    self.logs.info(format!(
+                        "schema change on '{}': {}",
+                        event.table,
+                        event.statement.as_deref().unwrap_or("<none>")
+                    ));
                     self.sink.apply_schema_change(&event).await?;
                     if let Some(schema) = &mut self.output_schema {
                         if let Err(e) = schema.apply_schema_change_event(&event) {
@@ -298,11 +358,15 @@ impl TaskGroup {
                     }
                     self.empty_streak = self.empty_streak.saturating_add(1);
                 }
-                Ok(PollResult::EOF) => break,
+                Ok(PollResult::EOF) => {
+                    self.logs.info("source reached EOF");
+                    break;
+                }
                 Err(e) => {
                     terminal_state = TaskState::Failed {
                         error: e.to_string(),
                     };
+                    self.logs.error(format!("poll loop failed: {}", e));
                     tracing::error!("Task {} failed in poll loop: {}", self.context.task_id, e);
                     break;
                 }
@@ -315,11 +379,7 @@ impl TaskGroup {
             // coordinator handle this degenerates to a plain final flush.
             if self.context.checkpoint_handle.is_some() {
                 if let Err(e) = self.execute_barrier(FINAL_CHECKPOINT_ID).await {
-                    tracing::error!(
-                        "Task {} exit barrier failed: {}",
-                        self.context.task_id,
-                        e
-                    );
+                    tracing::error!("Task {} exit barrier failed: {}", self.context.task_id, e);
                     if terminal_state == TaskState::Completed {
                         terminal_state = TaskState::Failed {
                             error: format!("exit barrier failed: {}", e),
@@ -359,10 +419,17 @@ impl TaskGroup {
             if let TaskState::Failed { ref error } = terminal_state {
                 status.error = Some(error.clone());
             }
-            status.state = terminal_state;
+            status.state = terminal_state.clone();
             status.end_time = crate::now_millis();
             status.processed_records = self.records_processed;
+            status.last_record_at = self.last_record_at;
+            status.last_checkpoint_id = self.last_checkpoint_meta.0;
+            status.last_checkpoint_size = self.last_checkpoint_meta.1;
         }
+        self.logs.info(format!(
+            "task finished: state={:?} records={} checkpoints={}",
+            terminal_state, self.records_processed, self.checkpoints_completed
+        ));
 
         tracing::info!(
             "Task {} finished: state={} records={} checkpoints={}",
@@ -389,7 +456,13 @@ impl TaskGroup {
         }
         self.last_status_publish = Some(now);
         let records = self.records_processed;
-        self.status.lock().await.processed_records = records;
+        let last_record_at = self.last_record_at;
+        let checkpoint_meta = self.last_checkpoint_meta;
+        let mut status = self.status.lock().await;
+        status.processed_records = records;
+        status.last_record_at = last_record_at;
+        status.last_checkpoint_id = checkpoint_meta.0;
+        status.last_checkpoint_size = checkpoint_meta.1;
     }
 
     /// Trigger a checkpoint when the configured interval has elapsed.
@@ -397,9 +470,7 @@ impl TaskGroup {
     async fn maybe_trigger_checkpoint(&mut self) -> anyhow::Result<Option<u64>> {
         // Coordinator-driven gates own checkpointing when present; the
         // interval path is the cluster worker's listener protocol.
-        if self.context.checkpoint_listener.is_none()
-            || self.context.checkpoint_handle.is_some()
-        {
+        if self.context.checkpoint_listener.is_none() || self.context.checkpoint_handle.is_some() {
             return Ok(None);
         }
         let now = crate::now_millis();
@@ -422,6 +493,7 @@ impl TaskGroup {
             .snapshot_state()
             .await
             .map_err(|e| anyhow::anyhow!("reader snapshot_state failed: {}", e))?;
+        self.last_checkpoint_meta = (cp_id, state.len() as u64);
 
         // 3. Persist + report via the listener.
         if let Some(listener) = &self.context.checkpoint_listener {
@@ -463,6 +535,7 @@ impl TaskGroup {
             .map_err(|e| anyhow::anyhow!("reader snapshot_state failed: {}", e))?;
         self.checkpoints_completed += 1;
         self.last_checkpoint_at = Some(crate::now_millis());
+        self.last_checkpoint_meta = (checkpoint_id, reader_state.len() as u64);
         self.last_commit_infos = commit_infos.clone();
         if let Some(handle) = self.context.checkpoint_handle.clone() {
             handle.report(TaskToDriver::Checkpoint(

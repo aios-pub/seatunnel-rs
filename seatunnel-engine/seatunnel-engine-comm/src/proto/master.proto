@@ -28,6 +28,10 @@ service ClientService {
   rpc GetJobStatus(JobStatusRequest) returns (JobStatus);
   rpc GetClusterInfo(Empty) returns (ClusterInfo);
   rpc ListJobs(Empty) returns (JobList);
+  // Checkpoint history (ids + sizes, no payload bytes) for the web UI.
+  rpc GetJobCheckpoints(JobStatusRequest) returns (JobCheckpointHistory);
+  // Per-task logs (lifecycle events + sampled data) for the web UI.
+  rpc GetJobLogs(JobStatusRequest) returns (JobLogs);
 }
 
 message Empty {}
@@ -43,12 +47,19 @@ message WorkerRegistration {
   // master marks them Running for this worker so other workers do not
   // take them over while it reconnects).
   repeated string running_task_ids = 6;
+  // Task slot budget advertised by the worker (0 = legacy/unlimited).
+  uint32 slots = 7;
 }
 
 message WorkerRegistrationResponse {
   bool success = 1;
   string message = 2;
   string leader_address = 3;
+  // Fencing term of the responding master. Workers ignore instructions
+  // (dispatch/cancel/preempt) from a master whose term is lower than the
+  // highest term they have already seen, so a deposed master cannot
+  // disturb tasks owned by its successor.
+  uint64 term = 4;
 }
 
 message UnregisterWorkerRequest {
@@ -62,6 +73,11 @@ message HeartbeatRequest {
   string address = 2;
   int64 timestamp = 3;
   repeated TaskHeartbeat tasks = 4;
+  // Fencing term the worker currently operates under (highest seen).
+  uint64 term = 5;
+  // Long-poll hint (ms): the master may hold the request until dispatchable
+  // work appears. 0 = return immediately (legacy behavior).
+  int64 wait_ms = 6;
 }
 
 message HeartbeatResponse {
@@ -74,6 +90,11 @@ message HeartbeatResponse {
   // reassigned elsewhere (worker-failover fencing): stop them locally to
   // avoid duplicate execution.
   repeated string preempted_task_ids = 5;
+  // Fencing term of this master (see WorkerRegistrationResponse.term).
+  uint64 term = 6;
+  // Address of the currently active master; empty when this node is active.
+  // Workers may use it to retry against the right master.
+  string leader_hint = 7;
 }
 
 message TaskHeartbeat {
@@ -82,6 +103,16 @@ message TaskHeartbeat {
   int64 processed_records = 3;
   int64 last_heartbeat_time = 4;
   int64 memory_usage = 5;
+  // Epoch-ms of the most recent record (0 = none yet): the task
+  // liveness/latency signal for streaming jobs.
+  int64 last_record_at = 6;
+  // Incremental task log lines (rendered) shipped since the previous
+  // heartbeat; the master retains a bounded tail per task.
+  repeated string logs = 7;
+  // Most recent completed checkpoint (id 0 = none yet) and its state
+  // size — visible for every storage backend, unlike payload bytes.
+  int64 last_checkpoint_id = 8;
+  int64 last_checkpoint_size_bytes = 9;
 }
 
 // --- Task Status ---
@@ -93,6 +124,8 @@ message TaskStatusReport {
   int64 timestamp = 5;
   int64 processed_records = 6;
   string error_message = 7;
+  // Fencing term the report was produced under.
+  uint64 term = 8;
 }
 
 // --- Checkpoint ---
@@ -103,6 +136,8 @@ message CheckpointReport {
   int64 timestamp = 4;
   bytes checkpoint_data = 5;
   bool success = 6;
+  // Fencing term the report was produced under.
+  uint64 term = 7;
 }
 
 // --- Client API ---
@@ -136,6 +171,8 @@ message JobStatus {
   int64 end_time = 5;
   string error_message = 6;
   repeated TaskStatusInfo tasks = 7;
+  int64 checkpoint_interval_ms = 8;
+  int64 checkpoints_completed = 9;
 }
 
 message TaskStatusInfo {
@@ -145,6 +182,10 @@ message TaskStatusInfo {
   int64 processed_records = 4;
   int64 start_time = 5;
   int64 end_time = 6;
+  // Epoch-ms of the most recent record (0 = none yet).
+  int64 last_record_at = 7;
+  // Worker currently (or last known) executing this task.
+  string worker_id = 8;
 }
 
 message JobList {
@@ -156,6 +197,36 @@ message JobSummary {
   string job_name = 2;
   JobState state = 3;
   int64 start_time = 4;
+  int64 end_time = 5;
+}
+
+// --- Checkpoint history (web UI) ---
+message JobCheckpointHistory {
+  string job_id = 1;
+  int64 checkpoint_interval_ms = 2;
+  int64 checkpoints_completed = 3;
+  repeated TaskCheckpointHistory tasks = 4;
+}
+
+message TaskCheckpointHistory {
+  string task_id = 1;
+  repeated CheckpointEntry entries = 2;
+}
+
+// --- Task logs (web UI) ---
+message JobLogs {
+  string job_id = 1;
+  repeated TaskLogs tasks = 2;
+}
+
+message TaskLogs {
+  string task_id = 1;
+  repeated string lines = 2;
+}
+
+message CheckpointEntry {
+  int64 checkpoint_id = 1;
+  int64 size_bytes = 2;
 }
 
 message ClusterInfo {
@@ -164,6 +235,12 @@ message ClusterInfo {
   int32 running_tasks = 3;
   int32 available_workers = 4;
   string leader_id = 5;
+  // Fencing term of the responding master.
+  uint64 term = 6;
+  // Advertised address of the active master.
+  string leader_address = 7;
+  // Role of the responding node: master | worker | hybrid.
+  string role = 8;
 }
 
 message WorkerInfo {
@@ -172,6 +249,8 @@ message WorkerInfo {
   int64 last_heartbeat = 3;
   map<string, string> resources = 4;
   int32 running_tasks = 5;
+  // Advertised slot budget (0 = legacy/unlimited).
+  uint32 slots = 6;
 }
 
 // --- Task Assignment ---

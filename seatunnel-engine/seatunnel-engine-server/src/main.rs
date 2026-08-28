@@ -18,28 +18,36 @@
 //! SeaTunnel Engine Server — gRPC Master + Worker node.
 //!
 //! Usage:
-//!   seatunnel-engine-server --role master --addr 0.0.0.0:5800
-//!   seatunnel-engine-server --role worker --master <master-address> [--worker-id w1]
+//!   seatunnel-engine-server --role master  --addr 0.0.0.0:5800
+//!   seatunnel-engine-server --role worker  --master <master-address> [--worker-id w1]
+//!   seatunnel-engine-server --role hybrid  --addr 0.0.0.0:5800
+//!
+//! `hybrid` runs the coordinator and a worker executor in one process —
+//! the recommended single-machine form (Java `MASTER_AND_WORKER` parity)
+//! and the building block of symmetric multi-node deployments.
 
 use clap::Parser;
 use seatunnel_engine_comm::{
-    generated::master_service_client::MasterServiceClient, HeartbeatRequest, WorkerRegistration,
+    HeartbeatRequest, WorkerRegistration, generated::master_service_client::MasterServiceClient,
 };
 use seatunnel_engine_server::{
-    new_worker_registry, ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode,
+    ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode, new_worker_registry,
+    server_config::EngineServerConfig,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::time::{interval, Duration};
-use tracing_subscriber::{fmt::Layer, prelude::*, EnvFilter};
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{EnvFilter, fmt::Layer, prelude::*};
 
 use seatunnel_engine_comm::generated::client_service_server::ClientServiceServer;
 use seatunnel_engine_comm::generated::master_service_server::MasterServiceServer;
+use seatunnel_engine_server::master::MasterInfo;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "seatunnel-engine-server",
-    about = "SeaTunnel Engine Server (Master/Worker)"
+    about = "SeaTunnel Engine Server (Master/Worker/Hybrid)"
 )]
 struct Args {
     #[arg(long, default_value = "master")]
@@ -48,7 +56,13 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:5800")]
     addr: String,
 
-    /// Master address (required for workers).
+    /// Address other nodes should use to reach this master (host:port).
+    /// Defaults to the --addr host (or 127.0.0.1 when binding a
+    /// wildcard) plus the bound port.
+    #[arg(long)]
+    advertise_addr: Option<String>,
+
+    /// Master address(es), comma separated (required for workers).
     #[arg(long)]
     master: Option<String>,
 
@@ -85,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(args.state_dir.as_str())
     };
-    let engine_config = seatunnel_engine_server::server_config::EngineServerConfig::load(
+    let engine_config = EngineServerConfig::load(
         args.config.as_deref(),
         explicit_state_dir,
         std::env::var("SEATUNNEL_STATE_DIR").ok().as_deref(),
@@ -103,12 +117,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     match args.role.as_str() {
-        "master" => run_master(&args.addr, engine_config).await?,
+        "master" => run_master(&args.addr, &args.advertise_addr, engine_config).await?,
         "worker" => {
-            run_worker(&args.addr, &args.master, &args.worker_id, engine_config).await?
+            let master_list = resolve_master_list(&args.master, &engine_config)?;
+            run_worker(&args.addr, master_list, &args.worker_id, engine_config).await?;
+        }
+        "hybrid" => {
+            run_hybrid(&args.addr, &args.advertise_addr, &args.worker_id, engine_config).await?
         }
         other => {
-            eprintln!("Unknown role: {}. Use 'master' or 'worker'.", other);
+            eprintln!(
+                "Unknown role: {}. Use 'master', 'worker' or 'hybrid'.",
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -116,49 +137,101 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_master(
-    addr: &str,
-    config: seatunnel_engine_server::server_config::EngineServerConfig,
-) -> anyhow::Result<()> {
-    // Port resolution: CLI --addr > hazelcast port (bind all interfaces)
-    // > default 5800.
-    let bind_addr = if addr != "0.0.0.0:5800" {
-        addr.to_string()
-    } else if let Some(port) = config.hazelcast_port {
-        format!("0.0.0.0:{}", port)
-    } else {
-        addr.to_string()
-    };
+/// Master list: --master (comma separated) > config member-list > default.
+/// Ordered = failover priority.
+fn resolve_master_list(
+    master_arg: &Option<String>,
+    engine_config: &EngineServerConfig,
+) -> anyhow::Result<Vec<String>> {
+    let list: Vec<String> = master_arg
+        .as_ref()
+        .map(|m| {
+            m.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .filter(|list: &Vec<String>| !list.is_empty())
+        .unwrap_or_else(|| engine_config.member_list.clone());
+    if list.is_empty() {
+        anyhow::bail!("no master address (use --master or the config member-list)");
+    }
+    Ok(list)
+}
 
+/// The address other nodes should use to reach a master bound at
+/// `bind_addr`: --advertise-addr > the bind host (if routable) >
+/// loopback, always with the actually bound port.
+fn advertise_address(advertise: &Option<String>, local_addr: &std::net::SocketAddr) -> String {
+    if let Some(explicit) = advertise.as_deref().filter(|a| !a.is_empty()) {
+        return explicit.to_string();
+    }
+    let host = local_addr.ip().to_string();
+    let host = if host == "0.0.0.0" || host == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    format!("{}:{}", host, local_addr.port())
+}
+
+/// Everything the gRPC stack needs that the rest of main also touches.
+struct MasterServing {
+    shutdown: CancellationToken,
+    local_addr: std::net::SocketAddr,
+}
+
+/// Bind the listener and spawn the master-side background loops. Returns
+/// the bound address plus the server future — callers decide how to
+/// combine it with other roles (hybrid) or shutdown policies.
+async fn start_master(
+    bind_addr: &str,
+    advertise: &Option<String>,
+    config: EngineServerConfig,
+    role: &str,
+) -> anyhow::Result<(MasterServing, impl std::future::Future<Output = ()> + Send)> {
     let coordinator = Arc::new(JobCoordinator::new());
     let registry = new_worker_registry();
-    let master_handler = MasterHandler::new(coordinator.clone(), registry.clone());
-    let client_handler = ClientHandler::new(coordinator.clone(), registry.clone());
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+    let advertise_addr = advertise_address(advertise, &local_addr);
+    let info = MasterInfo {
+        advertise_addr: advertise_addr.clone(),
+        role: role.to_string(),
+    };
+    let master_handler = MasterHandler::new(
+        coordinator.clone(),
+        registry.clone(),
+        info.clone(),
+        config.heartbeat_interval_ms,
+        config.worker_soft_timeout_ms,
+    );
+    let client_handler = ClientHandler::new(coordinator.clone(), registry.clone(), info);
     let replication_handler =
         seatunnel_engine_server::master::ReplicationHandler::new(coordinator.clone());
 
-    let listener = TcpListener::bind(&bind_addr).await?;
-    let local_addr = listener.local_addr()?;
     tracing::info!(
-        "Master listening on {} (cluster='{}', members={:?})",
+        "Master({}) listening on {} advertise={} (cluster='{}', members={:?})",
+        role,
         local_addr,
+        advertise_addr,
         config.cluster_name,
         config.member_list
     );
 
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_signal.cancel();
     });
 
-    // Worker-eviction loop: TTL-stale workers are removed and their tasks
-    // become claimable by live workers (failover).
+    // Worker-eviction loop: hard-TTL-stale workers are removed and their
+    // tasks become claimable by live workers (failover).
     {
         let registry = Arc::clone(&registry);
         let coordinator = Arc::clone(&coordinator);
-        let timeout_ms = config.worker_timeout_ms.max(1000);
+        let timeout_ms = config.worker_timeout_ms.max(config.worker_soft_timeout_ms).max(1000);
         let cancel = shutdown.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(2000));
@@ -204,7 +277,7 @@ async fn run_master(
     // that still has state.
     {
         let coordinator = Arc::clone(&coordinator);
-        let my_addr = format!("127.0.0.1:{}", local_addr.port());
+        let my_addr = advertise_addr;
         let members = config.member_list.clone();
         let interval_ms = config.replication_interval_ms.max(500);
         let cancel = shutdown.clone();
@@ -213,7 +286,9 @@ async fn run_master(
             let mut earlier: Vec<String> = Vec::new();
             let mut my_pos = members.len();
             for (idx, member) in members.iter().enumerate() {
-                if member == &my_addr || member.ends_with(&format!(":{}", local_addr_port(&my_addr))) {
+                if member == &my_addr
+                    || member.ends_with(&format!(":{}", local_addr_port(&my_addr)))
+                {
                     my_pos = idx;
                     break;
                 }
@@ -283,7 +358,7 @@ async fn run_master(
                 let sweep_every = Duration::from_secs(config.clean_interval_minutes * 60);
                 let cancel = shutdown.clone();
                 tokio::spawn(async move {
-                    let mut ticker = interval(sweep_every);
+                    let mut ticker = tokio::time::interval(sweep_every);
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
@@ -306,15 +381,89 @@ async fn run_master(
 
     // Hand the already-bound listener to tonic — no re-bind, no race.
     use tokio_stream::wrappers::TcpListenerStream;
-    tonic::transport::Server::builder()
-        .add_service(MasterServiceServer::new(master_handler))
-        .add_service(ClientServiceServer::new(client_handler))
-        .add_service(
-            seatunnel_engine_comm::ReplicationServiceServer::new(replication_handler),
-        )
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await?;
+    let server = async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(MasterServiceServer::new(master_handler))
+            .add_service(ClientServiceServer::new(client_handler))
+            .add_service(seatunnel_engine_comm::ReplicationServiceServer::new(
+                replication_handler,
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await;
+    };
 
+    Ok((
+        MasterServing {
+            shutdown,
+            local_addr,
+        },
+        server,
+    ))
+}
+
+async fn run_master(
+    addr: &str,
+    advertise: &Option<String>,
+    config: EngineServerConfig,
+) -> anyhow::Result<()> {
+    // Port resolution: CLI --addr > hazelcast port (bind all interfaces)
+    // > default 5800.
+    let bind_addr = if addr != "0.0.0.0:5800" {
+        addr.to_string()
+    } else if let Some(port) = config.hazelcast_port {
+        format!("0.0.0.0:{}", port)
+    } else {
+        addr.to_string()
+    };
+
+    let (serving, server) = start_master(&bind_addr, advertise, config, "master").await?;
+    let shutdown = serving.shutdown;
+    tokio::select! {
+        _ = server => {},
+        _ = shutdown.cancelled() => {
+            tracing::info!("Master shutting down.");
+        }
+    }
+    Ok(())
+}
+
+/// Hybrid role: one process = full cluster. The coordinator serves gRPC
+/// and a local worker executor heartbeats it over the loopback.
+async fn run_hybrid(
+    addr: &str,
+    advertise: &Option<String>,
+    worker_id: &str,
+    config: EngineServerConfig,
+) -> anyhow::Result<()> {
+    let bind_addr = if addr != "0.0.0.0:5800" {
+        addr.to_string()
+    } else if let Some(port) = config.hazelcast_port {
+        format!("0.0.0.0:{}", port)
+    } else {
+        addr.to_string()
+    };
+
+    let (serving, server) = start_master(&bind_addr, advertise, config.clone(), "hybrid").await?;
+    let advertise_addr = advertise_address(advertise, &serving.local_addr);
+    tracing::info!(
+        "Hybrid node: coordinator at {} + in-process worker '{}'",
+        advertise_addr,
+        worker_id
+    );
+
+    // The in-process worker talks to this node's own coordinator.
+    let master_list = vec![advertise_addr];
+    let worker_bind_addr = format!("127.0.0.1:{}", serving.local_addr.port());
+    let worker_fut = run_worker(&worker_bind_addr, master_list, worker_id, config);
+
+    tokio::select! {
+        _ = server => {},
+        res = worker_fut => {
+            if let Err(e) = res {
+                tracing::error!("Hybrid worker executor failed: {}", e);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -349,26 +498,13 @@ async fn pull_state_from(member: &str) -> anyhow::Result<Option<String>> {
 
 async fn run_worker(
     addr_arg: &str,
-    master_addr: &Option<String>,
+    master_list: Vec<String>,
     worker_id: &str,
-    engine_config: seatunnel_engine_server::server_config::EngineServerConfig,
+    engine_config: EngineServerConfig,
 ) -> anyhow::Result<()> {
-    // Master list: --master (comma separated) > config member-list >
-    // default. Ordered = failover priority.
-    let master_list: Vec<String> = master_addr
-        .as_ref()
-        .map(|m| {
-            m.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .filter(|list: &Vec<String>| !list.is_empty())
-        .unwrap_or_else(|| engine_config.member_list.clone());
-    let master = master_list
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no master address (use --master or the config member-list)"))?;
+    let master = master_list.first().cloned().ok_or_else(|| {
+        anyhow::anyhow!("no master address (use --master or the config member-list)")
+    })?;
 
     // Worker advertise address: --addr > config worker.address > default.
     let addr = if addr_arg != "127.0.0.1:5001" {
@@ -382,19 +518,15 @@ async fn run_worker(
         &state_dir,
         engine_config.keep_checkpoint_count,
     ));
-    let clean = engine_config.auto_clean.then(|| {
-        seatunnel_engine_server::worker::CleanConfig {
+    let clean = engine_config
+        .auto_clean
+        .then(|| seatunnel_engine_server::worker::CleanConfig {
             grace_secs: engine_config.clean_grace_minutes * 60,
             interval_secs: engine_config.clean_interval_minutes * 60,
             ttl_secs: engine_config.history_job_expire_minutes * 60,
-        }
-    });
-    let mut worker = WorkerNode::new_with_clean(
-        worker_id.to_string(),
-        addr.clone(),
-        state_store,
-        clean,
-    );
+        });
+    let mut worker =
+        WorkerNode::new_with_clean(worker_id.to_string(), addr.clone(), state_store, clean);
     // Checkpoint storage backend (master/s3 failover support).
     if engine_config.storage_type == "s3" && !engine_config.s3.bucket.is_empty() {
         match seatunnel_engine_server::checkpoint_store::build_object_store(&engine_config.s3) {
@@ -422,13 +554,14 @@ async fn run_worker(
     let worker = Arc::new(worker);
 
     tracing::info!(
-        "Worker '{}' starting at {} → master {} (state dir: {}, retained={}, auto-clean={})",
+        "Worker '{}' starting at {} → master {} (state dir: {}, retained={}, auto-clean={}, slots={})",
         worker_id,
         addr,
         master,
         state_dir,
         engine_config.keep_checkpoint_count,
-        engine_config.auto_clean
+        engine_config.auto_clean,
+        engine_config.slot_num
     );
 
     // Background state cleaner (TTL sweep; cancel cleanup rides along).
@@ -463,12 +596,23 @@ async fn run_worker(
             address: addr.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Default::default(),
-            heartbeat_interval_ms: 2000,
+            heartbeat_interval_ms: engine_config.heartbeat_interval_ms as i64,
             running_task_ids: running,
+            slots: engine_config.slot_num,
         });
         match client.register_worker(reg_request).await {
             Ok(resp) => {
-                tracing::info!("Registered with master: {}", resp.into_inner().message);
+                let resp = resp.into_inner();
+                worker.observe_term(resp.term);
+                tracing::info!(
+                    "Registered with master (term={}, leader={})",
+                    resp.term,
+                    if resp.leader_address.is_empty() {
+                        "-"
+                    } else {
+                        &resp.leader_address
+                    }
+                );
                 break;
             }
             Err(e) => {
@@ -479,88 +623,99 @@ async fn run_worker(
     }
 
     // Heartbeat loop: report liveness + running tasks, pull new assignments
-    // and cancellation notices.
-    let mut heartbeat = interval(Duration::from_millis(2000));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let worker_for_hb = Arc::clone(&worker);
-    let worker_id_owned = worker_id.to_string();
-    let addr_owned = addr.to_string();
-
-    let masters_for_hb = master_list.clone();
-    let heartbeat_task = tokio::spawn(async move {
-        let mut failures: u32 = 0;
-        let mut master_idx: usize = 0;
-        loop {
-            heartbeat.tick().await;
-
-            let tasks = worker_for_hb.heartbeat_tasks().await;
-            let hb = HeartbeatRequest {
-                worker_id: worker_id_owned.clone(),
-                address: addr_owned.clone(),
-                timestamp: seatunnel_engine_core::now_millis(),
-                tasks,
-            };
-
-            match client.heartbeat(hb).await {
-                Ok(resp) => {
-                    failures = 0;
-                    let response = resp.into_inner();
-                    if !response.cancel_jobs.is_empty() {
-                        worker_for_hb.cancel_jobs(&response.cancel_jobs).await;
-                    }
-                    if !response.preempted_task_ids.is_empty() {
-                        worker_for_hb
-                            .preempt_tasks(&response.preempted_task_ids)
-                            .await;
-                    }
-                    if !response.pending_tasks.is_empty() {
-                        tracing::info!(
-                            "Received {} task(s) from master",
-                            response.pending_tasks.len()
-                        );
-                        for task in response.pending_tasks {
-                            worker_for_hb.assign_task(task).await;
-                        }
-                    }
+    // and cancellation notices. The interval adapts to the master's
+    // `next_interval_ms` (clamped to sane bounds).
+    let shutdown = CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
+    let hb_handle = tokio::spawn({
+        let shutdown_signal = shutdown_signal;
+        let worker = Arc::clone(&worker);
+        let worker_id = worker_id.to_string();
+        let addr = addr.clone();
+        let masters = master_list.clone();
+        let default_interval = engine_config.heartbeat_interval_ms;
+        let slots = engine_config.slot_num;
+        async move {
+            let mut failures: u32 = 0;
+            let mut master_idx: usize = 0;
+            let mut interval_ms = default_interval;
+            loop {
+                tokio::select! {
+                    _ = shutdown_signal.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
                 }
-                Err(e) => {
-                    failures += 1;
-                    tracing::warn!("Heartbeat failed ({}/3): {}", failures, e);
-                    if failures >= 3 && masters_for_hb.len() > 1 {
-                        master_idx = (master_idx + 1) % masters_for_hb.len();
-                        let next = masters_for_hb[master_idx].clone();
-                        tracing::error!(
-                            "Master unreachable 3x — failing over to {} (data plane continues)",
-                            next
-                        );
-                        match MasterServiceClient::connect(format!("http://{}", next)).await {
-                            Ok(mut new_client) => {
-                                // Re-register with running tasks so the new
-                                // master fences reassigned tasks properly.
-                                let running = worker_for_hb.running_task_ids().await;
-                                let reg = tonic::Request::new(WorkerRegistration {
-                                    worker_id: worker_id_owned.clone(),
-                                    address: addr_owned.clone(),
-                                    version: env!("CARGO_PKG_VERSION").to_string(),
-                                    resources: Default::default(),
-                                    heartbeat_interval_ms: 2000,
-                                    running_task_ids: running,
-                                });
-                                if let Err(err) = new_client.register_worker(reg).await {
-                                    tracing::warn!(
-                                        "Re-registration with {} failed: {}",
-                                        next,
-                                        err
-                                    );
+
+                let tasks = worker.heartbeat_tasks().await;
+                let hb = HeartbeatRequest {
+                    worker_id: worker_id.clone(),
+                    address: addr.clone(),
+                    timestamp: seatunnel_engine_core::now_millis(),
+                    tasks,
+                    term: worker.term(),
+                    // Long-poll dispatch lands in a later stage; 0 keeps
+                    // the request-return-immediately behavior.
+                    wait_ms: 0,
+                };
+
+                match client.heartbeat(hb).await {
+                    Ok(resp) => {
+                        failures = 0;
+                        let response = resp.into_inner();
+                        interval_ms = if response.next_interval_ms > 0 {
+                            (response.next_interval_ms as u64).clamp(250, 60_000)
+                        } else {
+                            default_interval
+                        };
+                        // Term-fenced application: a deposed master's
+                        // instructions are rejected inside.
+                        worker.apply_master_response(&response).await;
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        tracing::warn!("Heartbeat failed ({}/3): {}", failures, e);
+                        if failures >= 3 && masters.len() > 1 {
+                            master_idx = (master_idx + 1) % masters.len();
+                            let next = masters[master_idx].clone();
+                            tracing::error!(
+                                "Master unreachable 3x — failing over to {} (data plane continues)",
+                                next
+                            );
+                            match MasterServiceClient::connect(format!("http://{}", next)).await {
+                                Ok(mut new_client) => {
+                                    // Re-register with running tasks so the new
+                                    // master fences reassigned tasks properly.
+                                    let running = worker.running_task_ids().await;
+                                    let reg = tonic::Request::new(WorkerRegistration {
+                                        worker_id: worker_id.clone(),
+                                        address: addr.clone(),
+                                        version: env!("CARGO_PKG_VERSION").to_string(),
+                                        resources: Default::default(),
+                                        heartbeat_interval_ms: default_interval as i64,
+                                        running_task_ids: running,
+                                        slots,
+                                    });
+                                    match new_client.register_worker(reg).await {
+                                        Ok(resp) => {
+                                            let resp = resp.into_inner();
+                                            worker.observe_term(resp.term);
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                "Re-registration with {} failed: {}",
+                                                next,
+                                                err
+                                            );
+                                        }
+                                    }
+                                    worker.set_master_client(new_client.clone()).await;
+                                    client = new_client;
+                                    failures = 0;
+                                    tracing::info!("Failed over to master {}", next);
                                 }
-                                worker_for_hb.set_master_client(new_client.clone()).await;
-                                client = new_client;
-                                failures = 0;
-                                tracing::info!("Failed over to master {}", next);
-                            }
-                            Err(err) => {
-                                tracing::warn!("Failover target {} unreachable too: {}", next, err);
-                                failures = 0; // rotate again next round
+                                Err(err) => {
+                                    tracing::warn!("Failover target {} unreachable too: {}", next, err);
+                                    failures = 0; // rotate again next round
+                                }
                             }
                         }
                     }
@@ -569,13 +724,28 @@ async fn run_worker(
         }
     });
 
-    // Wait for shutdown.
+    // Wait for shutdown, then leave the cluster cleanly: unregistering
+    // releases this worker's tasks for takeover immediately instead of
+    // making peers wait out the hard eviction timeout.
     tokio::select! {
-        _ = heartbeat_task => {},
+        _ = hb_handle => {},
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Worker '{}' shutting down.", worker_id);
+            shutdown.cancel();
         }
     }
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        if let Ok(mut c) = MasterServiceClient::connect(format!("http://{}", master)).await {
+            let req = tonic::Request::new(seatunnel_engine_comm::UnregisterWorkerRequest {
+                worker_id: worker_id.to_string(),
+                address: addr.clone(),
+            });
+            if let Err(e) = c.unregister_worker(req).await {
+                tracing::warn!("Graceful unregister failed: {}", e);
+            }
+        }
+    })
+    .await;
 
     Ok(())
 }

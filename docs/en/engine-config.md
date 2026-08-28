@@ -26,13 +26,25 @@ seatunnel:
 | Key | Default | Java counterpart | Behavior |
 | --- | --- | --- | --- |
 | `seatunnel.engine.history-job-expire-minutes` | 1440 (24h) | same key | TTL sweep removes a job's local state after this much idleness |
+| `seatunnel.engine.worker-soft-timeout-ms` | 30000 | — (two-level, this project) | a worker silent longer than this is suspected: it gets no NEW task assignments (still registered, running tasks untouched) |
+| `seatunnel.engine.worker-timeout-ms` | 60000 | Hazelcast `max.no.heartbeat.seconds` (180s) analogue | hard eviction: silent longer than this → removed from the registry, its tasks become claimable (failover) |
+| `seatunnel.engine.heartbeat-interval-ms` | 2000 | — | worker → master heartbeat period; the master may adjust it per response (`next_interval_ms`) |
+| `seatunnel.engine.slot-num` | 8 | `slot-num` | task slot budget this worker advertises |
+| `seatunnel.engine.replication-interval-ms` | 5000 | — | master-to-master state replication period (HA standby sync) |
+| `seatunnel.engine.worker-address` | 127.0.0.1:5001 | — | this worker's advertised address |
 | `seatunnel.engine.checkpoint.interval` | 30000 | `checkpoint.interval` | engine-wide default checkpoint interval (ms); a job's `env.checkpoint.interval` overrides it per job |
 | `seatunnel.engine.checkpoint.keep-checkpoint-count` | 3 | same key | checkpoint files retained per task; older ones are pruned on every write |
-| `seatunnel.engine.checkpoint.storage.type` | localfile | same key | only `localfile` exists here (warned if anything else) |
+| `seatunnel.engine.checkpoint.storage.type` | localfile | same key | `localfile` \| `master` (shared store on the master) \| `s3` (direct writes) |
 | `seatunnel.engine.checkpoint.storage.namespace` | .seatunnel-state | `plugin-config.namespace` analogue | local directory for checkpoint files |
 | `...storage.auto-clean` | true | — (this project) | enable terminal-job state cleanup |
 | `...storage.clean-grace-minutes` | 10 | — | delay after a job cancel before its state is deleted (restore window) |
 | `...storage.clean-interval-minutes` | 60 | — | how often the TTL sweep runs (plus once at startup) |
+
+Failure-detection defaults are deliberately conservative (soft 30 s /
+hard 60 s): the Java engine ships a 180 s heartbeat tolerance because a
+27-second full-GC stall once crossed a 60 s timeout and split the
+cluster — false evictions are worse than slow failover. See
+[Cluster HA Design](cluster-ha-design.md).
 
 Java keys with no equivalent yet (ignored if present): `backup-count`,
 `queue-type`, `slot-service.*`, `classloader-cache-mode`,

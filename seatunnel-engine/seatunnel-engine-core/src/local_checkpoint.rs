@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 use crate::now_millis;
 
@@ -123,7 +123,8 @@ impl CheckpointHandle {
 
     /// Whether the coordinator side is still alive.
     pub fn coordinator_alive(&self) -> bool {
-        !self.shared
+        !self
+            .shared
             .closed
             .load(std::sync::atomic::Ordering::Acquire)
     }
@@ -232,10 +233,12 @@ impl LocalCheckpointStore {
         // Job ids are operator-supplied; keep them filesystem-safe.
         let safe: String = job_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
             })
             .collect();
         self.root.join(safe)
@@ -270,7 +273,11 @@ impl LocalCheckpointStore {
     pub fn load_latest(&self, job_id: &str) -> anyhow::Result<Option<CheckpointEnvelope>> {
         let mut latest: Option<(u64, CheckpointEnvelope)> = None;
         for envelope in self.load_all(job_id)? {
-            if latest.as_ref().map(|(id, _)| envelope.checkpoint_id > *id).unwrap_or(true) {
+            if latest
+                .as_ref()
+                .map(|(id, _)| envelope.checkpoint_id > *id)
+                .unwrap_or(true)
+            {
                 latest = Some((envelope.checkpoint_id, envelope));
             }
         }
@@ -364,7 +371,11 @@ pub struct LocalCheckpointPlan {
 }
 
 impl LocalCheckpointPlan {
-    pub fn new(state_root: impl AsRef<Path>, job_id: impl Into<String>, interval: Duration) -> Self {
+    pub fn new(
+        state_root: impl AsRef<Path>,
+        job_id: impl Into<String>,
+        interval: Duration,
+    ) -> Self {
         let (report_tx, report_rx) = mpsc::unbounded_channel();
         LocalCheckpointPlan {
             job_id: job_id.into(),
@@ -613,7 +624,10 @@ impl LocalCheckpointDriver {
                     self.complete_checkpoint(p, false).await?;
                 }
             }
-            TaskToDriver::CommitDone { task_id, checkpoint_id } => {
+            TaskToDriver::CommitDone {
+                task_id,
+                checkpoint_id,
+            } => {
                 tracing::debug!(
                     job = %self.job_id,
                     "checkpoint {}: task {} finished phase 2",
@@ -634,7 +648,10 @@ impl LocalCheckpointDriver {
                     error
                 );
                 if let Some(p) = pending.take() {
-                    self.abort_checkpoint(p.checkpoint_id, &format!("task {} reported failure", task_id));
+                    self.abort_checkpoint(
+                        p.checkpoint_id,
+                        &format!("task {} reported failure", task_id),
+                    );
                 }
             }
             TaskToDriver::Done { task_id } => {
@@ -666,7 +683,8 @@ impl LocalCheckpointDriver {
         }
         let checkpoint_id = self.next_checkpoint_id;
         self.next_checkpoint_id = self.next_checkpoint_id.saturating_add(1);
-        let mut tasks: Vec<TaskCheckpointReport> = self.final_states.drain().map(|(_, r)| r).collect();
+        let mut tasks: Vec<TaskCheckpointReport> =
+            self.final_states.drain().map(|(_, r)| r).collect();
         for task in &mut tasks {
             task.checkpoint_id = checkpoint_id;
         }
@@ -689,7 +707,11 @@ impl LocalCheckpointDriver {
     }
 
     /// Persist the aggregated envelope, notify tasks, prune retention.
-    async fn complete_checkpoint(&mut self, mut pending: PendingCheckpoint, is_final: bool) -> anyhow::Result<()> {
+    async fn complete_checkpoint(
+        &mut self,
+        mut pending: PendingCheckpoint,
+        is_final: bool,
+    ) -> anyhow::Result<()> {
         let checkpoint_id = pending.checkpoint_id;
         let timestamp = pending.timestamp;
         // Tasks that exited mid-checkpoint contributed an exit-time barrier
@@ -698,7 +720,9 @@ impl LocalCheckpointDriver {
             if !entry.alive && !pending.reports.contains_key(&entry.meta.task_id) {
                 if let Some(mut final_state) = self.final_states.get(&entry.meta.task_id).cloned() {
                     final_state.checkpoint_id = checkpoint_id;
-                    pending.reports.insert(entry.meta.task_id.clone(), final_state);
+                    pending
+                        .reports
+                        .insert(entry.meta.task_id.clone(), final_state);
                 }
             }
         }
@@ -755,7 +779,9 @@ impl LocalCheckpointDriver {
         );
         for entry in &self.entries {
             if entry.alive {
-                entry.control.send_event(CheckpointEvent::Aborted(checkpoint_id));
+                entry
+                    .control
+                    .send_event(CheckpointEvent::Aborted(checkpoint_id));
             }
         }
     }
@@ -793,7 +819,11 @@ impl LocalCheckpointDriver {
                             entry.alive = false;
                         }
                     }
-                    Ok(Some(TaskToDriver::CheckpointFailed { task_id, checkpoint_id, error })) => {
+                    Ok(Some(TaskToDriver::CheckpointFailed {
+                        task_id,
+                        checkpoint_id,
+                        error,
+                    })) => {
                         tracing::error!(
                             job = %self.job_id,
                             "final checkpoint {} failed on task {}: {}",
@@ -816,7 +846,8 @@ impl LocalCheckpointDriver {
             // the cancel token makes them exit.
             let phase2_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while tokio::time::Instant::now() < phase2_deadline {
-                match tokio::time::timeout(Duration::from_millis(200), self.report_rx.recv()).await {
+                match tokio::time::timeout(Duration::from_millis(200), self.report_rx.recv()).await
+                {
                     Ok(Some(_)) => {}
                     _ => break,
                 }
@@ -873,7 +904,10 @@ mod tests {
         let latest = store.load_latest("job-a").unwrap().unwrap();
         assert_eq!(latest.checkpoint_id, 2);
         assert_eq!(latest.tasks.len(), 2);
-        assert_eq!(store.load_latest("job-b").unwrap().unwrap().checkpoint_id, 7);
+        assert_eq!(
+            store.load_latest("job-b").unwrap().unwrap().checkpoint_id,
+            7
+        );
         assert!(store.load_latest("missing").unwrap().is_none());
 
         // task state lookup by (pipeline, subtask)
@@ -949,8 +983,7 @@ mod tests {
     async fn driver_completes_checkpoint_after_all_reports() {
         let root = std::env::temp_dir().join(format!("cp-driver-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let mut plan =
-            LocalCheckpointPlan::new(&root, "job-driver", Duration::from_millis(20));
+        let mut plan = LocalCheckpointPlan::new(&root, "job-driver", Duration::from_millis(20));
         spawn_fake_task(&mut plan, "fast", 0).await;
         spawn_fake_task(&mut plan, "slow", 30).await;
         let store = LocalCheckpointStore::new(&root);

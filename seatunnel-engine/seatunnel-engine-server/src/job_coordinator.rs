@@ -35,6 +35,7 @@
 //! Only `Created` tasks are ever handed out, so heartbeats never double-assign.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use tracing::{error, info, warn};
@@ -115,6 +116,43 @@ pub struct TaskInfo {
     pub state: JobState,
     pub processed_records: u64,
     pub error: Option<String>,
+    /// Epoch-ms of the most recent record (0 = none yet), from heartbeats.
+    pub last_record_at: i64,
+    /// Most recent completed checkpoint id and state size (heartbeats).
+    pub last_checkpoint_id: u64,
+    pub last_checkpoint_size: u64,
+    /// Bounded tail of task log lines shipped by worker heartbeats.
+    pub logs: std::collections::VecDeque<String>,
+}
+
+/// Retained task log lines per task (bounded memory on the master).
+const TASK_LOG_RETAIN: usize = 500;
+
+impl TaskInfo {
+    pub fn new(task_id: String, stage_id: String, worker_id: String) -> Self {
+        TaskInfo {
+            task_id,
+            stage_id,
+            worker_id,
+            state: JobState::Created,
+            processed_records: 0,
+            error: None,
+            last_record_at: 0,
+            last_checkpoint_id: 0,
+            last_checkpoint_size: 0,
+            logs: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn append_logs(&mut self, lines: Vec<String>) {
+        for line in lines {
+            self.logs.push_back(line);
+        }
+        let excess = self.logs.len().saturating_sub(TASK_LOG_RETAIN);
+        if excess > 0 {
+            self.logs.drain(..excess);
+        }
+    }
 }
 
 /// A running job with its full state.
@@ -139,6 +177,11 @@ pub struct JobCoordinator {
     all_tasks: RwLock<HashMap<String, TaskDescriptor>>,
     /// Master-backed shared checkpoint store (storage type = master).
     checkpoint_store: crate::checkpoint_store::MasterCheckpointStore,
+    /// Fencing term (monotonic). Workers reject instructions from masters
+    /// with a lower term, so a deposed master cannot disturb tasks owned
+    /// by its successor. Replicated with the HA snapshot; becomes the
+    /// Raft leader term once consensus-based HA lands.
+    term: AtomicU64,
 }
 
 impl Default for JobCoordinator {
@@ -190,8 +233,9 @@ fn extract_pipelines(
             let source_section = entry
                 .get("source")
                 .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has no source section", name))?;
-            let (source_plugin, source_config) = first_block(source_section)
-                .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has an empty source section", name))?;
+            let (source_plugin, source_config) = first_block(source_section).ok_or_else(|| {
+                anyhow::anyhow!("pipeline '{}' has an empty source section", name)
+            })?;
             let sink_section = entry
                 .get("sinks")
                 .or_else(|| entry.get("sink"))
@@ -248,14 +292,39 @@ fn first_block(section: &serde_json::Value) -> Option<(String, serde_json::Value
     }
 }
 
-
 impl JobCoordinator {
     pub fn new() -> Self {
         JobCoordinator {
             jobs: RwLock::new(HashMap::new()),
             all_tasks: RwLock::new(HashMap::new()),
             checkpoint_store: crate::checkpoint_store::MasterCheckpointStore::new(3),
+            // Term 0 is reserved for "worker has not seen a master yet";
+            // masters always operate at term >= 1.
+            term: AtomicU64::new(1),
         }
+    }
+
+    /// Current fencing term.
+    pub fn term(&self) -> u64 {
+        self.term.load(Ordering::SeqCst)
+    }
+
+    /// Ratchet the term up to an externally observed value (replication
+    /// snapshot, worker report). Never decreases. Returns the current term.
+    pub fn observe_term(&self, seen: u64) -> u64 {
+        let mut current = self.term.load(Ordering::SeqCst);
+        while seen > current {
+            match self.term.compare_exchange(
+                current,
+                seen,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return seen,
+                Err(actual) => current = actual,
+            }
+        }
+        current
     }
 
     /// Compile a job config into chained task descriptors and register the job.
@@ -332,7 +401,10 @@ impl JobCoordinator {
                         ("job.name".to_string(), job_name.to_string()),
                         ("pipeline.index".to_string(), pipe_idx.to_string()),
                         ("pipeline.name".to_string(), pipe.name.clone()),
-                        ("pipeline.source.plugin".to_string(), pipe.source_plugin.clone()),
+                        (
+                            "pipeline.source.plugin".to_string(),
+                            pipe.source_plugin.clone(),
+                        ),
                         (
                             "pipeline.source.config".to_string(),
                             serde_json::to_string(&pipe.source_config)
@@ -373,8 +445,7 @@ impl JobCoordinator {
                     stage_id: t.stage_id.clone(),
                     worker_id: t.config.get("worker_id").cloned().unwrap_or_default(),
                     state: JobState::Scheduled,
-                    processed_records: 0,
-                    error: None,
+                    ..TaskInfo::new(t.task_id.clone(), t.stage_id.clone(), String::new())
                 },
             );
         }
@@ -479,10 +550,7 @@ impl JobCoordinator {
                     if matches!(info.state, JobState::Created | JobState::Scheduled) {
                         (info.worker_id.clone(), true)
                     } else if matches!(info.state, JobState::Deploying | JobState::Running) {
-                        (
-                            info.worker_id.clone(),
-                            !live_workers(&info.worker_id),
-                        )
+                        (info.worker_id.clone(), !live_workers(&info.worker_id))
                     } else {
                         continue;
                     }
@@ -502,7 +570,10 @@ impl JobCoordinator {
                     // Regular pending handout.
                     out.push(desc.clone());
                 } else if !live_workers(
-                    desc.config.get("worker_id").map(String::as_str).unwrap_or(""),
+                    desc.config
+                        .get("worker_id")
+                        .map(String::as_str)
+                        .unwrap_or(""),
                 ) {
                     // Orphan takeover: reassign to the requester.
                     info!(
@@ -511,7 +582,8 @@ impl JobCoordinator {
                         desc.config.get("worker_id").cloned().unwrap_or_default(),
                         worker_id
                     );
-                    desc.config.insert("worker_id".to_string(), worker_id.to_string());
+                    desc.config
+                        .insert("worker_id".to_string(), worker_id.to_string());
                     desc.config
                         .insert("worker_address".to_string(), worker_addr.to_string());
                     out.push(desc.clone());
@@ -545,9 +617,13 @@ impl JobCoordinator {
         affected
     }
 
-    /// Mark tasks reported as running by a (re)registering worker so no
-    /// other worker claims them, and return the subset this worker must
-    /// STOP because they were reassigned elsewhere (fencing).
+    /// Tasks a (re)registering worker reports as still running.
+    ///
+    /// Adopt-first (the Java engine's re-attach lesson): a task whose
+    /// assignment still points at this worker is marked `Running` for it
+    /// so no other worker claims it during the reconnect window. Only
+    /// tasks reassigned to ANOTHER worker are returned for local
+    /// preemption (fencing against double execution).
     pub fn register_running_tasks(
         &self,
         worker_id: &str,
@@ -556,33 +632,38 @@ impl JobCoordinator {
         if running_task_ids.is_empty() {
             return Vec::new();
         }
-        let jobs = self.jobs.read();
+        let mut jobs = self.jobs.write();
         let all = self.all_tasks.read();
         let mut preempted = Vec::new();
         for task_id in running_task_ids {
-            let Some(job) = jobs.values().find(|j| j.tasks.contains_key(task_id)) else {
+            let Some(job) = jobs.values_mut().find(|j| j.tasks.contains_key(task_id)) else {
                 continue;
             };
-            let Some(info) = job.tasks.get(task_id) else {
-                continue;
-            };
-            if info.worker_id == worker_id {
-                continue; // still ours
-            }
-            // Verify the current owner via the descriptor (assignment
-            // source of truth after failover reassignment).
+            // The descriptor's worker_id is the assignment source of truth
+            // (failover reassignment mutates it in place).
             let current_owner = all
                 .get(task_id)
                 .and_then(|d| d.config.get("worker_id").cloned())
                 .unwrap_or_default();
-            if current_owner == worker_id {
-                continue; // descriptor reassigned back to us
+            if current_owner != worker_id && !current_owner.is_empty() {
+                info!(
+                    "Fencing: task '{}' reported by worker '{}' but owned by '{}' — preempting",
+                    task_id, worker_id, current_owner
+                );
+                preempted.push(task_id.clone());
+                continue;
             }
-            info!(
-                "Fencing: task '{}' reported by worker '{}' but owned by '{}' — preempting",
-                task_id, worker_id, current_owner
-            );
-            preempted.push(task_id.clone());
+            // Adopt: still ours — mark Running so the claim rule's orphan
+            // arm cannot hand it to another worker while we reconnect.
+            if let Some(info) = job.tasks.get_mut(task_id) {
+                if matches!(
+                    info.state,
+                    JobState::Created | JobState::Scheduled | JobState::Deploying
+                ) {
+                    info.state = JobState::Running;
+                    info.worker_id = worker_id.to_string();
+                }
+            }
         }
         preempted
     }
@@ -659,6 +740,7 @@ impl JobCoordinator {
         };
         let checkpoints = self.checkpoint_store.export().await;
         serde_json::json!({
+            "term": self.term(),
             "jobs": job_dtos,
             "tasks": tasks_semantic,
             "checkpoints": checkpoints,
@@ -694,9 +776,14 @@ impl JobCoordinator {
             checkpoints_completed: u64,
             tasks: Vec<TaskInfoDto>,
         }
-        let Ok(jobs_dto) =
-            serde_json::from_value::<Vec<JobDto>>(snapshot.get("jobs").cloned().unwrap_or_default())
-        else {
+        // The fencing term never regresses: a standby that imported a
+        // higher-term snapshot (a successor took over) keeps that term.
+        if let Some(seen) = snapshot.get("term").and_then(|v| v.as_u64()) {
+            self.observe_term(seen);
+        }
+        let Ok(jobs_dto) = serde_json::from_value::<Vec<JobDto>>(
+            snapshot.get("jobs").cloned().unwrap_or_default(),
+        ) else {
             warn!("state import: malformed jobs section, skipped");
             return;
         };
@@ -714,12 +801,10 @@ impl JobCoordinator {
                         (
                             t.task_id.clone(),
                             TaskInfo {
-                                task_id: t.task_id,
-                                stage_id: t.stage_id,
-                                worker_id: t.worker_id,
                                 state: JobState::from(t.state.as_str()),
                                 processed_records: t.processed_records,
                                 error: t.error,
+                                ..TaskInfo::new(t.task_id.clone(), t.stage_id.clone(), t.worker_id.clone())
                             },
                         )
                     })
@@ -764,13 +849,27 @@ impl JobCoordinator {
                     task_id.clone(),
                     TaskDescriptor {
                         task_id,
-                        job_id: t.get("job_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        stage_id: t.get("stage_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        task_name: t.get("task_name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        task_index: t.get("task_index").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        job_id: t
+                            .get("job_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        stage_id: t
+                            .get("stage_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        task_name: t
+                            .get("task_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        task_index: t.get("task_index").and_then(|v| v.as_i64()).unwrap_or(0)
+                            as i32,
                         source_config_json: String::new(),
                         sink_config_json: String::new(),
-                        parallelism: t.get("parallelism").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+                        parallelism: t.get("parallelism").and_then(|v| v.as_i64()).unwrap_or(1)
+                            as i32,
                         config,
                     },
                 );
@@ -833,7 +932,6 @@ impl JobCoordinator {
                 task_id, job_id
             );
         }
-
         // A terminal job state (cancelled, failed, completed) is never
         // overwritten by late or in-flight task reports.
         if job.state.is_terminal() {
@@ -894,6 +992,41 @@ impl JobCoordinator {
         &self.checkpoint_store
     }
 
+    /// Ingest live per-task metrics carried by worker heartbeats: record
+    /// counter, last-record timestamp and the log-line increment. Task ids
+    /// are globally unique, so the owning job is located by scanning.
+    pub fn report_task_metrics(
+        &self,
+        task_id: &str,
+        records: u64,
+        last_record_at: i64,
+        logs: Vec<String>,
+        worker_id: &str,
+        last_checkpoint_id: u64,
+        last_checkpoint_size: u64,
+    ) {
+        let mut jobs = self.jobs.write();
+        for job in jobs.values_mut() {
+            if let Some(task) = job.tasks.get_mut(task_id) {
+                task.processed_records = records.max(task.processed_records);
+                if !worker_id.is_empty() {
+                    task.worker_id = worker_id.to_string();
+                }
+                if last_record_at > 0 {
+                    task.last_record_at = last_record_at;
+                }
+                if last_checkpoint_id > task.last_checkpoint_id {
+                    task.last_checkpoint_id = last_checkpoint_id;
+                    task.last_checkpoint_size = last_checkpoint_size;
+                }
+                if !job.state.is_terminal() && !logs.is_empty() {
+                    task.append_logs(logs);
+                }
+                return;
+            }
+        }
+    }
+
     /// Record a checkpoint reported by a worker.
     pub fn report_checkpoint(
         &self,
@@ -936,7 +1069,6 @@ impl JobCoordinator {
         false
     }
 }
-
 
 /// Normalize the transform section into an ordered array of configs.
 fn extract_transform_list(config: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -1009,8 +1141,6 @@ mod tests {
             .collect()
     }
 
-
-
     #[test]
     fn test_claim_orphan_reassigns_dead_worker_tasks() {
         let coordinator = JobCoordinator::new();
@@ -1029,12 +1159,13 @@ mod tests {
 
         // worker-1 dies: its task becomes claimable by worker-0.
         let dead = "worker-1";
-        let claimed = coordinator.claim_tasks_for_worker("worker-0", "127.0.0.1:9999", &|w| {
-            w != dead
-        });
-        assert!(claimed
-            .iter()
-            .any(|t| t.config.get("worker_id").map(String::as_str) == Some("worker-0")));
+        let claimed =
+            coordinator.claim_tasks_for_worker("worker-0", "127.0.0.1:9999", &|w| w != dead);
+        assert!(
+            claimed
+                .iter()
+                .any(|t| t.config.get("worker_id").map(String::as_str) == Some("worker-0"))
+        );
         // The task descriptor was reassigned.
         let reassigned = claimed
             .iter()
@@ -1092,9 +1223,11 @@ mod tests {
             coordinator.register_running_tasks("worker-0", std::slice::from_ref(&task_id));
         assert_eq!(preempted, vec![task_id.clone()]);
         // worker-1's own report is not fenced.
-        assert!(coordinator
-            .register_running_tasks("worker-1", &[task_id])
-            .is_empty());
+        assert!(
+            coordinator
+                .register_running_tasks("worker-1", &[task_id])
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1136,6 +1269,54 @@ mod tests {
             .and_then(|j| j.as_array().map(|a| a.len()))
             .unwrap_or(0);
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_term_never_regresses() {
+        let coordinator = JobCoordinator::new();
+        assert_eq!(coordinator.term(), 1);
+        assert_eq!(coordinator.observe_term(5), 5);
+        assert_eq!(coordinator.term(), 5);
+        // A lower observed term (stale master snapshot) is ignored.
+        assert_eq!(coordinator.observe_term(3), 5);
+        assert_eq!(coordinator.term(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_term_travels_with_state_snapshot() {
+        let primary = JobCoordinator::new();
+        primary.observe_term(9);
+        let snapshot = primary.export_state().await;
+        assert_eq!(snapshot["term"], 9);
+
+        let standby = JobCoordinator::new();
+        standby.import_state(&snapshot).await;
+        assert_eq!(standby.term(), 9);
+    }
+
+    #[test]
+    fn test_register_running_tasks_adopts_own_tasks() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = coordinator
+            .compile_and_schedule("ja", "a", &config, None, &workers(1))
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+
+        // Reconnect of the owning worker: adopt, never preempt.
+        let preempted =
+            coordinator.register_running_tasks("worker-0", std::slice::from_ref(&task_id));
+        assert!(preempted.is_empty());
+        // The task is Running for worker-0 and NOT claimable by a live peer.
+        let job = coordinator.get_job("ja").unwrap();
+        assert_eq!(job.tasks[&task_id].state, JobState::Running);
+        let claimed = coordinator.claim_tasks_for_worker("worker-1", "a", &|_| true);
+        assert!(claimed.iter().all(|t| t.task_id != task_id));
     }
 
     #[test]
@@ -1184,7 +1365,10 @@ mod tests {
         let t2 = &tasks[2];
         assert_eq!(t2.task_index, 1);
         // Default policy inherited from env.
-        assert_eq!(t2.config.get("pipeline.on-sink-failure").unwrap(), "isolate");
+        assert_eq!(
+            t2.config.get("pipeline.on-sink-failure").unwrap(),
+            "isolate"
+        );
     }
 
     #[test]
@@ -1250,9 +1434,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             "worker-0",
         );
-        assert!(coordinator
-            .get_pending_tasks_for_worker("worker-0")
-            .is_empty());
+        assert!(
+            coordinator
+                .get_pending_tasks_for_worker("worker-0")
+                .is_empty()
+        );
     }
 
     #[test]

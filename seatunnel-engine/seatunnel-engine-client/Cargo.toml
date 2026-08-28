@@ -13,6 +13,5 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-axum = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }

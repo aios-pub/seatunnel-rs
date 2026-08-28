@@ -30,8 +30,21 @@ seatunnel:
     # (TTL sweep removes anything idle longer than this; also drives the
     # S3 checkpoint sweep).
     history-job-expire-minutes: 1440
-    # Worker heartbeat timeout before eviction + task failover (ms).
-    worker-timeout-ms: 6000
+    # Two-level liveness detection (this project):
+    #   - soft: a worker silent longer than worker-soft-timeout-ms gets no
+    #     NEW task assignments (still registered, running tasks untouched)
+    #   - hard: silent longer than worker-timeout-ms → eviction, its tasks
+    #     become claimable by live workers (failover)
+    # Deliberately conservative: the Java engine ships a 180s heartbeat
+    # tolerance because a 27s full-GC stall once crossed a 60s timeout and
+    # split the cluster — false evictions are worse than slow failover.
+    worker-soft-timeout-ms: 30000
+    worker-timeout-ms: 60000
+    # Worker → master heartbeat period (ms); the master may adjust it per
+    # response (next_interval_ms).
+    heartbeat-interval-ms: 2000
+    # Task slot budget this worker advertises (Java slot-num analogue).
+    slot-num: 8
     # Master-to-master state replication period for HA standby (ms).
     replication-interval-ms: 5000
     # This worker's advertised address (host:port).

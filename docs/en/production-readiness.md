@@ -20,7 +20,7 @@ Pseudo-cluster fault-matrix verification: `scripts/e2e-pseudo-cluster.sh`
 ## Architecture summary (what was built)
 
 - **Checkpoint storage**: `localfile` (default) | `master` (bytes ride the existing `ReportCheckpoint` proto field; replicated to standbys via `PullState`) | `s3` (workers write directly via object_store; MinIO/AWS).
-- **Worker failover**: TTL eviction (`worker-timeout-ms`) + orphan-task claim rule + per-task preemption fence (`HeartbeatResponse.preempted_task_ids`) — a returning worker that still runs a reassigned task is told to stop it, preventing dual execution.
+- **Worker failover**: two-level liveness (`worker-soft-timeout-ms`: silent workers get no new assignments; `worker-timeout-ms`: eviction) + orphan-task claim rule + per-task preemption fence (`HeartbeatResponse.preempted_task_ids`) — a returning worker that still runs a reassigned task is told to stop it, preventing dual execution. Re-connecting workers re-attach to their still-assigned tasks (adopt-before-preempt).
 - **Master HA**: ordered `hazelcast.network.join.tcp-ip.member-list`; standby masters `PullState` from earlier members; a restarted primary recovers once from any member with state; workers and clients (`-a addr1,addr2`) follow the same ordered failover.
 - **S3 cleanup**: three layers — write-time retention (`keep-checkpoint-count`), master cancel-grace deletion, TTL sweep (`history-job-expire-minutes`).
 
@@ -37,6 +37,7 @@ Pseudo-cluster fault-matrix verification: `scripts/e2e-pseudo-cluster.sh`
 ## Operational guidance
 
 - Set `checkpoint.storage.type: s3` with a real S3/MinIO deployment for production (decouples checkpoint durability from master liveness).
-- `worker-timeout-ms` should be ≥ 3× heartbeat interval (default 2000ms); increase on lossy networks to avoid premature eviction.
+- `worker-timeout-ms` (hard eviction, default 60000) should be ≥ 3× heartbeat interval (`heartbeat-interval-ms`, default 2000); `worker-soft-timeout-ms` (default 30000) should sit between the two. Increase both on lossy networks to avoid premature eviction — the Java engine ships 180s tolerance for exactly this reason (a 27s full-GC stall once split its cluster).
+- Graceful worker shutdown (`UnregisterWorker`) releases the worker's tasks for takeover immediately; only crashed workers wait out the hard timeout.
 - `replication-interval-ms` bounds standby staleness; 5000ms default is a good trade-off.
 - Monitor for `Failover: task` and `failing over to` log lines — they indicate infra-level instability.

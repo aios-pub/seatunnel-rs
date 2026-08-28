@@ -48,7 +48,9 @@ use seatunnel_api::source::source_reader::SourceReader;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use seatunnel_engine_core::connector_factory::{AnySplit, BoxedSinkCommitter, BoxedSinkWriter, BoxedSourceReader};
+use seatunnel_engine_core::connector_factory::{
+    AnySplit, BoxedSinkCommitter, BoxedSinkWriter, BoxedSourceReader,
+};
 use seatunnel_engine_core::local_checkpoint::{
     CheckpointEnvelope, LocalCheckpointPlan, LocalCheckpointStore, TaskRegistration,
 };
@@ -75,7 +77,9 @@ impl SourceReader for SeqSource {
         Box::pin(async { Ok(()) })
     }
 
-    fn poll_next(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Row>>> + Send + '_>> {
+    fn poll_next(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PollResult<Row>>> + Send + '_>> {
         let seq = self.next_seq;
         self.next_seq += 1;
         Box::pin(async move {
@@ -86,7 +90,9 @@ impl SourceReader for SeqSource {
         })
     }
 
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         // The record with seq == next_seq-1 may not be committed yet; the
         // safe replay boundary is next_seq-1 ONLY IF the sink's prepare
         // flushed it first — which the engine's barrier order guarantees
@@ -198,7 +204,10 @@ impl SinkWriter for TestSink {
         Box::pin(async { Ok(()) })
     }
 
-    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         let seq = match record.fields.first() {
             Some(Field::Int64(v)) => *v as u64,
             _ => 0,
@@ -233,7 +242,9 @@ impl SinkWriter for TestSink {
         })
     }
 
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let state = serde_json::to_vec(&TestWriterState {
             boundary: self.boundary,
         })
@@ -264,7 +275,10 @@ impl SinkCommitter for TestCommitter {
     type CommitInfo = Vec<u8>;
     type AggregatedCommitInfo = serde_json::Value;
 
-    fn commit(&mut self, commit_infos: Vec<Self::CommitInfo>) -> CommitterFuture<'_, Self::AggregatedCommitInfo> {
+    fn commit(
+        &mut self,
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> CommitterFuture<'_, Self::AggregatedCommitInfo> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
             let mut guard = shared.lock().await;
@@ -333,7 +347,8 @@ async fn run_session(
     if let Some(envelope) = &envelope {
         if let Some(task_state) = envelope.task_state("p0", 0) {
             source.restore(&task_state.reader_state);
-            sink.restore(&task_state.writer_state, &task_state.commit_infos).await;
+            sink.restore(&task_state.writer_state, &task_state.commit_infos)
+                .await;
         }
     }
 
@@ -415,11 +430,7 @@ async fn run_session(
 }
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "st-cp-recovery-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("st-cp-recovery-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     root
@@ -453,16 +464,33 @@ async fn exactly_once_across_crash_matrix() {
     let after_a = result.last_envelope.map(|e| e.checkpoint_id).unwrap_or(0);
 
     // Session B: die right after a NEW envelope is persisted.
-    let result = run_session(&root, job, Arc::clone(&shared), Fault::AfterPersist(after_a)).await;
-    let after_b = result.last_envelope.map(|e| e.checkpoint_id).unwrap_or(after_a);
+    let result = run_session(
+        &root,
+        job,
+        Arc::clone(&shared),
+        Fault::AfterPersist(after_a),
+    )
+    .await;
+    let after_b = result
+        .last_envelope
+        .map(|e| e.checkpoint_id)
+        .unwrap_or(after_a);
 
     // Session C: die mid-stream with nothing coordinated.
-    let result = run_session(&root, job, Arc::clone(&shared), Fault::MidStream(Duration::from_millis(150))).await;
+    let result = run_session(
+        &root,
+        job,
+        Arc::clone(&shared),
+        Fault::MidStream(Duration::from_millis(150)),
+    )
+    .await;
     let _ = result;
 
     // Session D: graceful shutdown (final checkpoint + tail settle).
     let result = run_session(&root, job, Arc::clone(&shared), Fault::Graceful).await;
-    let final_envelope = result.last_envelope.expect("final session must persist a checkpoint");
+    let final_envelope = result
+        .last_envelope
+        .expect("final session must persist a checkpoint");
     assert!(final_envelope.is_final, "shutdown checkpoint must be final");
     assert!(final_envelope.checkpoint_id > after_b);
 
@@ -507,7 +535,10 @@ async fn exactly_once_crashing_right_after_persist() {
     let mut than = 0u64;
     for _ in 0..4 {
         let result = run_session(&root, job, Arc::clone(&shared), Fault::AfterPersist(than)).await;
-        than = result.last_envelope.map(|e| e.checkpoint_id).unwrap_or(than);
+        than = result
+            .last_envelope
+            .map(|e| e.checkpoint_id)
+            .unwrap_or(than);
     }
     run_session(&root, job, Arc::clone(&shared), Fault::Graceful).await;
 

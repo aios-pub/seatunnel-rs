@@ -40,7 +40,6 @@
 
 use serde::Deserialize;
 
-
 /// Top-level `hazelcast:` section (Java cluster config adapted).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -109,9 +108,26 @@ pub struct EngineSection {
     /// artifacts are kept before expiry (default 1440 = 24h).
     #[serde(default)]
     pub history_job_expire_minutes: Option<u64>,
-    /// Heartbeat timeout before a worker is evicted (failover).
+    /// Soft heartbeat timeout (ms): a worker silent longer than this is
+    /// suspected — no NEW tasks are assigned to it, but its running tasks
+    /// and registry entry stay until the hard timeout.
+    #[serde(default)]
+    pub worker_soft_timeout_ms: Option<u64>,
+    /// Hard heartbeat timeout before a worker is evicted and its tasks
+    /// become claimable (failover). Defaults deliberately conservative:
+    /// a long GC pause or network jitter must not trigger a false
+    /// eviction (the Java engine learned this the hard way with 27s
+    /// full-GC stalls crossing a 60s timeout).
     #[serde(default)]
     pub worker_timeout_ms: Option<u64>,
+    /// Worker → master heartbeat period (ms). The master may override it
+    /// per response (`next_interval_ms`).
+    #[serde(default)]
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Task slot budget this worker advertises (Java `slot-num` analogue;
+    /// scheduling use lands with least-loaded placement).
+    #[serde(default)]
+    pub slot_num: Option<u32>,
     /// Master-to-master state replication period (HA standby sync).
     #[serde(default)]
     pub replication_interval_ms: Option<u64>,
@@ -203,8 +219,15 @@ pub struct EngineServerConfig {
     /// Minutes of inactivity before a job's state dir is swept
     /// (Java `history-job-expire-minutes`).
     pub history_job_expire_minutes: u64,
+    /// Heartbeat silence after which a worker is suspected (ms). Suspect
+    /// workers receive no new task assignments.
+    pub worker_soft_timeout_ms: u64,
     /// Heartbeat timeout before worker eviction (ms).
     pub worker_timeout_ms: u64,
+    /// Worker → master heartbeat period (ms).
+    pub heartbeat_interval_ms: u64,
+    /// Task slot budget advertised by this worker.
+    pub slot_num: u32,
     /// Master state replication period (ms).
     pub replication_interval_ms: u64,
     /// This worker's advertised address.
@@ -243,7 +266,13 @@ impl Default for EngineServerConfig {
             clean_grace_minutes: 10,
             clean_interval_minutes: 60,
             history_job_expire_minutes: 1440,
-            worker_timeout_ms: 6_000,
+            // Conservative failure detection: suspect at 30s, evict at 60s.
+            // (The old 6s default evicted workers on a single long GC
+            // pause — the Java engine ships 180s for exactly this reason.)
+            worker_soft_timeout_ms: 30_000,
+            worker_timeout_ms: 60_000,
+            heartbeat_interval_ms: 2_000,
+            slot_num: 8,
             replication_interval_ms: 5_000,
             worker_address: "127.0.0.1:5001".to_string(),
             storage_type: "localfile".to_string(),
@@ -285,6 +314,19 @@ impl EngineServerConfig {
         let engine = &file.seatunnel.engine;
         if let Some(minutes) = engine.history_job_expire_minutes {
             self.history_job_expire_minutes = minutes.max(1);
+        }
+        if let Some(ms) = engine.worker_soft_timeout_ms {
+            self.worker_soft_timeout_ms = ms.max(1_000);
+        }
+        if let Some(ms) = engine.worker_timeout_ms {
+            // The hard timeout must never sit below the soft threshold.
+            self.worker_timeout_ms = ms.max(self.worker_soft_timeout_ms).max(1_000);
+        }
+        if let Some(ms) = engine.heartbeat_interval_ms {
+            self.heartbeat_interval_ms = ms.clamp(250, 60_000);
+        }
+        if let Some(slots) = engine.slot_num {
+            self.slot_num = slots.max(1);
         }
         if let Some(interval) = engine.checkpoint.interval {
             self.checkpoint_interval = interval.max(1);
@@ -352,7 +394,12 @@ impl EngineServerConfig {
                  member-list requires deterministic master ports"
             );
         }
-        let members = hz.network.join.tcp_ip.member_list.iter()
+        let members = hz
+            .network
+            .join
+            .tcp_ip
+            .member_list
+            .iter()
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
             .collect::<Vec<_>>();
@@ -373,6 +420,30 @@ mod tests {
         assert_eq!(config.keep_checkpoint_count, 3);
         assert!(config.auto_clean);
         assert_eq!(config.history_job_expire_minutes, 1440);
+        assert_eq!(config.worker_soft_timeout_ms, 30_000);
+        assert_eq!(config.worker_timeout_ms, 60_000);
+        assert_eq!(config.heartbeat_interval_ms, 2_000);
+        assert_eq!(config.slot_num, 8);
+    }
+
+    #[test]
+    fn timeout_overrides_are_clamped() {
+        let yaml = "
+seatunnel:
+  engine:
+    worker-soft-timeout-ms: 5000
+    worker-timeout-ms: 2000
+    heartbeat-interval-ms: 500
+    slot-num: 16
+";
+        let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let mut config = EngineServerConfig::default();
+        config.apply_file(&file);
+        assert_eq!(config.worker_soft_timeout_ms, 5_000);
+        // Hard timeout lifted to the soft threshold (2000 < 5000).
+        assert_eq!(config.worker_timeout_ms, 5_000);
+        assert_eq!(config.heartbeat_interval_ms, 500);
+        assert_eq!(config.slot_num, 16);
     }
 
     #[test]
@@ -404,7 +475,8 @@ seatunnel:
 
     #[test]
     fn auto_clean_can_be_disabled() {
-        let yaml = "seatunnel:\n  engine:\n    checkpoint:\n      storage:\n        auto-clean: false\n";
+        let yaml =
+            "seatunnel:\n  engine:\n    checkpoint:\n      storage:\n        auto-clean: false\n";
         let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
         let mut config = EngineServerConfig::default();
         config.apply_file(&file);

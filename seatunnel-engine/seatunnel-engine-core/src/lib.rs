@@ -10,24 +10,21 @@
 use chrono::Utc;
 use uuid::Uuid;
 
-pub mod fanout;
 pub mod barrier;
 pub mod checkpoint;
-pub mod checkpoint_coordinator;
 pub mod checkpoint_listener;
-pub mod checkpoint_storage;
 #[cfg(feature = "connectors")]
 pub mod connector_factory;
 pub mod dag;
 pub mod execution;
+pub mod fanout;
 pub mod local_checkpoint;
 pub mod recovery;
 pub mod resource;
-pub mod savepoint;
 pub mod state;
-pub mod state_backend;
 pub mod task;
 pub mod task_group;
+pub mod task_log;
 
 // Re-export key types
 pub use barrier::{BarrierTracker, CheckpointBarrier, StreamElement};
@@ -35,24 +32,17 @@ pub use checkpoint::{
     CheckpointConfig, CheckpointId, CheckpointState, CheckpointStorage, CompletedCheckpoint,
     TaskCheckpointState,
 };
-pub use checkpoint_coordinator::CheckpointCoordinator;
 pub use checkpoint_listener::{CheckpointListener, NopCheckpointListener};
-pub use checkpoint_storage::{
-    CheckpointStorageBackend, CheckpointStorageError, HDFSCheckpointStorage,
-    InMemoryCheckpointStorage, LocalCheckpointStorage, S3CheckpointStorage,
-};
 #[cfg(feature = "connectors")]
 pub use connector_factory::{
-    create_sink, create_source, create_transforms, AnySplit, BoxedSinkWriter, BoxedSourceReader,
-    BoxedTransform, ConsoleSinkWriter, FakeSeqSource,
+    AnySplit, BoxedSinkWriter, BoxedSourceReader, BoxedTransform, ConsoleSinkWriter, FakeSeqSource,
+    create_sink, create_source, create_transforms,
 };
 pub use dag::{Pipeline, Stage, StageType};
 pub use execution::ExecutionMode;
 pub use recovery::{FailureEvent, RecoveryAction, RecoveryManager, RecoveryPlan, RecoveryState};
 pub use resource::WorkerResource;
-pub use savepoint::{Savepoint, SavepointManager};
 pub use state::{JobState, TaskState};
-pub use state_backend::{ManagedStateBackend, MemoryStateBackend, StateBackend, StateHandle};
 pub use task::{TaskId, TaskKind, TaskStatus};
 
 /// Unique job identifier.

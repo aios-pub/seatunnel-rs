@@ -12,7 +12,6 @@ seatunnel-engine-comm = { path = "../seatunnel-engine-comm" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = "0.1"
-axum = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

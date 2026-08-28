@@ -270,16 +270,30 @@ where
 // Built-in fake source (smoke tests / local demos)
 // ---------------------------------------------------------------------------
 
-/// Emits a bounded sequence of synthetic rows, then EOF.
+/// Emits synthetic rows. `total` bounds the stream; a `total` of `u64::MAX`
+/// (config `row.num < 0`, e.g. `-1`) never ends, which together with
+/// `sleep.ms` models a continuous streaming source for demos and metrics.
 #[derive(Debug, Default)]
 pub struct FakeSeqSource {
     emitted: u64,
     total: u64,
+    /// Optional inter-row delay for unbounded demos (0 = as fast as
+    /// possible).
+    sleep_ms: u64,
 }
 
 impl FakeSeqSource {
     pub fn with_total(total: u64) -> Self {
-        FakeSeqSource { emitted: 0, total }
+        FakeSeqSource {
+            emitted: 0,
+            total,
+            sleep_ms: 0,
+        }
+    }
+
+    pub fn with_sleep_ms(mut self, sleep_ms: u64) -> Self {
+        self.sleep_ms = sleep_ms;
+        self
     }
 }
 
@@ -297,6 +311,9 @@ impl SourceReader for FakeSeqSource {
         Box::pin(async move {
             if self.emitted >= self.total {
                 return Ok(PollResult::EOF);
+            }
+            if self.sleep_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
             }
             let mut row = Row::new(seatunnel_api::row::RowKind::Insert, 3);
             row.set(0, Field::Int64(self.emitted as i64));
@@ -893,13 +910,20 @@ pub fn create_source(
             }
         }
         "fake" | "fake source" | "fakesource" => {
+            // `row.num < 0` (e.g. -1) = unbounded stream for demos;
+            // `sleep.ms` adds an inter-row delay to model throughput.
             let _ = (parallelism, restore_state);
-            let total = config
-                .get("row.num")
+            let total = match config.get("row.num").and_then(|v| v.parse::<i64>().ok()) {
+                Some(n) if n < 0 => u64::MAX,
+                Some(n) => n as u64,
+                None => 10,
+            };
+            let sleep_ms = config
+                .get("sleep.ms")
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(10);
+                .unwrap_or(0);
             Ok(Box::new(ReaderAdapter {
-                inner: FakeSeqSource::with_total(total),
+                inner: FakeSeqSource::with_total(total).with_sleep_ms(sleep_ms),
                 warned_splits: false,
             }))
         }

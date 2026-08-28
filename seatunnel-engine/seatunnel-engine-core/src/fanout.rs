@@ -47,7 +47,7 @@ use seatunnel_api::row::Row;
 use seatunnel_api::schema::SchemaChangeEvent;
 use seatunnel_api::sink::sink_committer::SinkCommitter;
 use seatunnel_api::sink::sink_writer::SinkWriter;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::connector_factory::{BoxedSinkCommitter, BoxedSinkWriter};
 
@@ -80,10 +80,7 @@ impl SinkFailurePolicy {
 enum SinkCommand {
     Open(oneshot::Sender<anyhow::Result<()>>),
     Write(Row),
-    SchemaChange(
-        Box<SchemaChangeEvent>,
-        oneshot::Sender<anyhow::Result<()>>,
-    ),
+    SchemaChange(Box<SchemaChangeEvent>, oneshot::Sender<anyhow::Result<()>>),
     PrepareCommit(u64, oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>),
     SnapshotState(oneshot::Sender<anyhow::Result<Vec<u8>>>),
     Close(oneshot::Sender<anyhow::Result<()>>),
@@ -322,11 +319,16 @@ impl SinkWriter for FanoutSinkWriter {
         })
     }
 
-    fn write(&mut self, record: Self::Input) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
         Box::pin(async move {
             // The last live sink receives the record by move; the rest clone.
             // Scanning backwards also avoids a per-write allocation.
-            let Some(last) = (0..self.handles.len()).rev().find(|i| !self.handles[*i].dead)
+            let Some(last) = (0..self.handles.len())
+                .rev()
+                .find(|i| !self.handles[*i].dead)
             else {
                 return Ok(());
             };
@@ -439,7 +441,10 @@ impl SinkWriter for FanoutSinkWriter {
             // written with the new shape everywhere.
             self.broadcast_and_await(move || {
                 let (ack_tx, ack_rx) = oneshot::channel();
-                (SinkCommand::SchemaChange(Box::new(event.clone()), ack_tx), ack_rx)
+                (
+                    SinkCommand::SchemaChange(Box::new(event.clone()), ack_tx),
+                    ack_rx,
+                )
             })
             .await
             .map(|_| ())
@@ -482,7 +487,11 @@ impl FanoutCommitter {
         };
         let parsed: FanoutCommitInfos = serde_json::from_slice(&first)
             .map_err(|e| anyhow::anyhow!("fan-out commit info decode: {}", e))?;
-        Ok(parsed.entries.into_iter().map(|e| (e.sink, e.infos)).collect())
+        Ok(parsed
+            .entries
+            .into_iter()
+            .map(|e| (e.sink, e.infos))
+            .collect())
     }
 }
 
@@ -499,10 +508,7 @@ impl SinkCommitter for FanoutCommitter {
             let mut aggregated = serde_json::Map::new();
             for (name, committer) in &mut self.committers {
                 if let (Some(committer), Some(infos)) = (committer, groups.get(name)) {
-                    aggregated.insert(
-                        name.clone(),
-                        committer.commit(infos.clone()).await?,
-                    );
+                    aggregated.insert(name.clone(), committer.commit(infos.clone()).await?);
                 }
             }
             Ok(serde_json::Value::Object(aggregated))
@@ -564,7 +570,10 @@ mod tests {
         }
 
         fn log(&self, op: &str) {
-            self.ops.lock().unwrap().push(format!("{}:{}", self.name, op));
+            self.ops
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", self.name, op));
         }
     }
 
@@ -636,8 +645,14 @@ mod tests {
         let ops = Arc::new(Mutex::new(Vec::new()));
         let mut mux = FanoutSinkWriter::new(
             vec![
-                ("a".to_string(), boxed(TestWriter::new("a", Arc::clone(&ops)))),
-                ("b".to_string(), boxed(TestWriter::new("b", Arc::clone(&ops)))),
+                (
+                    "a".to_string(),
+                    boxed(TestWriter::new("a", Arc::clone(&ops))),
+                ),
+                (
+                    "b".to_string(),
+                    boxed(TestWriter::new("b", Arc::clone(&ops))),
+                ),
             ],
             SinkFailurePolicy::Fail,
         );
@@ -649,10 +664,24 @@ mod tests {
 
         let ops = ops.lock().unwrap().clone();
         // Per-sink ordering: writes precede the flush.
-        let a = ops.iter().filter(|o| o.starts_with("a:")).cloned().collect::<Vec<_>>();
-        let b = ops.iter().filter(|o| o.starts_with("b:")).cloned().collect::<Vec<_>>();
-        assert_eq!(a, vec!["a:open", "a:write1", "a:write2", "a:flush", "a:close"]);
-        assert_eq!(b, vec!["b:open", "b:write1", "b:write2", "b:flush", "b:close"]);
+        let a = ops
+            .iter()
+            .filter(|o| o.starts_with("a:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let b = ops
+            .iter()
+            .filter(|o| o.starts_with("b:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            a,
+            vec!["a:open", "a:write1", "a:write2", "a:flush", "a:close"]
+        );
+        assert_eq!(
+            b,
+            vec!["b:open", "b:write1", "b:write2", "b:flush", "b:close"]
+        );
     }
 
     #[tokio::test]
@@ -662,7 +691,10 @@ mod tests {
             vec![
                 (
                     "slow".to_string(),
-                    boxed(TestWriter::new("slow", Arc::clone(&ops)).with_delay(Duration::from_millis(300))),
+                    boxed(
+                        TestWriter::new("slow", Arc::clone(&ops))
+                            .with_delay(Duration::from_millis(300)),
+                    ),
                 ),
                 (
                     "fast".to_string(),
@@ -740,10 +772,7 @@ mod tests {
         assert!(ops.contains(&"healthy:write2".to_string()));
         assert!(ops.contains(&"healthy:flush".to_string()));
         // doomed wrote its failing row only
-        let doomed_writes = ops
-            .iter()
-            .filter(|o| o.starts_with("doomed:write"))
-            .count();
+        let doomed_writes = ops.iter().filter(|o| o.starts_with("doomed:write")).count();
         assert_eq!(doomed_writes, 1);
     }
 
@@ -765,13 +794,17 @@ mod tests {
                 &mut self,
                 _record: Self::Input,
             ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
-                self.ops.lock().unwrap().push(format!("{}:write", self.name));
+                self.ops
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:write", self.name));
                 Box::pin(async { Ok(()) })
             }
             fn prepare_commit(
                 &mut self,
                 _checkpoint_id: u64,
-            ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>> {
+            ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>>
+            {
                 Box::pin(async { Ok(vec![]) })
             }
             fn snapshot_state(
@@ -815,10 +848,8 @@ mod tests {
             SinkFailurePolicy::Fail,
         );
         mux.open().await.unwrap();
-        let event = SchemaChangeEvent::new(
-            "db.t",
-            vec![seatunnel_api::SchemaChange::drop_column("x")],
-        );
+        let event =
+            SchemaChangeEvent::new("db.t", vec![seatunnel_api::SchemaChange::drop_column("x")]);
         mux.apply_schema_change(&event).await.unwrap();
         let ops_now = ops.lock().unwrap().clone();
         assert!(ops_now.contains(&"a:ddl".to_string()));

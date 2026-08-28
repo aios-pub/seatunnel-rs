@@ -284,10 +284,12 @@ mod tests {
     #[test]
     fn load_missing_returns_none() {
         let store = tmp_store("missing");
-        assert!(store
-            .load_latest_checkpoint("nope", "nope")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .load_latest_checkpoint("nope", "nope")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

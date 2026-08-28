@@ -9,8 +9,8 @@
 
 use reqwest::Client as HttpClient;
 use seatunnel_engine_comm::{
-    CancelJobRequest, ClientServiceClient, ClusterInfo, JobList, JobStatus, JobStatusRequest,
-    SubmitJobRequest, SubmitJobResponse,
+    CancelJobRequest, ClientServiceClient, ClusterInfo, JobCheckpointHistory, JobList, JobLogs,
+    JobStatus, JobStatusRequest, SubmitJobRequest, SubmitJobResponse,
 };
 use tonic::Request;
 use tracing::info;
@@ -35,7 +35,10 @@ impl EngineClient {
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty())
             .collect();
-        let primary = all.first().cloned().unwrap_or_else(|| master_address.to_string());
+        let primary = all
+            .first()
+            .cloned()
+            .unwrap_or_else(|| master_address.to_string());
         EngineClient {
             grpc_address: format!("http://{}", primary),
             all_addresses: all,
@@ -48,8 +51,10 @@ impl EngineClient {
     /// `all_addresses`).
     async fn connect_failover(
         &self,
-    ) -> Result<ClientServiceClient<tonic::transport::Channel>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        ClientServiceClient<tonic::transport::Channel>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let addresses = if self.all_addresses.is_empty() {
             vec![self.grpc_address.clone()]
         } else {
@@ -68,21 +73,23 @@ impl EngineClient {
                 }
             }
         }
-        Err(format!(
-            "no reachable master ({})",
-            last_err.unwrap_or_default()
-        )
-        .into())
+        Err(format!("no reachable master ({})", last_err.unwrap_or_default()).into())
     }
 
     /// Try each comma-separated master address in order; returns a client
     /// connected to the first reachable one.
     pub async fn connect_any(
         master_addresses: &str,
-    ) -> Result<ClientServiceClient<tonic::transport::Channel>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        ClientServiceClient<tonic::transport::Channel>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let mut last_err: Option<String> = None;
-        for addr in master_addresses.split(',').map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        for addr in master_addresses
+            .split(',')
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+        {
             match ClientServiceClient::connect(format!("http://{}", addr)).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
@@ -165,34 +172,35 @@ impl EngineClient {
         Ok(response.into_inner())
     }
 
+    /// Get checkpoint history (ids + sizes, no payload bytes) for a job.
+    pub async fn get_job_checkpoints(
+        &self,
+        job_id: &str,
+    ) -> Result<JobCheckpointHistory, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.connect_failover().await?;
+        let request = JobStatusRequest {
+            job_id: job_id.to_string(),
+        };
+        let response = client.get_job_checkpoints(Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Get per-task log lines for a job.
+    pub async fn get_job_logs(
+        &self,
+        job_id: &str,
+    ) -> Result<JobLogs, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.connect_failover().await?;
+        let request = JobStatusRequest {
+            job_id: job_id.to_string(),
+        };
+        let response = client.get_job_logs(Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
+
     /// Get REST endpoint URL for monitoring.
     pub fn rest_url(&self, path: &str) -> String {
         format!("{}{}", self.rest_address, path)
-    }
-}
-
-/// REST API handler for the engine's HTTP monitoring interface.
-pub mod rest_api {
-    use axum::{routing::get, Router};
-
-    /// Build the REST API router.
-    pub fn build_router() -> Router {
-        Router::new()
-            .route("/api/v1/cluster", get(cluster_info))
-            .route("/api/v1/jobs", get(list_jobs))
-            .route("/api/v1/health", get(health_check))
-    }
-
-    async fn health_check() -> &'static str {
-        "OK"
-    }
-
-    async fn cluster_info() -> String {
-        "{}".to_string()
-    }
-
-    async fn list_jobs() -> String {
-        "[]".to_string()
     }
 }
 
@@ -208,10 +216,5 @@ mod tests {
             client.rest_url("/jobs"),
             "http://127.0.0.1:5000/api/v1/jobs"
         );
-    }
-
-    #[test]
-    fn test_rest_router() {
-        let _router = rest_api::build_router();
     }
 }

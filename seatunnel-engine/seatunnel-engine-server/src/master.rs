@@ -37,6 +37,8 @@ use crate::job_coordinator::{JobCoordinator, JobState};
 pub struct WorkerEntry {
     pub address: String,
     pub last_heartbeat_ms: i64,
+    /// Advertised slot budget (0 = legacy/unlimited).
+    pub slots: u32,
 }
 
 /// Shared between MasterService (registration/heartbeats) and ClientService
@@ -57,12 +59,22 @@ pub fn registry_snapshot(registry: &WorkerRegistry) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Identity of this master node, shared by Master/Client handlers so the
+/// wire protocol can carry a real leader address and role.
+#[derive(Debug, Clone)]
+pub struct MasterInfo {
+    /// Address other nodes should use to reach this master (advertise
+    /// address, not the bind wildcard).
+    pub advertise_addr: String,
+    /// Deployment role: master | hybrid.
+    pub role: String,
+}
+
 /// Master node state.
 #[derive(Default)]
 pub struct MasterState {
     /// Task assignments: task_id → worker_id.
     pub task_assignments: HashMap<String, String>,
-    pub leader_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,15 +95,30 @@ pub struct MasterHandler {
     workers: WorkerRegistry,
     /// worker_id → task ids to preempt on its next heartbeat (fencing).
     pending_preemptions: Mutex<HashMap<String, Vec<String>>>,
+    info: MasterInfo,
+    /// Configured worker heartbeat period, echoed via `next_interval_ms`.
+    heartbeat_interval_ms: u64,
+    /// Soft liveness threshold: a worker silent longer than this gets no
+    /// new assignments until it proves liveness again (still registered).
+    worker_soft_timeout_ms: u64,
 }
 
 impl MasterHandler {
-    pub fn new(coordinator: Arc<JobCoordinator>, workers: WorkerRegistry) -> Self {
+    pub fn new(
+        coordinator: Arc<JobCoordinator>,
+        workers: WorkerRegistry,
+        info: MasterInfo,
+        heartbeat_interval_ms: u64,
+        worker_soft_timeout_ms: u64,
+    ) -> Self {
         MasterHandler {
             state: Mutex::new(MasterState::default()),
             coordinator,
             workers,
             pending_preemptions: Mutex::new(HashMap::new()),
+            info,
+            heartbeat_interval_ms: heartbeat_interval_ms.clamp(250, 60_000),
+            worker_soft_timeout_ms: worker_soft_timeout_ms.max(1_000),
         }
     }
 
@@ -103,9 +130,8 @@ impl MasterHandler {
         &self.workers
     }
 
-    #[cfg(test)]
-    pub async fn leader_id(&self) -> Option<String> {
-        self.state.lock().await.leader_id.clone()
+    pub fn info(&self) -> &MasterInfo {
+        &self.info
     }
 }
 
@@ -116,23 +142,16 @@ impl MasterService for MasterHandler {
         request: Request<WorkerRegistration>,
     ) -> Result<Response<WorkerRegistrationResponse>, Status> {
         let reg = request.into_inner();
-        let returning = self.workers.read().unwrap().contains_key(&reg.worker_id);
         info!(
-            "Worker {} registering at {} ({} running task(s))",
+            "Worker {} registering at {} ({} running task(s), slots={})",
             reg.worker_id,
             reg.address,
-            reg.running_task_ids.len()
+            reg.running_task_ids.len(),
+            reg.slots
         );
-        self.workers.write().unwrap().insert(
-            reg.worker_id.clone(),
-            WorkerEntry {
-                address: reg.address.clone(),
-                last_heartbeat_ms: seatunnel_engine_core::now_millis(),
-            },
-        );
-        // Fencing: tasks this worker still runs but which were reassigned
-        // during its absence must stop locally (prevents double execution).
-        if returning && !reg.running_task_ids.is_empty() {
+        // Adopt-first: tasks still assigned to this worker are re-marked
+        // Running for it (re-attach); only reassigned tasks get fenced.
+        if !reg.running_task_ids.is_empty() {
             let preempted = self
                 .coordinator
                 .register_running_tasks(&reg.worker_id, &reg.running_task_ids);
@@ -150,13 +169,20 @@ impl MasterService for MasterHandler {
                     .extend(preempted);
             }
         }
-        let mut state = self.state.lock().await;
-        state.task_assignments.retain(|_, _| true);
+        self.workers.write().unwrap().insert(
+            reg.worker_id.clone(),
+            WorkerEntry {
+                address: reg.address.clone(),
+                last_heartbeat_ms: seatunnel_engine_core::now_millis(),
+                slots: reg.slots,
+            },
+        );
 
         Ok(Response::new(WorkerRegistrationResponse {
             success: true,
             message: "registered".to_string(),
-            leader_address: state.leader_id.clone().unwrap_or_default(),
+            leader_address: self.info.advertise_addr.clone(),
+            term: self.coordinator.term(),
         }))
     }
 
@@ -166,6 +192,30 @@ impl MasterService for MasterHandler {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let hb = request.into_inner();
         let worker_id = hb.worker_id.clone();
+        let now = seatunnel_engine_core::now_millis();
+        let my_term = self.coordinator.term();
+
+        // Fencing: a worker operating under a HIGHER term means a
+        // successor master exists — ratchet our term so the successor's
+        // state wins on merge, and stop dispatching until we are sure we
+        // are current (empty instruction set this round).
+        if hb.term > my_term {
+            warn!(
+                "Worker {} reports term {} > ours {} — possible stale master; standing down \
+                 dispatch this round",
+                worker_id, hb.term, my_term
+            );
+            self.coordinator.observe_term(hb.term);
+            return Ok(Response::new(HeartbeatResponse {
+                worker_id,
+                next_interval_ms: self.heartbeat_interval_ms as i64,
+                pending_tasks: Vec::new(),
+                cancel_jobs: Vec::new(),
+                preempted_task_ids: Vec::new(),
+                term: self.coordinator.term(),
+                leader_hint: String::new(),
+            }));
+        }
 
         // A worker evicted by TTL that comes back (SIGSTOP/network
         // glitch) may still run tasks that were reassigned in its
@@ -176,10 +226,10 @@ impl MasterService for MasterHandler {
                 reg.contains_key(&worker_id)
             };
             if !known && !hb.tasks.is_empty() {
-                let running: Vec<String> =
-                    hb.tasks.iter().map(|t| t.task_id.clone()).collect();
-                let preempted =
-                    self.coordinator.register_running_tasks(&worker_id, &running);
+                let running: Vec<String> = hb.tasks.iter().map(|t| t.task_id.clone()).collect();
+                let preempted = self
+                    .coordinator
+                    .register_running_tasks(&worker_id, &running);
                 if !preempted.is_empty() {
                     warn!(
                         "Worker {} returned with {} reassigned task(s); fencing via heartbeat",
@@ -196,11 +246,31 @@ impl MasterService for MasterHandler {
             }
         }
 
-        // Refresh liveness.
+        // Live per-task metrics shipped with the heartbeat: record
+        // counters, last-record timestamp and log increments.
+        for task in &hb.tasks {
+            self.coordinator.report_task_metrics(
+                &task.task_id,
+                task.processed_records.max(0) as u64,
+                task.last_record_at,
+                task.logs.clone(),
+                &hb.worker_id,
+                task.last_checkpoint_id.max(0) as u64,
+                task.last_checkpoint_size_bytes.max(0) as u64,
+            );
+        }
+
+        // Refresh liveness; a worker returning from a silence longer than
+        // the soft timeout gets no NEW assignments this round (it may
+        // still be recovering — running tasks are untouched).
+        let mut soft_stale = false;
         {
             let mut reg = self.workers.write().unwrap();
             match reg.get_mut(&worker_id) {
-                Some(entry) => entry.last_heartbeat_ms = seatunnel_engine_core::now_millis(),
+                Some(entry) => {
+                    soft_stale = now - entry.last_heartbeat_ms > self.worker_soft_timeout_ms as i64;
+                    entry.last_heartbeat_ms = now;
+                }
                 None => {
                     // Heartbeat before registration — accept it anyway so a
                     // restarted worker recovers without a full re-register.
@@ -208,20 +278,28 @@ impl MasterService for MasterHandler {
                         worker_id.clone(),
                         WorkerEntry {
                             address: hb.address.clone(),
-                            last_heartbeat_ms: seatunnel_engine_core::now_millis(),
+                            last_heartbeat_ms: now,
+                            slots: 0,
                         },
                     );
                 }
             }
         }
+        if soft_stale {
+            warn!(
+                "Worker {} silent > {}ms (soft timeout): skipping new assignments this round",
+                worker_id, self.worker_soft_timeout_ms
+            );
+        }
 
         // Failover-aware handout: pending tasks assigned to this worker
         // PLUS orphaned tasks of evicted workers (reassigned here).
-        let pending_tasks = {
+        let pending_tasks = if soft_stale {
+            Vec::new()
+        } else {
             let live = self.workers.read().unwrap();
-            self.coordinator.claim_tasks_for_worker(&worker_id, &hb.address, &|w| {
-                live.contains_key(w)
-            })
+            self.coordinator
+                .claim_tasks_for_worker(&worker_id, &hb.address, &|w| live.contains_key(w))
         };
         if !pending_tasks.is_empty() {
             info!(
@@ -250,10 +328,13 @@ impl MasterService for MasterHandler {
 
         Ok(Response::new(HeartbeatResponse {
             worker_id,
-            next_interval_ms: 2000,
+            next_interval_ms: self.heartbeat_interval_ms as i64,
             pending_tasks,
             cancel_jobs,
             preempted_task_ids,
+            term: self.coordinator.term(),
+            // Empty hint = this node is the active master.
+            leader_hint: String::new(),
         }))
     }
 
@@ -335,7 +416,11 @@ impl MasterService for MasterHandler {
         request: Request<FetchCheckpointRequest>,
     ) -> Result<Response<FetchCheckpointResponse>, Status> {
         let req = request.into_inner();
-        match self.coordinator.fetch_checkpoint(&req.job_id, &req.task_id).await {
+        match self
+            .coordinator
+            .fetch_checkpoint(&req.job_id, &req.task_id)
+            .await
+        {
             Some((id, data)) => Ok(Response::new(FetchCheckpointResponse {
                 checkpoint_id: id as i64,
                 checkpoint_data: data,
@@ -354,6 +439,17 @@ impl MasterService for MasterHandler {
         let req = request.into_inner();
         warn!("Worker unregistering: {}", req.worker_id);
         self.workers.write().unwrap().remove(&req.worker_id);
+        // Graceful shutdown must actually RELEASE the worker's tasks for
+        // failover — without this a clean restart waits for the hard
+        // eviction timeout before another worker can take over.
+        let affected = self.coordinator.evict_worker(&req.worker_id);
+        if !affected.is_empty() {
+            info!(
+                "Worker {} unregistered: {} task(s) released for takeover",
+                req.worker_id,
+                affected.len()
+            );
+        }
         Ok(Response::new(Empty {}))
     }
 }
@@ -400,6 +496,7 @@ mod tests {
             WorkerEntry {
                 address: "127.0.0.1:5001".into(),
                 last_heartbeat_ms: 0,
+                slots: 8,
             },
         );
         assert_eq!(

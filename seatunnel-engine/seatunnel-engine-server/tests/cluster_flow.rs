@@ -29,11 +29,12 @@ use std::time::Duration;
 
 use seatunnel_engine_client::EngineClient;
 use seatunnel_engine_comm::{
-    generated::client_service_server::ClientServiceServer,
-    generated::master_service_server::MasterServiceServer, SubmitJobRequest,
+    SubmitJobRequest, generated::client_service_server::ClientServiceServer,
+    generated::master_service_server::MasterServiceServer,
 };
+use seatunnel_engine_server::master::MasterInfo;
 use seatunnel_engine_server::{
-    new_worker_registry, ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode,
+    ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode, new_worker_registry,
 };
 
 async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
@@ -48,12 +49,21 @@ async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
         .try_init();
     let coordinator = Arc::new(JobCoordinator::new());
     let registry = new_worker_registry();
-    let handler = MasterHandler::new(coordinator.clone(), registry.clone());
-    let client = ClientHandler::new(coordinator.clone(), registry);
-
     // Bind eagerly so callers can connect immediately after this returns.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let info = MasterInfo {
+        advertise_addr: addr.to_string(),
+        role: "master".to_string(),
+    };
+    let handler = MasterHandler::new(
+        coordinator.clone(),
+        registry.clone(),
+        info.clone(),
+        150,  // fast heartbeat for tests
+        60_000,
+    );
+    let client = ClientHandler::new(coordinator.clone(), registry, info);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(MasterServiceServer::new(handler))
@@ -90,7 +100,8 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
                 address: worker_addr,
                 version: "test".into(),
                 resources: Default::default(),
-                heartbeat_interval_ms: 200,
+                heartbeat_interval_ms: 150,
+                slots: 8,
             },
         ))
         .await?;
@@ -108,18 +119,16 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
                     address: String::new(),
                     timestamp: seatunnel_engine_core::now_millis(),
                     tasks: vec![],
+                    term: hb_worker.term(),
+                    wait_ms: 0,
                 })
                 .await
             else {
                 break;
             };
             let response = resp.into_inner();
-            if !response.cancel_jobs.is_empty() {
-                hb_worker.cancel_jobs(&response.cancel_jobs).await;
-            }
-            for task in response.pending_tasks {
-                hb_worker.assign_task(task).await;
-            }
+            // Term-fenced application (also assigns pending tasks).
+            hb_worker.apply_master_response(&response).await;
         }
     });
 

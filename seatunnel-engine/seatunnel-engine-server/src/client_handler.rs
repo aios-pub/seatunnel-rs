@@ -21,11 +21,13 @@
 //! and cluster introspection for the CLI and REST clients.
 
 use crate::job_coordinator::JobCoordinator;
-use crate::master::{registry_snapshot, WorkerRegistry};
+use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot};
 use seatunnel_engine_comm::{
-    CancelJobRequest, ClusterInfo, Empty, JobList, JobStatus, JobStatusRequest, JobSummary,
-    SubmitJobRequest, SubmitJobResponse, WorkerInfo,
+    CancelJobRequest, CheckpointEntry, ClusterInfo, Empty, JobCheckpointHistory, JobList, JobLogs,
+    JobStatus, JobStatusRequest, JobSummary, SubmitJobRequest, SubmitJobResponse,
+    TaskCheckpointHistory, TaskLogs, WorkerInfo,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -34,13 +36,19 @@ use tonic::{Request, Response, Status};
 pub struct ClientHandler {
     coordinator: Arc<JobCoordinator>,
     workers: WorkerRegistry,
+    info: MasterInfo,
 }
 
 impl ClientHandler {
-    pub fn new(coordinator: Arc<JobCoordinator>, workers: WorkerRegistry) -> Self {
+    pub fn new(
+        coordinator: Arc<JobCoordinator>,
+        workers: WorkerRegistry,
+        info: MasterInfo,
+    ) -> Self {
         ClientHandler {
             coordinator,
             workers,
+            info,
         }
     }
 
@@ -49,6 +57,18 @@ impl ClientHandler {
     }
 
     fn worker_infos(&self) -> Vec<WorkerInfo> {
+        // Live per-worker running-task counts from the coordinator's
+        // view of assignments.
+        let mut running_per_worker: HashMap<String, i32> = HashMap::new();
+        for job in self.coordinator.list_jobs() {
+            for info in job.tasks.values() {
+                if info.state == crate::job_coordinator::JobState::Running
+                    && !info.worker_id.is_empty()
+                {
+                    *running_per_worker.entry(info.worker_id.clone()).or_default() += 1;
+                }
+            }
+        }
         self.workers
             .read()
             .unwrap()
@@ -57,20 +77,11 @@ impl ClientHandler {
                 worker_id: id.clone(),
                 address: e.address.clone(),
                 last_heartbeat: e.last_heartbeat_ms,
+                running_tasks: running_per_worker.get(id).copied().unwrap_or(0),
+                slots: e.slots,
                 ..Default::default()
             })
             .collect()
-    }
-}
-
-#[allow(dead_code)] // kept for the upcoming REST status endpoint
-fn job_state_to_proto(state: &str) -> i32 {
-    match state {
-        "RUNNING" => 3,
-        "COMPLETED" => 4,
-        "FAILED" => 5,
-        "CANCELLED" => 6,
-        _ => 1,
     }
 }
 
@@ -169,6 +180,8 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 processed_records: info.processed_records as i64,
                 start_time: job.start_time,
                 end_time: job.end_time.unwrap_or(0),
+                last_record_at: info.last_record_at,
+                worker_id: info.worker_id.clone(),
             })
             .collect();
         tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
@@ -181,6 +194,8 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             end_time: job.end_time.unwrap_or(0),
             error_message: job.error_message.unwrap_or_default(),
             tasks,
+            checkpoint_interval_ms: job.checkpoint_interval_ms as i64,
+            checkpoints_completed: job.checkpoints_completed as i64,
         }))
     }
 
@@ -191,14 +206,21 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         let workers = self.worker_infos();
         let jobs = self.coordinator.list_jobs();
         let total_tasks: usize = jobs.iter().map(|j| j.tasks.len()).sum();
-        let running_tasks: usize = jobs.iter().map(|j| j.tasks.len()).sum();
+        let running_tasks: usize = jobs
+            .iter()
+            .flat_map(|j| j.tasks.values())
+            .filter(|t| t.state == crate::job_coordinator::JobState::Running)
+            .count();
 
         Ok(Response::new(ClusterInfo {
             available_workers: workers.len() as i32,
             workers,
             total_tasks: total_tasks as i32,
             running_tasks: running_tasks as i32,
-            leader_id: "self".to_string(),
+            leader_id: self.info.advertise_addr.clone(),
+            term: self.coordinator.term(),
+            leader_address: self.info.advertise_addr.clone(),
+            role: self.info.role.clone(),
         }))
     }
 
@@ -212,9 +234,91 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 job_name: j.job_name,
                 state: j.state.to_proto_state(),
                 start_time: j.start_time,
+                end_time: j.end_time.unwrap_or(0),
             })
             .collect();
         summaries.sort_by_key(|j| std::cmp::Reverse(j.start_time));
         Ok(Response::new(JobList { jobs: summaries }))
+    }
+
+    async fn get_job_checkpoints(
+        &self,
+        request: Request<JobStatusRequest>,
+    ) -> Result<Response<JobCheckpointHistory>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        let Some(job) = self.coordinator.get_job(&job_id) else {
+            return Err(Status::not_found(format!("Job {} not found", job_id)));
+        };
+
+        // Full history from the master-backed store when present; every
+        // other storage backend falls back to the most recent checkpoint
+        // reported via heartbeats, so the console always shows progress.
+        let mut tasks: Vec<TaskCheckpointHistory> = self
+            .coordinator
+            .checkpoint_store()
+            .list_job_meta(&job_id)
+            .await
+            .into_iter()
+            .map(|t| TaskCheckpointHistory {
+                task_id: t.task_id,
+                entries: t
+                    .entries
+                    .into_iter()
+                    .map(|e| CheckpointEntry {
+                        checkpoint_id: e.checkpoint_id as i64,
+                        size_bytes: e.size_bytes as i64,
+                    })
+                    .collect(),
+            })
+            .collect();
+        for info in job.tasks.values() {
+            if info.last_checkpoint_id > 0
+                && !tasks
+                    .iter()
+                    .any(|t| t.task_id == info.task_id && !t.entries.is_empty())
+            {
+                tasks.push(TaskCheckpointHistory {
+                    task_id: info.task_id.clone(),
+                    entries: vec![CheckpointEntry {
+                        checkpoint_id: info.last_checkpoint_id as i64,
+                        size_bytes: info.last_checkpoint_size as i64,
+                    }],
+                });
+            }
+        }
+        tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+
+        Ok(Response::new(JobCheckpointHistory {
+            job_id,
+            checkpoint_interval_ms: job.checkpoint_interval_ms as i64,
+            checkpoints_completed: job.checkpoints_completed as i64,
+            tasks,
+        }))
+    }
+
+    async fn get_job_logs(
+        &self,
+        request: Request<JobStatusRequest>,
+    ) -> Result<Response<JobLogs>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        let Some(job) = self.coordinator.get_job(&job_id) else {
+            return Err(Status::not_found(format!("Job {} not found", job_id)));
+        };
+
+        let mut tasks: Vec<TaskLogs> = job
+            .tasks
+            .values()
+            .map(|t| TaskLogs {
+                task_id: t.task_id.clone(),
+                lines: t.logs.iter().cloned().collect(),
+            })
+            .collect();
+        tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+
+        Ok(Response::new(JobLogs { job_id, tasks }))
     }
 }

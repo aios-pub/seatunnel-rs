@@ -25,8 +25,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use tokio::sync::RwLock;
 
 use crate::server_config::ResolvedS3Config;
@@ -39,6 +39,20 @@ use crate::server_config::ResolvedS3Config;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct TaskCheckpoints {
     pub entries: Vec<(u64, Vec<u8>)>,
+}
+
+/// Metadata of a single retained checkpoint (id + size, no payload).
+#[derive(Debug, Clone)]
+pub struct CheckpointMetaEntry {
+    pub checkpoint_id: u64,
+    pub size_bytes: u64,
+}
+
+/// Checkpoint metadata for one task, for read-only listings (web UI).
+#[derive(Debug, Clone)]
+pub struct TaskCheckpointMeta {
+    pub task_id: String,
+    pub entries: Vec<CheckpointMetaEntry>,
 }
 
 /// In-memory master store with bounded per-task retention; replicated to
@@ -79,16 +93,41 @@ impl MasterCheckpointStore {
             .and_then(|t| t.entries.last().cloned())
     }
 
+    /// List retained checkpoint metadata for every task of a job, sorted by
+    /// task id. Does not copy payload bytes.
+    pub async fn list_job_meta(&self, job_id: &str) -> Vec<TaskCheckpointMeta> {
+        let inner = self.inner.read().await;
+        let mut out: Vec<TaskCheckpointMeta> = inner
+            .iter()
+            .filter(|((job, _), _)| job == job_id)
+            .map(|((_, task_id), t)| TaskCheckpointMeta {
+                task_id: task_id.clone(),
+                entries: t
+                    .entries
+                    .iter()
+                    .map(|(id, data)| CheckpointMetaEntry {
+                        checkpoint_id: *id,
+                        size_bytes: data.len() as u64,
+                    })
+                    .collect(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        out
+    }
+
     pub async fn drop_job(&self, job_id: &str) {
-        self.inner
-            .write()
-            .await
-            .retain(|(job, _), _| job != job_id);
+        self.inner.write().await.retain(|(job, _), _| job != job_id);
     }
 
     /// Full snapshot for HA replication (JSON-safe entry list).
     pub async fn export(&self) -> Vec<((String, String), TaskCheckpoints)> {
-        self.inner.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.inner
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Merge a replication snapshot (imported entries only fill gaps —
@@ -221,7 +260,11 @@ impl S3CheckpointStore {
                 tracing::warn!("S3 delete {} failed: {}", path, e);
             }
         }
-        tracing::info!("S3 cleanup: removed {} object(s) for job {}", removed, job_id);
+        tracing::info!(
+            "S3 cleanup: removed {} object(s) for job {}",
+            removed,
+            job_id
+        );
     }
 
     /// TTL sweep: remove job prefixes whose newest object is older than
@@ -311,10 +354,7 @@ impl S3CheckpointStore {
         use futures::StreamExt;
         while let Some(item) = listing.next().await {
             let meta = item.map_err(|e| anyhow::anyhow!("{}", e))?;
-            out.push((
-                meta.location.clone(),
-                meta.last_modified.into(),
-            ));
+            out.push((meta.location.clone(), meta.last_modified.into()));
         }
         Ok(out)
     }
@@ -417,7 +457,9 @@ mod tests {
     async fn s3_write_prunes_old_objects() {
         let store = mem_store(2);
         for id in 1..=5u64 {
-            store.save("j", "t", id, format!("s{}", id).as_bytes()).await;
+            store
+                .save("j", "t", id, format!("s{}", id).as_bytes())
+                .await;
         }
         // Only cp-4 and cp-5 remain.
         let (id, _) = store.load_latest("j", "t").await.unwrap();

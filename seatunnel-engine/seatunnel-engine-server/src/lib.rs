@@ -18,6 +18,8 @@ pub mod worker;
 
 pub use client_handler::ClientHandler;
 pub use job_coordinator::JobCoordinator;
-pub use master::{new_worker_registry, MasterHandler, WorkerEntry, WorkerRegistry};
+pub use master::{
+    MasterHandler, MasterInfo, WorkerEntry, WorkerRegistry, new_worker_registry,
+};
 pub use state_store::LocalStateStore;
 pub use worker::WorkerNode;

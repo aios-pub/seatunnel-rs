@@ -25,6 +25,16 @@ pub struct TaskStatus {
     pub start_time: i64,
     pub end_time: i64,
     pub error: Option<String>,
+    /// Epoch-ms timestamp of the most recently processed record; 0 when
+    /// no record has been processed yet. Lets consumers derive the task's
+    /// "idle" time, which is the key liveness signal for streaming jobs.
+    pub last_record_at: i64,
+    /// Id and state size of the most recent completed checkpoint
+    /// (id 0 = none yet). Surfaced through heartbeats so the console can
+    /// show checkpoint progress for every storage backend, not only the
+    /// master-backed store.
+    pub last_checkpoint_id: u64,
+    pub last_checkpoint_size: u64,
 }
 
 impl TaskStatus {
@@ -36,6 +46,9 @@ impl TaskStatus {
             start_time: 0,
             end_time: 0,
             error: None,
+            last_record_at: 0,
+            last_checkpoint_id: 0,
+            last_checkpoint_size: 0,
         }
     }
 

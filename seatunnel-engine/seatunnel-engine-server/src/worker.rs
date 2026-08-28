@@ -24,6 +24,7 @@
 //! restarted worker resumes from the last binlog position / offset.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -31,14 +32,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use seatunnel_engine_comm::{
-    generated::master_service_client::MasterServiceClient, CheckpointReport, TaskDescriptor,
-    TaskStatusReport,
+    CheckpointReport, HeartbeatResponse, TaskDescriptor, TaskStatusReport,
+    generated::master_service_client::MasterServiceClient,
 };
 use seatunnel_engine_core::checkpoint_listener::CheckpointListener;
-use seatunnel_engine_core::connector_factory::{create_sink, create_sinks, create_source, create_transforms};
+use seatunnel_engine_core::connector_factory::{
+    create_sink, create_sinks, create_source, create_transforms,
+};
 use seatunnel_engine_core::state::TaskState;
 use seatunnel_engine_core::task_group::TaskGroup;
-use seatunnel_engine_core::{now_millis, TaskStatus};
+use seatunnel_engine_core::{TaskStatus, now_millis};
 
 use crate::state_store::LocalStateStore;
 
@@ -69,13 +72,31 @@ pub struct WorkerNode {
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
     running_tasks: Mutex<HashMap<String, RunningTaskHandle>>,
+    /// Highest fencing term seen from any master (0 = none yet).
+    /// Instructions from masters with a lower term are rejected so a
+    /// deposed master cannot disturb tasks owned by its successor.
+    /// Shared with spawned task executors so their reports carry it.
+    term: Arc<AtomicU64>,
 }
 
 /// Internal handle for a spawned task execution.
-#[derive(Debug)]
+#[derive(Default)]
 struct RunningTaskHandle {
     job_id: String,
-    cancel: Arc<CancellationToken>,
+    cancel: Option<Arc<CancellationToken>>,
+    /// Shared status of the executing TaskGroup, filled in as soon as the
+    /// pipeline is built (None during connector construction).
+    status: Option<Arc<tokio::sync::Mutex<TaskStatus>>>,
+    /// Task log ring mirrored from the executing TaskGroup.
+    logs: Option<seatunnel_engine_core::task_log::TaskLogRing>,
+    /// Log shipping bookmark for the last heartbeat.
+    log_cursor: u64,
+}
+
+impl RunningTaskHandle {
+    fn cancel_token(&self) -> Arc<CancellationToken> {
+        self.cancel.clone().expect("cancel token set at insert")
+    }
 }
 
 impl WorkerNode {
@@ -103,6 +124,7 @@ impl WorkerNode {
             clean_config,
             storage_type: "localfile".to_string(),
             s3_store: None,
+            term: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -123,6 +145,67 @@ impl WorkerNode {
 
     pub fn state_store(&self) -> &Arc<LocalStateStore> {
         &self.state_store
+    }
+
+    /// Highest master term this worker has seen.
+    pub fn term(&self) -> u64 {
+        self.term.load(Ordering::SeqCst)
+    }
+
+    /// Ratchet the term up (never down) — e.g. from a registration
+    /// response. Returns the current term.
+    pub fn observe_term(&self, seen: u64) -> u64 {
+        let mut current = self.term.load(Ordering::SeqCst);
+        while seen > current {
+            match self.term.compare_exchange(
+                current,
+                seen,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return seen,
+                Err(actual) => current = actual,
+            }
+        }
+        current
+    }
+
+    /// Apply a heartbeat response's instruction set under term fencing.
+    ///
+    /// Returns `true` when the instructions were accepted. A response
+    /// from a master whose term is LOWER than the highest we have seen
+    /// is stale (a deposed master) and its instructions are ignored —
+    /// this is the fence that makes double dispatch impossible across a
+    /// master switch.
+    pub async fn apply_master_response(self: &Arc<Self>, response: &HeartbeatResponse) -> bool {
+        if response.term < self.term() {
+            warn!(
+                "Worker {}: ignoring instructions from master term {} (highest seen {})",
+                self.worker_id, response.term, self.term()
+            );
+            return false;
+        }
+        if response.term > self.term() {
+            self.term.store(response.term, Ordering::SeqCst);
+        }
+        if !response.cancel_jobs.is_empty() {
+            self.cancel_jobs(&response.cancel_jobs).await;
+        }
+        if !response.preempted_task_ids.is_empty() {
+            self.preempt_tasks(&response.preempted_task_ids).await;
+        }
+        if !response.pending_tasks.is_empty() {
+            info!(
+                "Received {} task(s) from master (term {})",
+                response.pending_tasks.len(),
+                response.term
+            );
+            for task in &response.pending_tasks {
+                let task = task.clone();
+                self.assign_task(task).await;
+            }
+        }
+        true
     }
 
     /// Accept a task from the master and start executing it asynchronously.
@@ -151,7 +234,8 @@ impl WorkerNode {
             task_id.clone(),
             RunningTaskHandle {
                 job_id: job_id.clone(),
-                cancel: cancel.clone(),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
             },
         );
 
@@ -161,15 +245,30 @@ impl WorkerNode {
             state_store: self.state_store.clone(),
             storage_type: self.storage_type.clone(),
             s3_store: self.s3_store.clone(),
+            term: Arc::clone(&self.term),
         };
 
         let worker = Arc::clone(self);
         let cleanup_task_id = task_id.clone();
         tokio::spawn(async move {
-            execute_descriptor(task, ctx, cancel).await;
+            execute_descriptor(task, ctx, cancel, Arc::clone(&worker)).await;
             // Detach from the registry once terminal.
             worker.running_tasks.lock().await.remove(&cleanup_task_id);
         });
+    }
+
+    /// Fill in the live status/log handles of a registered task once its
+    /// TaskGroup exists, so heartbeats can report real metrics.
+    pub async fn attach_task_metrics(
+        &self,
+        task_id: &str,
+        status: Arc<tokio::sync::Mutex<TaskStatus>>,
+        logs: seatunnel_engine_core::task_log::TaskLogRing,
+    ) {
+        if let Some(handle) = self.running_tasks.lock().await.get_mut(task_id) {
+            handle.status = Some(status);
+            handle.logs = Some(logs);
+        }
     }
 
     /// Ids of tasks currently running on this worker (fencing reports).
@@ -190,25 +289,48 @@ impl WorkerNode {
                     "Worker {}: preempting task {} (reassigned by the master)",
                     self.worker_id, task_id
                 );
-                handle.cancel.cancel();
+                handle.cancel_token().cancel();
             }
         }
     }
 
-    /// Snapshot of running tasks for the next heartbeat.
+    /// Snapshot of running tasks for the next heartbeat: real record
+    /// counters, the last-record timestamp and the task log increment.
     pub async fn heartbeat_tasks(&self) -> Vec<seatunnel_engine_comm::TaskHeartbeat> {
-        self.running_tasks
-            .lock()
-            .await
-            .keys()
-            .map(|tid| seatunnel_engine_comm::TaskHeartbeat {
+        let mut out = Vec::with_capacity(self.running_tasks.lock().await.len());
+        for (tid, handle) in self.running_tasks.lock().await.iter_mut() {
+            let (records, last_record_at, logs, last_cp) = match (&handle.status, &handle.logs) {
+                (Some(status), Some(ring)) => {
+                    let snapshot = status.lock().await;
+                    let entries = ring.entries_after(handle.log_cursor);
+                    handle.log_cursor = ring.cursor();
+                    let lines = entries.iter().map(|e| e.render()).collect::<Vec<_>>();
+                    let checkpoint = (
+                        snapshot.last_checkpoint_id,
+                        snapshot.last_checkpoint_size,
+                    );
+                    (
+                        snapshot.processed_records,
+                        snapshot.last_record_at,
+                        lines,
+                        checkpoint,
+                    )
+                }
+                _ => (0, 0, Vec::new(), (0, 0)),
+            };
+            out.push(seatunnel_engine_comm::TaskHeartbeat {
                 task_id: tid.clone(),
                 state: 2, // TASK_RUNNING
-                processed_records: 0,
+                processed_records: records as i64,
                 last_heartbeat_time: now_millis(),
                 memory_usage: 0,
-            })
-            .collect()
+                last_record_at,
+                logs,
+                last_checkpoint_id: last_cp.0 as i64,
+                last_checkpoint_size_bytes: last_cp.1 as i64,
+            });
+        }
+        out
     }
 
     /// Stop all local tasks belonging to the given jobs.
@@ -229,9 +351,9 @@ impl WorkerNode {
         }
         let mut tasks = self.running_tasks.lock().await;
         for (tid, handle) in tasks.iter_mut() {
-            if job_ids.contains(&handle.job_id) && !handle.cancel.is_cancelled() {
+            if job_ids.contains(&handle.job_id) && !handle.cancel_token().is_cancelled() {
                 info!("Cancelling task {} (job cancelled)", tid);
-                handle.cancel.cancel();
+                handle.cancel_token().cancel();
             }
         }
     }
@@ -247,6 +369,7 @@ impl WorkerNode {
 async fn report_transition_raw(
     worker_id: &str,
     master_client: &SharedMasterClient,
+    term: &Arc<AtomicU64>,
     job_id: &str,
     task_id: &str,
     state: i32,
@@ -269,6 +392,7 @@ async fn report_transition_raw(
         timestamp: now_millis(),
         processed_records: records as i64,
         error_message: error.unwrap_or_default(),
+        term: term.load(Ordering::SeqCst),
     };
     if let Err(e) = client.report_task_status(tonic::Request::new(report)).await {
         warn!("report_task_status failed for {}: {}", task_id, e);
@@ -288,11 +412,13 @@ pub struct CleanConfig {
 
 /// Spawn the background cleaner: periodic TTL sweep plus delayed cleanup
 /// of cancelled jobs (after the grace window).
-pub fn spawn_state_cleaner(worker: Arc<WorkerNode>, config: CleanConfig) -> tokio::task::JoinHandle<()> {
+pub fn spawn_state_cleaner(
+    worker: Arc<WorkerNode>,
+    config: CleanConfig,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            config.interval_secs.max(1),
-        ));
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(config.interval_secs.max(1)));
         // First tick fires immediately — sweep once at startup.
         loop {
             ticker.tick().await;
@@ -336,11 +462,7 @@ async fn fetch_checkpoint_from_master(
 
 /// Schedule deletion of a cancelled job's local state after the grace
 /// window (keeps a restore window for operator intervention).
-pub fn schedule_cancel_cleanup(
-    state_store: Arc<LocalStateStore>,
-    job_id: String,
-    grace_secs: u64,
-) {
+pub fn schedule_cancel_cleanup(state_store: Arc<LocalStateStore>, job_id: String, grace_secs: u64) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(grace_secs.max(1))).await;
         state_store.drop_job(&job_id);
@@ -359,6 +481,8 @@ struct TaskExecCtx {
     storage_type: String,
     /// S3 store (storage type = s3); workers write directly.
     s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
+    /// Highest master term seen by this worker (fencing on reports).
+    term: Arc<AtomicU64>,
 }
 
 /// Execute one descriptor end-to-end: build connectors, restore state, run
@@ -370,6 +494,7 @@ async fn execute_descriptor(
     task: TaskDescriptor,
     ctx: TaskExecCtx,
     cancel: Arc<CancellationToken>,
+    worker: Arc<crate::worker::WorkerNode>,
 ) {
     let task_id = task.task_id.clone();
     let job_id = task.job_id.clone();
@@ -377,6 +502,7 @@ async fn execute_descriptor(
     report_transition_raw(
         &ctx.worker_id,
         &ctx.master_client,
+        &ctx.term,
         &job_id,
         &task_id,
         2,
@@ -386,7 +512,7 @@ async fn execute_descriptor(
     .await;
 
     let result = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_pipeline(
-        &task, &ctx, cancel,
+        &task, &ctx, cancel, &worker,
     )))
     .await
     {
@@ -409,6 +535,7 @@ async fn execute_descriptor(
             report_transition_raw(
                 &ctx.worker_id,
                 &ctx.master_client,
+                &ctx.term,
                 &job_id,
                 &task_id,
                 code,
@@ -422,6 +549,7 @@ async fn execute_descriptor(
             report_transition_raw(
                 &ctx.worker_id,
                 &ctx.master_client,
+                &ctx.term,
                 &job_id,
                 &task_id,
                 4,
@@ -448,6 +576,7 @@ async fn run_pipeline(
     task: &TaskDescriptor,
     ctx: &TaskExecCtx,
     cancel: Arc<CancellationToken>,
+    worker: &Arc<crate::worker::WorkerNode>,
 ) -> anyhow::Result<TaskStatus> {
     let cfg = &task.config;
 
@@ -501,24 +630,20 @@ async fn run_pipeline(
         Some(data)
     } else {
         match ctx.storage_type.as_str() {
-            "master" => fetch_checkpoint_from_master(
-                &ctx.master_client,
-                &task.job_id,
-                &task.task_id,
-            )
-            .await
-            .map(|(id, data)| {
-                info!(
-                    "Task {}: restored checkpoint cp-{} from master",
-                    task.task_id, id
-                );
-                data
-            }),
+            "master" => {
+                fetch_checkpoint_from_master(&ctx.master_client, &task.job_id, &task.task_id)
+                    .await
+                    .map(|(id, data)| {
+                        info!(
+                            "Task {}: restored checkpoint cp-{} from master",
+                            task.task_id, id
+                        );
+                        data
+                    })
+            }
             "s3" => {
                 let fetched = if let Some(store) = &ctx.s3_store {
-                    store
-                        .load_latest(&task.job_id, &task.task_id)
-                        .await
+                    store.load_latest(&task.job_id, &task.task_id).await
                 } else {
                     None
                 };
@@ -531,10 +656,7 @@ async fn run_pipeline(
                 })
             }
             _ => {
-                info!(
-                    "Task {}: no checkpoint found (cold start)",
-                    task.task_id
-                );
+                info!("Task {}: no checkpoint found (cold start)", task.task_id);
                 None
             }
         }
@@ -574,8 +696,7 @@ async fn run_pipeline(
             .unwrap_or("console");
         let sink_value: serde_json::Value =
             serde_json::from_str(cfg.get("sink.config").map(String::as_str).unwrap_or("{}"))?;
-        let sink_config =
-            seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
+        let sink_config = seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
         create_sink(sink_plugin, &sink_config)?
     };
 
@@ -589,28 +710,32 @@ async fn run_pipeline(
     .with_cancel_token(cancel)
     .with_checkpoint_interval(checkpoint_interval)
     .with_checkpoint_listener(Arc::new(TaskCheckpointReporter {
-        worker_id: ctx.worker_id.clone(),
         master_client: ctx.master_client.clone(),
         state_store: ctx.state_store.clone(),
         upload_to_master: ctx.storage_type == "master",
         s3_store: ctx.s3_store.clone(),
+        term: Arc::clone(&ctx.term),
     }));
 
     let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
+    // Expose live metrics/logs to the heartbeat before the loop starts.
+    worker
+        .attach_task_metrics(&task.task_id, group.status(), group.logs().clone())
+        .await;
     group.run().await
 }
 
 /// Checkpoint listener that persists state durably and reports success to the
 /// master over gRPC.
 struct TaskCheckpointReporter {
-    #[allow(dead_code)] // included in future checkpoint reports to the master
-    worker_id: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
     /// Upload bytes to the master-backed store (storage type = master).
     upload_to_master: bool,
     /// Direct S3 writes (storage type = s3).
     s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
+    /// Highest master term seen (carried on the report for fencing).
+    term: Arc<AtomicU64>,
 }
 
 impl CheckpointListener for TaskCheckpointReporter {
@@ -643,7 +768,11 @@ impl CheckpointListener for TaskCheckpointReporter {
 
             // 3. Master notification; bytes ride along for the
             //    master-backed shared store (storage type = master).
-            let upload = if self.upload_to_master { state.clone() } else { Vec::new() };
+            let upload = if self.upload_to_master {
+                state.clone()
+            } else {
+                Vec::new()
+            };
             let mut guard = self.master_client.lock().await;
             if let Some(client) = guard.as_mut() {
                 let report = CheckpointReport {
@@ -653,6 +782,7 @@ impl CheckpointListener for TaskCheckpointReporter {
                     timestamp,
                     checkpoint_data: upload,
                     success: true,
+                    term: self.term.load(Ordering::SeqCst),
                 };
                 if let Err(e) = client.report_checkpoint(tonic::Request::new(report)).await {
                     warn!("report_checkpoint failed: {}", e);
@@ -676,6 +806,63 @@ mod tests {
     fn test_worker_node_creation() {
         let worker = WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("create"));
         assert_eq!(worker.worker_id, "w1");
+        assert_eq!(worker.term(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_term_fencing_rejects_stale_master() {
+        use seatunnel_engine_comm::TaskDescriptor;
+
+        let worker = Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("fence")));
+
+        // Fresh master at term 2: accepted, term recorded.
+        let resp = HeartbeatResponse {
+            worker_id: "w1".into(),
+            next_interval_ms: 2000,
+            pending_tasks: vec![TaskDescriptor {
+                task_id: "t-new".into(),
+                job_id: "j".into(),
+                stage_id: "s".into(),
+                task_name: "n".into(),
+                task_index: 0,
+                source_config_json: String::new(),
+                sink_config_json: String::new(),
+                parallelism: 1,
+                config: HashMap::from([
+                    ("source.plugin".to_string(), "Fake".to_string()),
+                    (
+                        "source.config".to_string(),
+                        serde_json::json!({ "row.num": 1 }).to_string(),
+                    ),
+                    ("sink.plugin".to_string(), "Console".to_string()),
+                    ("sink.config".to_string(), "{}".to_string()),
+                    ("transform.config".to_string(), "[]".to_string()),
+                    (
+                        "checkpoint.interval".to_string(),
+                        "60000".to_string(),
+                    ),
+                ]),
+            }],
+            cancel_jobs: vec!["j-doomed".into()],
+            preempted_task_ids: Vec::new(),
+            term: 2,
+            leader_hint: String::new(),
+        };
+        assert!(worker.apply_master_response(&resp).await);
+        assert_eq!(worker.term(), 2);
+
+        // Deposed master at term 1 (< 2): instructions ignored.
+        let stale = HeartbeatResponse {
+            worker_id: "w1".into(),
+            next_interval_ms: 2000,
+            pending_tasks: Vec::new(),
+            cancel_jobs: vec!["j-doomed".into()],
+            preempted_task_ids: Vec::new(),
+            term: 1,
+            leader_hint: String::new(),
+        };
+        assert!(!worker.apply_master_response(&stale).await);
+        assert_eq!(worker.term(), 2);
     }
 
     #[tokio::test]
