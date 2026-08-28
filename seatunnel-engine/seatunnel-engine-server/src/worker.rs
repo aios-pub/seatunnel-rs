@@ -36,7 +36,7 @@ use seatunnel_engine_comm::{
     generated::master_service_client::MasterServiceClient,
 };
 use seatunnel_engine_core::connector_factory::{
-    create_sink, create_sinks, create_source, create_transforms,
+    create_source, create_transforms,
 };
 use seatunnel_engine_core::local_checkpoint::{
     CheckpointEvent, GateControl, TaskToDriver, task_gate,
