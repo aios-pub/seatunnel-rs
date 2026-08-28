@@ -56,9 +56,11 @@
 //! `subTableFields` parity (authoritative entry + change filtering)
 //! requires the explicit positional `canal-client.columns` config.
 //!
-//! The CDC sources emit UPDATE as a delete(before) + insert(after) row
-//! pair; [`CanalClientEncoder`] is a STATEFUL encoder that pairs
-//! adjacent rows with the same key back into a single `update` message.
+//! The CDC sources emit UPDATE as an `UPDATE_BEFORE` + `UPDATE_AFTER`
+//! row pair (explicit RowKind tags, mirroring the Java CDC contract);
+//! [`CanalClientEncoder`] is a STATEFUL encoder that merges the tagged
+//! pair back into a single `update` message — real DELETE / INSERT rows
+//! are encoded immediately and never held.
 
 use chrono::NaiveDateTime;
 use seatunnel_api::row::{Field, Row, RowKind};
@@ -185,6 +187,13 @@ pub struct CanalClientConfig {
     /// Timezone for naive datetime interpretation (default: the server's
     /// local zone, mirroring Java's SimpleDateFormat default).
     pub server_time_zone: String,
+    /// How long (milliseconds) a before-image may wait for its
+    /// after-image before being emitted as a standalone delete. Must
+    /// comfortably exceed the gap between the two images of one UPDATE
+    /// when they land in different sink flush cycles (normally
+    /// microseconds-to-milliseconds apart in the binlog stream).
+    /// Default: [`PAIRING_WINDOW`].
+    pub pairing_window_ms: u64,
 }
 
 /// snake_case → camelCase with the FIRST letter left untouched
@@ -281,8 +290,10 @@ fn convert_string(tz: &ServerTz, s: &str) -> Value {
     Value::String(s.to_string())
 }
 
-/// Before-image held until its after-image arrives. Held images older
-/// than [`PAIRING_WINDOW`] are emitted as real deletes.
+/// An UPDATE before-image held until its UPDATE_AFTER partner arrives.
+/// Held images older than the pairing window are emitted as real deletes
+/// (torn-pair safety — the CDC sources write the pair back-to-back, so a
+/// lone before-image should never occur in practice).
 #[derive(Debug)]
 struct PendingDelete {
     key: String,
@@ -291,10 +302,13 @@ struct PendingDelete {
     since: std::time::Instant,
 }
 
-/// How long a before-image may wait for its after-image before being
-/// emitted as a standalone delete (the CDC sources emit the pair
-/// back-to-back, well inside this window).
-pub const PAIRING_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// Default pairing window: how long a before-image may wait for its
+/// after-image before being emitted as a standalone delete (the CDC
+/// sources emit the pair back-to-back, microseconds-to-milliseconds
+/// apart in the binlog stream, so this is a large safety margin). The
+/// effective window is configurable per sink via
+/// [`CanalClientConfig::pairing_window_ms`].
+pub const PAIRING_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// One encoded canal-client message, bound to its origin table identity
 /// (`database.table`) so routing sinks can pick a topic per table.
@@ -319,7 +333,8 @@ struct TableState {
     fields: TableFields,
     tz: ServerTz,
     column_positions: HashMap<String, usize>,
-    /// Adjacent before-image awaiting its after-image (or flush).
+    /// Adjacent UPDATE before-image awaiting its UPDATE_AFTER partner
+    /// (or the torn-pair expiry).
     pending: Option<PendingDelete>,
 }
 
@@ -413,85 +428,83 @@ impl TableState {
         }
     }
 
-    fn stash_delete(&mut self, row: &Row) -> CanalMessage {
-        // Delete data carries the must fields only (canal before-images
-        // carry no changed flags, so update fields stay out).
+    /// Delete / before-image data: the must fields only (canal
+    /// before-images carry no changed flags, so update fields stay out).
+    fn must_data(&self, row: &Row) -> Map<String, Value> {
         let mut data = Map::new();
         for (col, target) in &self.fields.must {
             if let Some(field) = self.get(row, col) {
                 data.insert(target.clone(), convert_field(&self.tz, field));
             }
         }
-        let key = self.row_key(row);
-        let message = self.build_message("delete", &key, data.clone(), None);
+        data
+    }
+
+    /// Hold an UPDATE before-image until its UPDATE_AFTER partner arrives
+    /// (the CDC sources write the pair back-to-back). `data` keeps the
+    /// must-fields for the torn-pair fallback that emits it as a delete.
+    fn stash_update_before(&mut self, row: &Row) {
+        let data = self.must_data(row);
         self.pending = Some(PendingDelete {
-            key,
+            key: self.row_key(row),
             source_row: row.clone(),
             data,
             since: std::time::Instant::now(),
         });
-        message
     }
 
-    /// Encode one row; returns 0..2 messages.
-    /// Zero = filtered (update without any configured column change, or
-    /// a before-image held for pairing).
+    /// Encode one row into 0..1 messages.
+    /// Zero = suppressed (an UPDATE_BEFORE image held for its UPDATE_AFTER
+    /// partner, or an update filtered because no configured column changed).
+    ///
+    /// Mirrors Java `CanalJsonSerializationSchema` with
+    /// `mergeUpdateEventFlag=true`: the merge is driven by the explicit
+    /// RowKind tags carried by the rows — real DELETE and INSERT rows are
+    /// encoded (and delivered) immediately, never held for pairing.
     fn encode(&mut self, row: &Row) -> Vec<CanalMessage> {
         let key = self.row_key(row);
         match row.kind {
-            RowKind::Delete | RowKind::UpdateBefore => {
-                // A previous before-image that never paired was a real
-                // delete — emit it, then hold the current one.
+            RowKind::UpdateBefore => {
+                // Hold the before-image for the UPDATE_AFTER that follows
+                // it back-to-back. A still-held previous image is a torn
+                // pair — surface it as a delete rather than dropping it.
                 let mut messages = Vec::new();
                 if let Some(pending) = self.pending.take() {
                     messages.push(self.build_message("delete", &pending.key, pending.data, None));
                 }
-                self.stash_delete(row);
+                self.stash_update_before(row);
                 messages
             }
-            RowKind::Insert | RowKind::UpdateAfter => {
-                let mut messages = Vec::new();
-                let paired = match self.pending.take() {
-                    Some(pending) if pending.key == key => Some(pending),
-                    Some(pending) => {
-                        // Different key: the stashed row was a real delete.
-                        messages.push(self.build_message(
-                            "delete",
-                            &pending.key,
-                            pending.data,
-                            None,
-                        ));
-                        None
-                    }
-                    None => None,
-                };
-                let current = match paired {
+            RowKind::UpdateAfter => {
+                match self.pending.take() {
                     Some(pending) => {
                         // One UPDATE message: data = after image (changed
                         // checks against the before image), oldData = all
                         // configured columns of the before image.
                         let (data, is_update) = self.map_image(row, Some(&pending.source_row));
                         if !self.fields.update.is_empty() && !is_update {
-                            None // Java filter: update without configured changes
+                            Vec::new() // Java filter: update without configured changes
                         } else {
                             let old_data = self.map_old(&pending.source_row);
-                            Some(self.build_message("update", &key, data, Some(old_data)))
+                            vec![self.build_message("update", &key, data, Some(old_data))]
                         }
                     }
                     None => {
-                        // INSERT; a lone UpdateAfter (no before-image
-                        // available) serializes as update without oldData.
-                        let event = if row.kind == RowKind::UpdateAfter {
-                            "update"
-                        } else {
-                            "insert"
-                        };
+                        // Lone UPDATE_AFTER (idempotent update — the
+                        // Postgres/TiDB CDC sources emit single-row
+                        // updates): update without oldData.
                         let (data, _) = self.map_image(row, None);
-                        Some(self.build_message(event, &key, data, None))
+                        vec![self.build_message("update", &key, data, None)]
                     }
-                };
-                messages.extend(current);
-                messages
+                }
+            }
+            RowKind::Delete => {
+                // Real delete: encoded immediately, never held.
+                vec![self.build_message("delete", &key, self.must_data(row), None)]
+            }
+            RowKind::Insert => {
+                let (data, _) = self.map_image(row, None);
+                vec![self.build_message("insert", &key, data, None)]
             }
         }
     }
@@ -506,18 +519,20 @@ impl TableState {
 
     /// Emit a held before-image as a real delete once the pairing window
     /// expired (called from each sink flush cycle).
-    fn expire_pending(&mut self) -> Vec<CanalMessage> {
+    fn expire_pending(&mut self, window: std::time::Duration) -> Vec<CanalMessage> {
         match &self.pending {
-            Some(pending) if pending.since.elapsed() >= PAIRING_WINDOW => {}
+            Some(pending) if pending.since.elapsed() >= window => {}
             _ => return Vec::new(),
         }
         self.flush()
     }
 }
 
-/// Stateful multi-table encoder: maps rows into canal-client messages,
-/// pairing the CDC delete(before)+insert(after) row pairs of one UPDATE
-/// into a single `update` message with `oldData`.
+/// Stateful multi-table encoder: maps rows into canal-client messages.
+/// An UPDATE's `UPDATE_BEFORE` + `UPDATE_AFTER` row pair (explicit
+/// RowKind tags, mirroring Java's CDC contract) is merged into a single
+/// `update` message with `oldData`; real DELETE / INSERT rows are
+/// encoded immediately — the merge never delays or reorders them.
 ///
 /// Rows carrying [`Row::origin_table`] are encoded against their own
 /// table's state (identity, columns, pairing slot); rows without origin
@@ -824,12 +839,41 @@ impl CanalClientEncoder {
     }
 
     /// Emit held before-images as real deletes once the pairing window
-    /// expired (called from each sink flush cycle).
+    /// expired. Called from the sink's flush cycle; for the expiry to
+    /// happen while the row batch is empty (a lone delete on an idle
+    /// table), the sink must ALSO trigger a flush when
+    /// [`Self::has_expired_pending`] reports true — otherwise the held
+    /// image waits for the next checkpoint boundary.
     pub fn expire_pending(&mut self) -> Vec<CanalMessage> {
+        let window = self.pairing_window();
         self.tables
             .values_mut()
-            .flat_map(TableState::expire_pending)
+            .flat_map(|state| state.expire_pending(window))
             .collect()
+    }
+
+    /// Whether any before-image is currently held for pairing (an UPDATE
+    /// whose after-image has not arrived yet, or a standalone delete
+    /// inside its window).
+    pub fn has_pending(&self) -> bool {
+        self.tables.values().any(|state| state.pending.is_some())
+    }
+
+    /// Whether any held before-image has outlived the pairing window —
+    /// i.e. a flush cycle would emit a real delete right now. The sink's
+    /// idle flush check uses this to fire an otherwise-empty flush.
+    pub fn has_expired_pending(&self) -> bool {
+        let window = self.pairing_window();
+        self.tables.values().any(|state| {
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.since.elapsed() >= window)
+        })
+    }
+
+    fn pairing_window(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.config.pairing_window_ms)
     }
 }
 
@@ -1044,6 +1088,7 @@ mod tests {
             columns: vec!["id".into(), "name".into(), "status".into(), "other".into()],
             tables,
             server_time_zone: "UTC".to_string(),
+            pairing_window_ms: PAIRING_WINDOW.as_millis() as u64,
         }
     }
 
@@ -1078,15 +1123,16 @@ mod tests {
     }
 
     #[test]
-    fn test_encoder_pairs_delete_insert_into_update() {
+    fn test_encoder_merges_update_before_after_pair() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
-        // mysql-cdc emits UPDATE as Delete(before) + Insert(after).
+        // mysql-cdc emits UPDATE as UPDATE_BEFORE + UPDATE_AFTER (explicit
+        // kinds, mirroring the Java CDC contract).
         let held = encoder
-            .encode(&row_of(RowKind::Delete, 1001, "李四", 0))
+            .encode(&row_of(RowKind::UpdateBefore, 1001, "李四", 0))
             .unwrap();
-        assert!(held.is_empty(), "before-image is held for pairing");
+        assert!(held.is_empty(), "before-image is held for its partner");
         let messages = encoder
-            .encode(&row_of(RowKind::Insert, 1001, "张三", 0))
+            .encode(&row_of(RowKind::UpdateAfter, 1001, "张三", 0))
             .unwrap();
         assert_eq!(messages.len(), 1);
         let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
@@ -1099,14 +1145,62 @@ mod tests {
     }
 
     #[test]
+    fn test_encoder_lone_update_after_has_no_old_data() {
+        // Single-row idempotent updates (Postgres/TiDB CDC) serialize as
+        // update without oldData.
+        let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::UpdateAfter, 1001, "solo", 1))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["eventType"], "update");
+        assert!(json.get("oldData").is_none());
+    }
+
+    #[test]
+    fn test_encoder_real_delete_emits_immediately() {
+        let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::Delete, 7, "gone", 0))
+            .unwrap();
+        assert_eq!(messages.len(), 1, "a real delete is never held");
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["eventType"], "delete");
+        assert_eq!(json["data"]["id"], 7);
+        // Delete data carries must fields only (no status).
+        assert!(json["data"].get("status").is_none());
+        assert!(!encoder.has_pending());
+        assert!(encoder.expire_pending().is_empty());
+    }
+
+    #[test]
+    fn test_encoder_delete_then_reinsert_stays_two_messages() {
+        // A delete followed by an insert of the same key must NOT be
+        // merged into an update — only tagged UPDATE pairs merge.
+        let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
+        let first = encoder
+            .encode(&row_of(RowKind::Delete, 7, "gone", 0))
+            .unwrap();
+        let second = encoder
+            .encode(&row_of(RowKind::Insert, 7, "back", 1))
+            .unwrap();
+        assert_eq!(first.len() + second.len(), 2);
+        let delete: Value = serde_json::from_str(&first[0].payload).unwrap();
+        assert_eq!(delete["eventType"], "delete");
+        let insert: Value = serde_json::from_str(&second[0].payload).unwrap();
+        assert_eq!(insert["eventType"], "insert");
+    }
+
+    #[test]
     fn test_encoder_filters_update_without_configured_changes() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
         // Only 'other' (not configured) changes between the images.
         encoder
-            .encode(&row_of(RowKind::Delete, 1001, "same", 0))
+            .encode(&row_of(RowKind::UpdateBefore, 1001, "same", 0))
             .unwrap();
         let messages = encoder
-            .encode(&row_of(RowKind::Insert, 1001, "same", 0))
+            .encode(&row_of(RowKind::UpdateAfter, 1001, "same", 0))
             .unwrap();
         assert!(
             messages.is_empty(),
@@ -1115,35 +1209,66 @@ mod tests {
     }
 
     #[test]
-    fn test_encoder_real_delete_flushes_before_unrelated_insert() {
+    fn test_encoder_flush_emits_torn_update_before_as_delete() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
         encoder
-            .encode(&row_of(RowKind::Delete, 7, "gone", 0))
-            .unwrap();
-        let messages = encoder
-            .encode(&row_of(RowKind::Insert, 1001, "new", 1))
-            .unwrap();
-        assert_eq!(messages.len(), 2);
-        let delete: Value = serde_json::from_str(&messages[0].payload).unwrap();
-        assert_eq!(delete["eventType"], "delete");
-        assert_eq!(delete["data"]["id"], 7);
-        // Delete data carries must fields only (no status).
-        assert!(delete["data"].get("status").is_none());
-        let insert: Value = serde_json::from_str(&messages[1].payload).unwrap();
-        assert_eq!(insert["eventType"], "insert");
-    }
-
-    #[test]
-    fn test_encoder_flush_emits_trailing_delete() {
-        let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
-        encoder
-            .encode(&row_of(RowKind::Delete, 9, "tail", 0))
+            .encode(&row_of(RowKind::UpdateBefore, 9, "tail", 0))
             .unwrap();
         let flushed = encoder.flush();
         assert_eq!(flushed.len(), 1);
         let json: Value = serde_json::from_str(&flushed[0].payload).unwrap();
         assert_eq!(json["eventType"], "delete");
         assert_eq!(json["data"]["id"], 9);
+    }
+
+    #[test]
+    fn test_pending_update_before_within_window_is_not_expired() {
+        let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
+        assert!(!encoder.has_pending());
+        encoder
+            .encode(&row_of(RowKind::UpdateBefore, 7, "held", 0))
+            .unwrap();
+        assert!(encoder.has_pending());
+        // Freshly held before-image sits inside the default 100ms window.
+        assert!(!encoder.has_expired_pending());
+        assert!(encoder.expire_pending().is_empty());
+    }
+
+    #[test]
+    fn test_pending_update_before_expires_with_configured_window() {
+        let mut config = fields_config();
+        config.pairing_window_ms = 0; // expire immediately
+        let mut encoder = CanalClientEncoder::new(config).unwrap();
+        encoder
+            .encode(&row_of(RowKind::UpdateBefore, 7, "gone", 0))
+            .unwrap();
+        assert!(encoder.has_expired_pending());
+        let expired = encoder.expire_pending();
+        assert_eq!(expired.len(), 1);
+        let json: Value = serde_json::from_str(&expired[0].payload).unwrap();
+        assert_eq!(json["eventType"], "delete");
+        assert_eq!(json["data"]["id"], 7);
+        assert!(!encoder.has_pending());
+    }
+
+    #[test]
+    fn test_pairing_wins_over_expiry_when_after_image_arrives() {
+        // A tiny window must not break UPDATE pairing: the after-image
+        // pairs during encode before any expiry check runs.
+        let mut config = fields_config();
+        config.pairing_window_ms = 0;
+        let mut encoder = CanalClientEncoder::new(config).unwrap();
+        encoder
+            .encode(&row_of(RowKind::UpdateBefore, 1001, "before", 0))
+            .unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::UpdateAfter, 1001, "after", 1))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["eventType"], "update");
+        assert!(!encoder.has_pending());
+        assert!(encoder.expire_pending().is_empty());
     }
 
     fn auto_schema() -> seatunnel_api::TableSchema {
@@ -1164,6 +1289,7 @@ mod tests {
             columns: Vec::new(), // automatic: derived from the schema
             tables: HashMap::new(),
             server_time_zone: "UTC".to_string(),
+            pairing_window_ms: PAIRING_WINDOW.as_millis() as u64,
         }
     }
 
@@ -1216,10 +1342,10 @@ mod tests {
         // `data` carries the must columns; unchanged `status` stays out
         // of data but appears in oldData.
         encoder
-            .encode(&row_of(RowKind::Delete, 7, "李四", 2))
+            .encode(&row_of(RowKind::UpdateBefore, 7, "李四", 2))
             .unwrap();
         let messages = encoder
-            .encode(&row_of(RowKind::Insert, 7, "张三", 2))
+            .encode(&row_of(RowKind::UpdateAfter, 7, "张三", 2))
             .unwrap();
         let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
         assert_eq!(json["eventType"], "update");
@@ -1230,10 +1356,10 @@ mod tests {
         // UPDATE touching only `status` (changed-only column): emitted
         // with status in data.
         encoder
-            .encode(&row_of(RowKind::Delete, 7, "张三", 2))
+            .encode(&row_of(RowKind::UpdateBefore, 7, "张三", 2))
             .unwrap();
         let messages = encoder
-            .encode(&row_of(RowKind::Insert, 7, "张三", 5))
+            .encode(&row_of(RowKind::UpdateAfter, 7, "张三", 5))
             .unwrap();
         let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
         assert_eq!(json["eventType"], "update");
@@ -1314,6 +1440,7 @@ mod tests {
             columns: Vec::new(),
             tables: HashMap::new(),
             server_time_zone: "UTC".to_string(),
+            pairing_window_ms: PAIRING_WINDOW.as_millis() as u64,
         };
         let encoder = CanalClientEncoder::from_schema(config, &schema).unwrap();
         assert_eq!(encoder.fields().key, "code");
@@ -1384,11 +1511,11 @@ mod tests {
 
         // UPDATE pairs within the same table only.
         let held = encoder
-            .encode(&origin_row_of(RowKind::Delete, 1001, "李四", 0))
+            .encode(&origin_row_of(RowKind::UpdateBefore, 1001, "李四", 0))
             .unwrap();
         assert!(held.is_empty());
         let messages = encoder
-            .encode(&origin_row_of(RowKind::Insert, 1001, "张三", 0))
+            .encode(&origin_row_of(RowKind::UpdateAfter, 1001, "张三", 0))
             .unwrap();
         assert_eq!(messages.len(), 1);
         let update: Value = serde_json::from_str(&messages[0].payload).unwrap();
@@ -1403,11 +1530,11 @@ mod tests {
         encoder.register_schema(&auto_schema()).unwrap();
         encoder.register_schema(&second_auto_schema()).unwrap();
 
-        // student delete(id=1) held; a course insert with the SAME key
-        // value must NOT pair with it — it stays a plain insert of its
-        // own table.
+        // student UPDATE_BEFORE(id=1) held; a course insert with the SAME
+        // key value must NOT pair with it — it stays a plain insert of its
+        // own table (per-table pairing slots).
         encoder
-            .encode(&origin_row_of(RowKind::Delete, 1, "gone", 0))
+            .encode(&origin_row_of(RowKind::UpdateBefore, 1, "gone", 0))
             .unwrap();
         let messages = encoder
             .encode(&course_row_of(RowKind::Insert, 1, "math"))
@@ -1423,7 +1550,7 @@ mod tests {
         // The held student before-image still pairs with its own table's
         // after-image afterwards.
         let messages = encoder
-            .encode(&origin_row_of(RowKind::Insert, 1, "renamed", 0))
+            .encode(&origin_row_of(RowKind::UpdateAfter, 1, "renamed", 0))
             .unwrap();
         assert_eq!(messages.len(), 1);
         let update: Value = serde_json::from_str(&messages[0].payload).unwrap();
@@ -1437,12 +1564,12 @@ mod tests {
         encoder.register_schema(&auto_schema()).unwrap();
         encoder.register_schema(&second_auto_schema()).unwrap();
 
-        // Leave one unpaired before-image per table.
+        // Leave one torn UPDATE_BEFORE image per table.
         encoder
-            .encode(&origin_row_of(RowKind::Delete, 9, "tail-student", 0))
+            .encode(&origin_row_of(RowKind::UpdateBefore, 9, "tail-student", 0))
             .unwrap();
         encoder
-            .encode(&course_row_of(RowKind::Delete, 3, "tail-course"))
+            .encode(&course_row_of(RowKind::UpdateBefore, 3, "tail-course"))
             .unwrap();
 
         let flushed = encoder.flush();

@@ -46,9 +46,12 @@ Transformation rules (faithful to the Java implementation):
   `"0"` / zero-leading-free digit strings → longs (leading zeros preserved
   as strings); everything else stays a string;
 - the Kafka partition key is the configured primary-key value;
-- the CDC delete(before)+insert(after) pair of one UPDATE is re-paired into
-  a single `update` message with `oldData` (2s pairing window; an
-  unpaired before-image is emitted as a real delete).
+- the CDC `UPDATE_BEFORE`+`UPDATE_AFTER` row pair of one UPDATE (explicit
+  RowKind tags, mirroring the Java CDC contract) is merged into a single
+  `update` message with `oldData`; real DELETE / INSERT rows are encoded
+  and delivered immediately — the merge is deterministic and never holds
+  them (a torn before-image without its partner is emitted as a real
+  delete after `canal-client.pairing-window-ms`, default 100ms).
 
 ```yaml
 sink:

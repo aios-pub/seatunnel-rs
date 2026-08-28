@@ -677,7 +677,7 @@ impl RedisSinkWriter {
             let key = resolve_template(&config.key_template, row);
             let value = serialize_value(config, row);
             match row.kind {
-                RowKind::Insert | RowKind::UpdateAfter | RowKind::UpdateBefore => {
+                RowKind::Insert | RowKind::UpdateAfter => {
                     match config.data_type {
                         RedisDataType::String => {
                             pipe.set(&key, value);
@@ -701,7 +701,9 @@ impl RedisSinkWriter {
                         pipe.expire(&key, config.expire);
                     }
                 }
-                RowKind::Delete => match config.data_type {
+                // UPDATE_BEFORE removes the stale value first (Java
+                // behavior); the UPDATE_AFTER partner re-adds the new one.
+                RowKind::Delete | RowKind::UpdateBefore => match config.data_type {
                     RedisDataType::String => {
                         pipe.del(&key);
                     }

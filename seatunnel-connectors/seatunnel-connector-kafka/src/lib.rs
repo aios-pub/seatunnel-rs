@@ -901,6 +901,16 @@ impl KafkaSinkConfig {
                                 &config.get_string("server_time_zone", "local"),
                             ),
                         ),
+                        pairing_window_ms: config
+                            .get_int(
+                                "canal-client.pairing-window-ms",
+                                config.get_int(
+                                    "canal-client.pairing_window_ms",
+                                    seatunnel_formats::canal_client_json::PAIRING_WINDOW.as_millis()
+                                        as i64,
+                                ),
+                            )
+                            .max(0) as u64,
                     })
                 })
                 .flatten(),
@@ -1800,12 +1810,17 @@ impl SinkWriter for KafkaSinkWriter {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + Send + '_>> {
         // Buffer the record; delivery happens at batch size, when the
         // `batch.timeout.ms` linger elapses, or at prepare_commit/close.
+        // An outstanding canal-client pairing hold also forces an
+        // immediate flush so an UPDATE's after-image pairs with its
+        // stashed before-image right away instead of waiting out the
+        // linger.
         self.batch.push(record);
         let full = self.batch.len() >= self.config.batch_size;
         let linger_due =
             self.last_flush.elapsed() >= Duration::from_millis(self.config.batch_timeout_ms);
+        let pairing_wait = self.canal_encoder.as_ref().is_some_and(|e| e.has_pending());
         Box::pin(async move {
-            if full || linger_due {
+            if full || linger_due || pairing_wait {
                 self.flush_batch().await?;
             }
             Ok(())
@@ -1901,11 +1916,18 @@ impl SinkWriter for KafkaSinkWriter {
     fn poll_flush(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         // Flush the tail of a partial batch once the linger elapsed; without
         // this, records buffered at the end of a burst wait for the next
-        // write or a checkpoint boundary.
-        let due = !self.batch.is_empty()
+        // write or a checkpoint boundary. A canal-client held delete whose
+        // pairing window expired must also fire here: with an empty batch
+        // nothing else calls flush_batch before the next checkpoint, which
+        // would pin standalone deletes to the checkpoint interval.
+        let linger_due = !self.batch.is_empty()
             && self.last_flush.elapsed() >= Duration::from_millis(self.config.batch_timeout_ms);
+        let pairing_due = self
+            .canal_encoder
+            .as_ref()
+            .is_some_and(|e| e.has_expired_pending());
         Box::pin(async move {
-            if due {
+            if linger_due || pairing_due {
                 self.flush_batch().await?;
             }
             Ok(())
@@ -2335,6 +2357,152 @@ mod tests {
         let cfg = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
         let writer = KafkaSinkWriter::new(cfg, metrics()).unwrap();
         assert!(writer.uses_canal_client());
+    }
+
+    fn users_row(kind: RowKind, id: i64, name: &str, score: i64) -> Row {
+        let mut row = Row::new(kind, 3);
+        row.set(0, seatunnel_api::Field::Int64(id));
+        row.set(1, seatunnel_api::Field::String(name.into()));
+        row.set(2, seatunnel_api::Field::Int64(score));
+        row
+    }
+
+    fn canal_writer(extra: &[(&str, &str)]) -> KafkaSinkWriter {
+        let base = [
+            ("bootstrap.servers", "127.0.0.1:9092"),
+            ("format", "canal_client_json"),
+            ("canal-client.database-name", "seatunnel"),
+            ("canal-client.table-name", "users"),
+            ("canal-client.columns", "id,name,score"),
+            (
+                "canal-client.sub-table-fields",
+                "{ \"users\": { \"key\": \"id\", \"must\": { \"id\": \"id\", \"name\": \"name\" }, \"update\": { \"score\": \"score\" } } }",
+            ),
+        ];
+        let props: HashMap<String, String> = base
+            .iter()
+            .chain(extra.iter())
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        KafkaSinkWriter::new(
+            KafkaSinkConfig::from_config(&ConnectorConfig::new(props)),
+            metrics(),
+        )
+        .unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn test_poll_flush_emits_expired_torn_update_before() {
+        // batch.timeout.ms 0 → write() flushes immediately. A 50ms pairing
+        // window holds the UPDATE_BEFORE image at flush time; once it
+        // elapses (torn pair — its partner never arrived), the idle poll
+        // cycle must fire an (empty-batch) flush and deliver the delete
+        // instead of waiting for a checkpoint barrier.
+        let mut writer = canal_writer(&[
+            ("topic", "canal-pending-expiry"),
+            ("batch.timeout.ms", "0"),
+            ("canal-client.pairing-window-ms", "50"),
+        ]);
+        assert_eq!(
+            writer
+                .config
+                .canal_client
+                .as_ref()
+                .unwrap()
+                .pairing_window_ms,
+            50,
+            "pairing window must be configurable"
+        );
+        block_on(writer.write(users_row(RowKind::UpdateBefore, 7, "gone", 0))).unwrap();
+        assert!(writer.batch.is_empty(), "linger 0 flushed the row");
+        assert!(writer.canal_encoder.as_ref().unwrap().has_pending());
+        assert_eq!(writer.total_written, 0, "before-image held, not emitted");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        block_on(writer.poll_flush()).unwrap();
+        assert!(
+            !writer.canal_encoder.as_ref().unwrap().has_pending(),
+            "expired hold must be emitted as a delete"
+        );
+        assert_eq!(writer.total_written, 1);
+    }
+
+    #[test]
+    fn test_real_delete_encodes_in_the_same_flush() {
+        // A real DELETE is never held for pairing: the write-triggered
+        // flush already delivers it (no window, no pending).
+        let mut writer = canal_writer(&[
+            ("topic", "canal-delete-immediate"),
+            ("batch.timeout.ms", "0"),
+        ]);
+        block_on(writer.write(users_row(RowKind::Delete, 7, "gone", 0))).unwrap();
+        assert!(writer.batch.is_empty());
+        assert!(
+            !writer.canal_encoder.as_ref().unwrap().has_pending(),
+            "a real delete never enters the pairing slot"
+        );
+        assert_eq!(writer.total_written, 1);
+    }
+
+    #[test]
+    fn test_poll_flush_holds_update_before_inside_pairing_window() {
+        // Default 100ms window: an idle poll cycle must NOT emit a freshly
+        // held UPDATE_BEFORE image — its UPDATE_AFTER may still arrive.
+        let mut writer =
+            canal_writer(&[("topic", "canal-pending-hold"), ("batch.timeout.ms", "0")]);
+        assert_eq!(
+            writer
+                .config
+                .canal_client
+                .as_ref()
+                .unwrap()
+                .pairing_window_ms,
+            seatunnel_formats::canal_client_json::PAIRING_WINDOW.as_millis() as u64
+        );
+        block_on(writer.write(users_row(RowKind::UpdateBefore, 7, "held", 0))).unwrap();
+        assert!(writer.canal_encoder.as_ref().unwrap().has_pending());
+
+        block_on(writer.poll_flush()).unwrap();
+        assert!(
+            writer.canal_encoder.as_ref().unwrap().has_pending(),
+            "inside the window the before-image stays held"
+        );
+        assert_eq!(writer.total_written, 0);
+    }
+
+    #[test]
+    fn test_write_flushes_eagerly_while_pairing_hold_outstanding() {
+        // A 60s linger keeps the after-image buffered; the outstanding
+        // pairing hold must force its flush so the pair merges into one
+        // update message instead of waiting out the linger.
+        let mut writer = canal_writer(&[
+            ("topic", "canal-pending-pair"),
+            ("batch.timeout.ms", "60000"),
+        ]);
+        block_on(writer.write(users_row(RowKind::UpdateBefore, 7, "before", 0))).unwrap();
+        assert!(!writer.batch.is_empty(), "linger not due, row buffered");
+        // Simulate the earlier flush that stashed the before-image (on an
+        // idle table the linger of the PREVIOUS cycle already elapsed).
+        block_on(writer.flush_batch()).unwrap();
+        assert!(writer.canal_encoder.as_ref().unwrap().has_pending());
+
+        block_on(writer.write(users_row(RowKind::UpdateAfter, 7, "after", 1))).unwrap();
+        assert!(
+            writer.batch.is_empty(),
+            "outstanding hold forces an immediate flush"
+        );
+        assert!(
+            !writer.canal_encoder.as_ref().unwrap().has_pending(),
+            "the after-image paired (no delete leaked)"
+        );
+        assert_eq!(writer.total_written, 1, "one merged update message");
     }
 
     #[test]

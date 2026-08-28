@@ -97,7 +97,8 @@ enables DDL capture from binlog query events — see
    chunk→subtask assignment). Binlog rows decoded during the scan are
    buffered and replayed after the snapshot.
 2. **Incremental**: only subtask 0 streams; row events are decoded
-   positionally, UPDATEs become delete-before + insert-after; binlog
+   positionally, UPDATEs become an `UPDATE_BEFORE` + `UPDATE_AFTER` row
+   pair (explicit RowKind tags, mirroring the Java CDC contract); binlog
    rotations are tracked so checkpoints stay valid across files.
 3. **Checkpointing**: binlog file/position (+ GTID set), split cursors
    and the split layout are persisted; restart resumes exactly.

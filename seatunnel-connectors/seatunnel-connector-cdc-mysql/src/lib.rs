@@ -1257,11 +1257,24 @@ impl MySqlCdcReader {
             RowsEventData::UpdateRowsEvent(e) => {
                 for pair in e.rows(tme) {
                     if let Ok((Some(before), Some(after))) = pair {
+                        // Mirrors Java SeaTunnelRowDebeziumDeserializeSchema:
+                        // an UPDATE becomes an UPDATE_BEFORE + UPDATE_AFTER
+                        // row pair — the explicit kinds let downstream
+                        // formats merge the pair deterministically (no
+                        // key/time-window guessing).
                         decoded.push_back(BufferedChange {
-                            row: tag(binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete)),
+                            row: tag(binlog_row_to_seatunnel(
+                                &before,
+                                num_cols,
+                                RowKind::UpdateBefore,
+                            )),
                         });
                         decoded.push_back(BufferedChange {
-                            row: tag(binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert)),
+                            row: tag(binlog_row_to_seatunnel(
+                                &after,
+                                num_cols,
+                                RowKind::UpdateAfter,
+                            )),
                         });
                     }
                 }
