@@ -51,6 +51,13 @@ Selection applies to both snapshot enumeration (matched tables resolved
 via `information_schema`, snapshotted in parallel chunks) and the binlog
 filter. Schema-evolution watchers are created per captured table.
 
+Every emitted row (snapshot and binlog phases alike) carries its origin
+`database.table` identity, so downstream sinks can route/stamp per
+table — e.g. the Kafka canal-client format derives each message's
+`dbName`/`tableName` from it and the `topic-routes` / `${table}`
+template resolve one topic per table or per table group (see the
+[Kafka connector](kafka.md)).
+
 ### Startup / stop
 
 | Option | Values |

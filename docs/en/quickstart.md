@@ -12,20 +12,41 @@ Two binaries:
 | Binary | Purpose |
 |--------|---------|
 | `seatunnel` | CLI: local runs, cluster job submission & management |
-| `seatunnel-engine-server` | Cluster node: `--role master` or `--role worker` |
+| `seatunnel-engine-server` | Cluster node: `--role hybrid` (recommended), `master`, or `worker` |
 
 > Note: macOS reserves port 5000 (AirPlay), so the engine defaults to **5800**.
 
 ## Start a Cluster
 
-```bash
-# terminal 1 — master
-seatunnel-engine-server --role master --addr 0.0.0.0:5800
+One hybrid process = coordinator (Raft voter) + worker — the recommended
+single-machine form:
 
-# terminal 2 — worker
+```bash
+seatunnel-engine-server --role hybrid --addr 127.0.0.1:5800
+# or: ./scripts/start-hybrid.sh   # builds, waits for readiness, prints status
+```
+
+For HA, run 3 symmetric hybrid nodes — Raft elects the coordinator, and
+voter counts must be odd (two voters are rejected at startup):
+
+```bash
+# on each of the three machines (same member-list everywhere):
+seatunnel-engine-server --role hybrid --addr 0.0.0.0:5800 \
+  --advertise-addr node1.example.com:5800 -f config/seatunnel-3node.yaml
+# local rehearsal on one machine:
+./scripts/start-hybrid-cluster.sh   # 3 voters on 127.0.0.1:5800/5810/5820
+```
+
+Large clusters can instead separate the roles — 3 masters (Raft voters)
+plus N dedicated workers:
+
+```bash
+seatunnel-engine-server --role master --addr 0.0.0.0:5800
 seatunnel-engine-server --role worker --master 127.0.0.1:5800 \
   --worker-id worker-1 --addr 0.0.0.0:5001
 ```
+
+See [Cluster HA Design](cluster-ha-design.md) for the trade-offs.
 
 ## MySQL CDC → Kafka (cluster mode)
 

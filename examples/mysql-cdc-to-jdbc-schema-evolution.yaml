@@ -11,7 +11,7 @@
 env:
   job.name: mysql-cdc-to-jdbc-schema-evolution
   parallelism: 1
-  checkpoint.interval: 5000
+  checkpoint.interval: 10000
 
 source:
   MySQL-CDC:

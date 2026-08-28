@@ -19,9 +19,9 @@ mod metrics;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::middleware;
 use axum::routing::get;
-use axum::Router;
 
 pub use auth::AuthConfig;
 pub use dto::{
@@ -29,7 +29,7 @@ pub use dto::{
     JobSummaryDto, SubmitJobDto, SubmitResultDto, TaskCheckpointDto, TaskStatusDto, WorkerDto,
 };
 pub use engine::{EngineError, EngineOps};
-pub use metrics::{spawn_poller, Metrics};
+pub use metrics::{Metrics, spawn_poller};
 
 /// Shared application state for handlers.
 #[derive(Clone)]
@@ -61,8 +61,14 @@ pub fn build_router(state: AppState) -> Router {
                 get(api::jobs::list_jobs).post(api::jobs::submit_job),
             )
             .route("/api/v1/jobs/{job_id}", get(api::jobs::job_detail))
-            .route("/api/v1/jobs/{job_id}/cancel", axum::routing::post(api::jobs::cancel_job))
-            .route("/api/v1/jobs/{job_id}/update", axum::routing::post(api::jobs::update_job))
+            .route(
+                "/api/v1/jobs/{job_id}/cancel",
+                axum::routing::post(api::jobs::cancel_job),
+            )
+            .route(
+                "/api/v1/jobs/{job_id}/update",
+                axum::routing::post(api::jobs::update_job),
+            )
             .route(
                 "/api/v1/jobs/{job_id}/checkpoints",
                 get(api::jobs::job_checkpoints),
@@ -193,9 +199,19 @@ mod tests {
     #[tokio::test]
     async fn protected_api_requires_login() {
         let state = test_state(FakeEngine::default());
-        for path in ["/api/v1/jobs", "/api/v1/overview", "/api/v1/cluster", "/api/v1/whoami"] {
+        for path in [
+            "/api/v1/jobs",
+            "/api/v1/overview",
+            "/api/v1/cluster",
+            "/api/v1/whoami",
+        ] {
             let (status, _) = get_json(&state, path, None).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{} should require auth", path);
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{} should require auth",
+                path
+            );
         }
     }
 
@@ -209,8 +225,7 @@ mod tests {
                     .uri("/api/v1/login")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({ "username": "admin", "password": "wrong" })
-                            .to_string(),
+                        serde_json::json!({ "username": "admin", "password": "wrong" }).to_string(),
                     ))
                     .unwrap(),
             )
@@ -235,13 +250,7 @@ mod tests {
     #[tokio::test]
     async fn logout_clears_the_session_cookie() {
         let state = test_state(FakeEngine::default());
-        let status = post_json(
-            &state,
-            "/api/v1/logout",
-            String::new(),
-            None,
-        )
-        .await;
+        let status = post_json(&state, "/api/v1/logout", String::new(), None).await;
         assert_eq!(status, StatusCode::OK);
         let response = build_router(state)
             .oneshot(
@@ -268,7 +277,8 @@ mod tests {
     #[tokio::test]
     async fn tampered_session_cookie_is_rejected() {
         let state = test_state(FakeEngine::default());
-        let (status, _) = get_json(&state, "/api/v1/jobs", Some("seatunnel_session=1:deadbeef")).await;
+        let (status, _) =
+            get_json(&state, "/api/v1/jobs", Some("seatunnel_session=1:deadbeef")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -345,7 +355,13 @@ mod tests {
     async fn cancel_unknown_job_returns_404() {
         let state = test_state(FakeEngine::default());
         let cookie = login_cookie(&state).await;
-        let status = post_json(&state, "/api/v1/jobs/missing/cancel", String::new(), Some(&cookie)).await;
+        let status = post_json(
+            &state,
+            "/api/v1/jobs/missing/cancel",
+            String::new(),
+            Some(&cookie),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -386,7 +402,8 @@ mod tests {
     async fn checkpoints_endpoint_returns_history() {
         let state = test_state(FakeEngine::with_running_job());
         let cookie = login_cookie(&state).await;
-        let (status, body) = get_json(&state, "/api/v1/jobs/job-1/checkpoints", Some(&cookie)).await;
+        let (status, body) =
+            get_json(&state, "/api/v1/jobs/job-1/checkpoints", Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("checkpoint_id"));
     }

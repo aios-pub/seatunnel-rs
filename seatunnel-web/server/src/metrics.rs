@@ -10,11 +10,12 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 
-use crate::engine::EngineOps;
 use crate::AppState;
+use crate::engine::EngineOps;
 
 /// All metrics exposed by the web console. Clone shares the same registry.
 #[derive(Clone)]
@@ -35,10 +36,25 @@ pub struct Metrics {
     task_processed_records: IntGaugeVec,
     task_records_per_second: IntGaugeVec,
     task_idle_seconds: IntGaugeVec,
+    /// Sink delivery metrics per task (60s window; only set when the
+    /// sink reports — e.g. the Kafka connector's in-flight pipeline).
+    task_sink_sent: IntGaugeVec,
+    task_sink_delivered: IntGaugeVec,
+    task_sink_failed: IntGaugeVec,
+    task_sink_in_flight: IntGaugeVec,
+    task_sink_delivery_latency_ema_ms: GaugeVec,
+    task_sink_delivery_latency_max_ms: IntGaugeVec,
     /// Label sets present in `task_processed_records` after the last refresh.
     task_labels: std::sync::Arc<std::sync::Mutex<HashSet<(String, String)>>>,
     /// Previous `(processed_records, sampled_at)` per task for rate gauges.
-    rate_samples: std::sync::Arc<std::sync::Mutex<HashMap<(String, String), (i64, std::time::Instant)>>>,
+    rate_samples:
+        std::sync::Arc<std::sync::Mutex<HashMap<(String, String), (i64, std::time::Instant)>>>,
+    /// Poller liveness: cycles run, cycles that failed to reach the
+    /// master, and when the last successful refresh completed. A stale
+    /// `/metrics` page is diagnosable from the metrics themselves.
+    refresh_cycles: prometheus::IntCounter,
+    refresh_failures: prometheus::IntCounter,
+    refresh_last_ok_unix_ts: IntGauge,
 }
 
 impl Metrics {
@@ -129,8 +145,73 @@ impl Metrics {
             &["job", "task"],
         )
         .unwrap();
+        let task_sink_sent = IntGaugeVec::new(
+            Opts::new(
+                "seatunnel_task_sink_sent",
+                "Sink messages enqueued in the last window seconds",
+            ),
+            &["job", "task"],
+        )
+        .unwrap();
+        let task_sink_delivered = IntGaugeVec::new(
+            Opts::new(
+                "seatunnel_task_sink_delivered",
+                "Sink delivery reports acknowledged OK in the last window seconds",
+            ),
+            &["job", "task"],
+        )
+        .unwrap();
+        let task_sink_failed = IntGaugeVec::new(
+            Opts::new(
+                "seatunnel_task_sink_failed",
+                "Sink delivery reports failed in the last window seconds",
+            ),
+            &["job", "task"],
+        )
+        .unwrap();
+        let task_sink_in_flight = IntGaugeVec::new(
+            Opts::new(
+                "seatunnel_task_sink_in_flight",
+                "Sink messages currently in flight (enqueued, report pending)",
+            ),
+            &["job", "task"],
+        )
+        .unwrap();
+        let task_sink_delivery_latency_ema_ms = GaugeVec::new(
+            Opts::new(
+                "seatunnel_task_sink_delivery_latency_ema_ms",
+                "Sink EMA of enqueue-to-report latency, millis",
+            ),
+            &["job", "task"],
+        )
+        .unwrap();
+        let task_sink_delivery_latency_max_ms = IntGaugeVec::new(
+            Opts::new(
+                "seatunnel_task_sink_delivery_latency_max_ms",
+                "Sink max enqueue-to-report latency within the window, millis",
+            ),
+            &["job", "task"],
+        )
+        .unwrap();
+        let refresh_cycles = prometheus::IntCounter::new(
+            "seatunnel_web_refresh_cycles_total",
+            "Engine refresh cycles attempted by the metrics poller",
+        )
+        .unwrap();
+        let refresh_failures = prometheus::IntCounter::new(
+            "seatunnel_web_refresh_failures_total",
+            "Engine refresh cycles that failed to list jobs from the master",
+        )
+        .unwrap();
+        let refresh_last_ok_unix_ts = IntGauge::new(
+            "seatunnel_web_refresh_last_ok_unix_ts",
+            "Unix seconds of the last successful engine refresh (stale gauges are diagnosable)",
+        )
+        .unwrap();
 
-        registry.register(Box::new(http_requests_total.clone())).unwrap();
+        registry
+            .register(Box::new(http_requests_total.clone()))
+            .unwrap();
         registry
             .register(Box::new(http_request_duration_seconds.clone()))
             .unwrap();
@@ -156,6 +237,29 @@ impl Metrics {
         registry
             .register(Box::new(task_idle_seconds.clone()))
             .unwrap();
+        registry.register(Box::new(task_sink_sent.clone())).unwrap();
+        registry
+            .register(Box::new(task_sink_delivered.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(task_sink_failed.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(task_sink_in_flight.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(task_sink_delivery_latency_ema_ms.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(task_sink_delivery_latency_max_ms.clone()))
+            .unwrap();
+        registry.register(Box::new(refresh_cycles.clone())).unwrap();
+        registry
+            .register(Box::new(refresh_failures.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(refresh_last_ok_unix_ts.clone()))
+            .unwrap();
 
         Metrics {
             registry,
@@ -172,8 +276,17 @@ impl Metrics {
             task_processed_records,
             task_records_per_second,
             task_idle_seconds,
+            task_sink_sent,
+            task_sink_delivered,
+            task_sink_failed,
+            task_sink_in_flight,
+            task_sink_delivery_latency_ema_ms,
+            task_sink_delivery_latency_max_ms,
             task_labels: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
             rate_samples: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            refresh_cycles,
+            refresh_failures,
+            refresh_last_ok_unix_ts,
         }
     }
 
@@ -197,11 +310,25 @@ impl Metrics {
 
     /// Pull engine state into the gauges once.
     pub async fn refresh(&self, engine: &dyn EngineOps) {
-        for state in ["CREATED", "SCHEDULED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
+        self.refresh_cycles.inc();
+        for state in [
+            "CREATED",
+            "SCHEDULED",
+            "RUNNING",
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+        ] {
             self.jobs.with_label_values(&[state]).set(0);
         }
 
         if let Ok(jobs) = engine.list_jobs().await {
+            self.refresh_last_ok_unix_ts.set(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            );
             let now = std::time::Instant::now();
             let mut live_labels = HashSet::new();
             for job in jobs {
@@ -243,6 +370,26 @@ impl Metrics {
                             -1
                         };
                         self.task_idle_seconds.with_label_values(&labels).set(idle);
+                        if let Some(m) = &task.sink_metrics {
+                            self.task_sink_sent
+                                .with_label_values(&labels)
+                                .set(m.sent as i64);
+                            self.task_sink_delivered
+                                .with_label_values(&labels)
+                                .set(m.delivered as i64);
+                            self.task_sink_failed
+                                .with_label_values(&labels)
+                                .set(m.failed as i64);
+                            self.task_sink_in_flight
+                                .with_label_values(&labels)
+                                .set(m.in_flight as i64);
+                            self.task_sink_delivery_latency_ema_ms
+                                .with_label_values(&labels)
+                                .set(m.latency_ema_ms);
+                            self.task_sink_delivery_latency_max_ms
+                                .with_label_values(&labels)
+                                .set(m.latency_max_ms as i64);
+                        }
                         live_labels.insert((job.job_id.clone(), task.task_id.clone()));
                     }
                 }
@@ -269,7 +416,9 @@ impl Metrics {
                 self.worker_overloaded
                     .with_label_values(&[&id])
                     .set(if w.can_accept { 0 } else { 1 });
-                self.worker_lag_ms.with_label_values(&[&id]).set(w.lag_ms as i64);
+                self.worker_lag_ms
+                    .with_label_values(&[&id])
+                    .set(w.lag_ms as i64);
                 self.worker_mem_ratio
                     .with_label_values(&[&id])
                     .set(w.mem_permille as i64);
@@ -284,6 +433,10 @@ impl Metrics {
                 let _ = self.worker_mem_ratio.remove_label_values(&[id]);
             }
             *previous = live;
+        } else {
+            // Unreachable master: gauges keep their last values — count it
+            // so a stale console page is visible from the metrics themselves.
+            self.refresh_failures.inc();
         }
     }
 }
@@ -295,7 +448,11 @@ pub fn spawn_poller(state: AppState, interval: Duration) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            state.metrics.refresh(&*state.engine).await;
+            // A wedged master connection must never freeze the console's
+            // metrics (a hung gRPC call without a deadline would park this
+            // poller forever and /metrics would serve stale gauges). Bound
+            // every refresh cycle by the interval; the next tick retries.
+            let _ = tokio::time::timeout(interval, state.metrics.refresh(&*state.engine)).await;
         }
     });
 }

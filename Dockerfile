@@ -62,8 +62,11 @@ USER seatunnel
 # Master gRPC (workers/CLI) and worker port.
 EXPOSE 5800 5001
 
-# Default: run a master. Override with:
+# Default: run a hybrid node (coordinator + worker in one process).
+# Multi-node: give every container the same member-list config (odd voter
+# count) and its own --advertise-addr, e.g. with config/seatunnel-3node.yaml.
+# To join an existing cluster as a pure worker instead, override with:
 #   docker run seatunnel-rs seatunnel-engine-server --role worker \
 #     --master <master>:5800 --worker-id w1
 ENTRYPOINT ["seatunnel-engine-server"]
-CMD ["--role", "master", "--addr", "0.0.0.0:5800"]
+CMD ["--role", "hybrid", "--addr", "0.0.0.0:5800"]

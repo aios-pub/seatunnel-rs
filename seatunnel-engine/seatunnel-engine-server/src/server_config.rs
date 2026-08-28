@@ -159,6 +159,31 @@ pub struct EngineSection {
     pub worker_address: Option<String>,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
+    #[serde(default)]
+    pub raft: RaftSection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RaftSection {
+    /// Election timeout window lower bound (ms). The effective window is
+    /// shifted per node by `election-skew-ms` (see EngineServerConfig).
+    #[serde(default)]
+    pub election_timeout_min_ms: Option<u64>,
+    /// Election timeout window upper bound (ms).
+    #[serde(default)]
+    pub election_timeout_max_ms: Option<u64>,
+    /// Per-node election window shift (ms): node i (member-list order,
+    /// 1-based) draws from [min+(i-1)*skew, max+(i-1)*skew). Windows are
+    /// disjoint when skew >= window width + one tick, making the lowest
+    /// live member win every election — no split votes, no term storms.
+    /// 0 disables the skew.
+    #[serde(default)]
+    pub election_skew_ms: Option<u64>,
+    /// Raft heartbeat period (ms). Also the hard RPC timeout openraft
+    /// applies to append-entries, so it must exceed one RPC round trip.
+    #[serde(default)]
+    pub heartbeat_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -273,6 +298,60 @@ pub struct EngineServerConfig {
     pub cluster_name: String,
     /// Master bind port from the hazelcast section (None = keep default).
     pub hazelcast_port: Option<u16>,
+    /// Raft election timing (see RaftSection for semantics).
+    pub raft: RaftTiming,
+}
+
+/// Resolved raft election timing.
+///
+/// openraft draws the election timeout ONCE per process
+/// (`gen_range(min..max)`, fixed forever), and all followers start
+/// counting from the leader's last heartbeat — so two nodes that draw
+/// close values campaign in lockstep forever: each bumps the term,
+/// neither wins. Giving every node its own window, shifted by member
+/// order, makes collisions structurally impossible: the lowest live
+/// member always fires first and the others grant its vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaftTiming {
+    /// Window lower bound for node 1 (ms).
+    pub election_timeout_min_ms: u64,
+    /// Window upper bound for node 1 (ms).
+    pub election_timeout_max_ms: u64,
+    /// Per-node window shift (ms); 0 disables the skew.
+    pub election_skew_ms: u64,
+    /// Heartbeat period (ms).
+    pub heartbeat_interval_ms: u64,
+}
+
+impl RaftTiming {
+    /// The election timeout window of voter `node_id` (1-based position
+    /// in the member list). Higher ids wait longer — member-list order
+    /// is the leader priority order.
+    pub fn election_window(&self, node_id: u64) -> (u64, u64) {
+        let shift = self
+            .election_skew_ms
+            .saturating_mul(node_id.saturating_sub(1));
+        (
+            self.election_timeout_min_ms.saturating_add(shift),
+            self.election_timeout_max_ms.saturating_add(shift),
+        )
+    }
+}
+
+impl Default for RaftTiming {
+    fn default() -> Self {
+        RaftTiming {
+            election_timeout_min_ms: 900,
+            election_timeout_max_ms: 1_300,
+            // Windows must clear each other by at least one openraft
+            // tick (heartbeat*3/2 = 225ms): skew 700 with a 400ms window
+            // leaves a 300ms gap, so the lower node's vote request always
+            // arrives before the next node's timer fires. Voter windows:
+            // [900,1300), [1600,2000), [2300,2700), ...
+            election_skew_ms: 700,
+            heartbeat_interval_ms: 150,
+        }
+    }
 }
 
 /// Resolved S3/MinIO checkpoint storage configuration.
@@ -315,6 +394,7 @@ impl Default for EngineServerConfig {
             member_list: vec!["127.0.0.1:5800".to_string()],
             cluster_name: "seatunnel".to_string(),
             hazelcast_port: None,
+            raft: RaftTiming::default(),
         }
     }
 }
@@ -468,6 +548,44 @@ impl EngineServerConfig {
         if !members.is_empty() {
             self.member_list = members;
         }
+        let raft = &engine.raft;
+        if let Some(ms) = raft.heartbeat_interval_ms {
+            self.raft.heartbeat_interval_ms = ms.max(50);
+        }
+        if let Some(ms) = raft.election_skew_ms {
+            self.raft.election_skew_ms = ms;
+        }
+        if let (Some(min), Some(max)) = (raft.election_timeout_min_ms, raft.election_timeout_max_ms)
+        {
+            // Require a strictly increasing window; lift max to min+1
+            // rather than rejecting the whole config file.
+            self.raft.election_timeout_min_ms = min.max(1);
+            self.raft.election_timeout_max_ms = max.max(min + 1);
+        } else {
+            if let Some(min) = raft.election_timeout_min_ms {
+                self.raft.election_timeout_min_ms = min.max(1);
+            }
+            if let Some(max) = raft.election_timeout_max_ms {
+                self.raft.election_timeout_max_ms = max.max(self.raft.election_timeout_min_ms + 1);
+            }
+        }
+        // A positive skew must actually separate the windows: lift it to
+        // window width + one openraft tick, otherwise adjacent nodes can
+        // still campaign in the same window (split votes return).
+        let width = self.raft.election_timeout_max_ms - self.raft.election_timeout_min_ms;
+        let tick = self.raft.heartbeat_interval_ms * 3 / 2;
+        let min_skew = width + tick;
+        if self.raft.election_skew_ms > 0 && self.raft.election_skew_ms < min_skew {
+            tracing::warn!(
+                "raft.election-skew-ms {} too small for window {}ms + tick {}ms; \
+                 lifting to {} so per-node election windows stay disjoint",
+                self.raft.election_skew_ms,
+                width,
+                tick,
+                min_skew
+            );
+            self.raft.election_skew_ms = min_skew;
+        }
     }
 }
 
@@ -567,5 +685,99 @@ seatunnel:
         // Env sits between the two.
         let config = EngineServerConfig::load(None, None, Some("/from-env")).unwrap();
         assert_eq!(config.state_dir, "/from-env");
+    }
+
+    #[test]
+    fn raft_defaults_without_file() {
+        let config = EngineServerConfig::load(None, None, None).unwrap();
+        assert_eq!(config.raft.election_timeout_min_ms, 900);
+        assert_eq!(config.raft.election_timeout_max_ms, 1_300);
+        assert_eq!(config.raft.election_skew_ms, 700);
+        assert_eq!(config.raft.heartbeat_interval_ms, 150);
+    }
+
+    #[test]
+    fn raft_section_overrides_and_clamps() {
+        let yaml = "
+seatunnel:
+  engine:
+    raft:
+      election-timeout-min-ms: 1000
+      election-timeout-max-ms: 1500
+      election-skew-ms: 0
+      heartbeat-interval-ms: 30
+";
+        let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let mut config = EngineServerConfig::default();
+        config.apply_file(&file);
+        assert_eq!(config.raft.election_timeout_min_ms, 1_000);
+        assert_eq!(config.raft.election_timeout_max_ms, 1_500);
+        // Skew 0 disables the per-node priority shift.
+        assert_eq!(config.raft.election_skew_ms, 0);
+        // Heartbeat floored at 50ms (openraft append hard timeout).
+        assert_eq!(config.raft.heartbeat_interval_ms, 50);
+    }
+
+    #[test]
+    fn raft_window_ordering_is_repaired() {
+        let yaml = "
+seatunnel:
+  engine:
+    raft:
+      election-timeout-min-ms: 1200
+      election-timeout-max-ms: 1000
+";
+        let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let mut config = EngineServerConfig::default();
+        config.apply_file(&file);
+        assert!(config.raft.election_timeout_max_ms > config.raft.election_timeout_min_ms);
+    }
+
+    #[test]
+    fn raft_small_positive_skew_is_lifted() {
+        let yaml = "
+seatunnel:
+  engine:
+    raft:
+      election-skew-ms: 100
+";
+        let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let mut config = EngineServerConfig::default();
+        config.apply_file(&file);
+        let width = config.raft.election_timeout_max_ms - config.raft.election_timeout_min_ms;
+        let tick = config.raft.heartbeat_interval_ms * 3 / 2;
+        // 100ms skew cannot separate the default window — lifted to
+        // width + tick so windows stay disjoint.
+        assert_eq!(config.raft.election_skew_ms, width + tick);
+    }
+
+    #[test]
+    fn raft_election_windows_are_disjoint() {
+        let timing = RaftTiming::default();
+        let tick = timing.heartbeat_interval_ms * 3 / 2; // openraft tick
+        let windows: Vec<(u64, u64)> = (1..=5).map(|i| timing.election_window(i)).collect();
+        for w in &windows {
+            assert!(w.0 < w.1, "window must be non-empty: {:?}", w);
+        }
+        for pair in windows.windows(2) {
+            // Gap between adjacent windows must clear one tick so the
+            // lower node's vote request always arrives first.
+            assert!(
+                pair[1].0 >= pair[0].1 + tick,
+                "adjacent windows overlap or gap < tick: {:?}",
+                pair
+            );
+        }
+        // Node 1 window is the unshifted default.
+        assert_eq!(windows[0], (900, 1_300));
+    }
+
+    #[test]
+    fn raft_zero_skew_disables_windows() {
+        let timing = RaftTiming {
+            election_skew_ms: 0,
+            ..RaftTiming::default()
+        };
+        assert_eq!(timing.election_window(1), timing.election_window(3));
     }
 }

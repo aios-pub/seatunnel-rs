@@ -5,10 +5,10 @@
 
 //! Job management handlers.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use uuid::Uuid;
 
 use crate::api::error_response;
@@ -106,7 +106,10 @@ pub async fn submit_job(
     if let Some(env) = parsed.env {
         doc.insert("env".to_string(), env);
     }
-    doc.insert("source".to_string(), serde_json::Value::Array(parsed.sources));
+    doc.insert(
+        "source".to_string(),
+        serde_json::Value::Array(parsed.sources),
+    );
     doc.insert(
         "transform".to_string(),
         serde_json::Value::Array(parsed.transforms),
@@ -145,7 +148,7 @@ pub async fn update_job(
         "" => {
             return error_response(&EngineError::Invalid(
                 "config_text must not be empty".to_string(),
-            ))
+            ));
         }
         text => serde_json::from_str::<serde_json::Value>(text)
             .map_err(|e| EngineError::Invalid(format!("invalid JSON config: {}", e)))
@@ -157,10 +160,7 @@ pub async fn update_job(
         Err(e) => return error_response(&e),
     };
     // Default the name to the job id stem when not provided.
-    let job_name = body
-        .job_name
-        .clone()
-        .unwrap_or_else(|| job_id.clone());
+    let job_name = body.job_name.clone().unwrap_or_else(|| job_id.clone());
     match state
         .engine
         .update_job(

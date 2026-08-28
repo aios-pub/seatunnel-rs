@@ -92,17 +92,18 @@ pub async fn update_job(
 
     match client.get_job_status(job_id).await {
         Ok(status) => {
-            let terminal =
-                matches!(status.state, STATE_COMPLETED | STATE_FAILED | STATE_CANCELLED);
+            let terminal = matches!(
+                status.state,
+                STATE_COMPLETED | STATE_FAILED | STATE_CANCELLED
+            );
             if !terminal {
                 client.cancel_job(job_id).await?;
                 cancelled = true;
                 let deadline = tokio::time::Instant::now()
                     + Duration::from_secs(options.cancel_timeout_secs.max(1));
                 loop {
-                    assert_not_cancelled_timeout(deadline, job_id, options).map_err(
-                        |e| -> Box<dyn std::error::Error + Send + Sync> { e },
-                    )?;
+                    assert_not_cancelled_timeout(deadline, job_id, options)
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e })?;
                     let status = client.get_job_status(job_id).await?;
                     if status.state == STATE_CANCELLED {
                         cancel_wait_ms = started.elapsed().as_millis();
@@ -189,6 +190,10 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ABORTED"), "must state the abort: {}", msg);
-        assert!(msg.contains("parallel"), "must warn about duplicates: {}", msg);
+        assert!(
+            msg.contains("parallel"),
+            "must warn about duplicates: {}",
+            msg
+        );
     }
 }

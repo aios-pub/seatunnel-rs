@@ -91,21 +91,12 @@ pub fn registry_snapshot(registry: &WorkerRegistry) -> Vec<(String, String)> {
 
 /// Snapshot of registered workers as `(id, address, load_score,
 /// can_accept)` — the placement input for pressure-ordered scheduling.
-pub fn registry_snapshot_admission(
-    registry: &WorkerRegistry,
-) -> Vec<(String, String, u32, bool)> {
+pub fn registry_snapshot_admission(registry: &WorkerRegistry) -> Vec<(String, String, u32, bool)> {
     registry
         .read()
         .unwrap()
         .iter()
-        .map(|(id, e)| {
-            (
-                id.clone(),
-                e.address.clone(),
-                e.load_score,
-                e.can_accept,
-            )
-        })
+        .map(|(id, e)| (id.clone(), e.address.clone(), e.load_score, e.can_accept))
         .collect()
 }
 
@@ -238,7 +229,6 @@ impl MasterHandler {
     }
 }
 
-
 impl MasterHandler {
     /// Classify a (re)registering worker's running tasks: adopt the
     /// still-assigned ones (through the write path), fence the rest.
@@ -280,8 +270,7 @@ impl MasterHandler {
             }
         };
         if !pending_tasks.is_empty() {
-            let ids: Vec<String> =
-                pending_tasks.iter().map(|t| t.task_id.clone()).collect();
+            let ids: Vec<String> = pending_tasks.iter().map(|t| t.task_id.clone()).collect();
             let cmd = Command::MarkDispatched {
                 task_ids: ids,
                 worker_id: worker_id.to_string(),
@@ -300,9 +289,7 @@ impl MasterHandler {
             term: self.coordinator.term(),
             leader_hint: String::new(),
             checkpoint_triggers,
-            checkpoint_resolutions: self
-                .coordinator
-                .drain_checkpoint_resolutions(worker_id),
+            checkpoint_resolutions: self.coordinator.drain_checkpoint_resolutions(worker_id),
         }
     }
 
@@ -381,6 +368,7 @@ impl MasterHandler {
                 &hb.worker_id,
                 task.last_checkpoint_id.max(0) as u64,
                 task.last_checkpoint_size_bytes.max(0) as u64,
+                task.sink_metrics.as_ref().map(|m| m.into()),
             );
         }
 
@@ -431,7 +419,7 @@ impl MasterHandler {
         // workers plus PENDING tasks of overloaded ones. The claim
         // decision is read-only; the durable mutation is a MarkDispatched
         // command (never steals confirmed-RUNNING tasks).
-        let pending_tasks = if soft_stale || admission_blocked {
+        let mut pending_tasks = if soft_stale || admission_blocked {
             Vec::new()
         } else {
             let claimed = self
@@ -448,18 +436,43 @@ impl MasterHandler {
             }
         };
         if !pending_tasks.is_empty() {
-            info!(
-                "Dispatching {} task(s) to worker {}",
-                pending_tasks.len(),
-                worker_id
-            );
             let ids: Vec<String> = pending_tasks.iter().map(|t| t.task_id.clone()).collect();
             let cmd = Command::MarkDispatched {
                 task_ids: ids,
                 worker_id: worker_id.clone(),
             };
-            if let Err(e) = self.writes.propose(cmd).await {
-                warn!("MarkDispatched proposal failed: {}", e);
+            // Deliver only what durably transferred: `mark_tasks_dispatched`
+            // skips tasks still confirmed-RUNNING under another worker (the
+            // claim of a dead owner's task before eviction), and delivering
+            // such a task would only get the receiver's RUNNING report
+            // fenced as a duplicate.
+            let transferred = match self.writes.propose(cmd).await {
+                Ok(_) => {
+                    pending_tasks.retain(|t| {
+                        let owned = self.coordinator.task_owned_by(&t.task_id, &worker_id);
+                        if !owned {
+                            info!(
+                                "Skipping dispatch of {} to {}: ownership transfer was skipped",
+                                t.task_id, worker_id
+                            );
+                        }
+                        owned
+                    });
+                    true
+                }
+                Err(e) => {
+                    warn!("MarkDispatched proposal failed: {}", e);
+                    false
+                }
+            };
+            if transferred && !pending_tasks.is_empty() {
+                info!(
+                    "Dispatching {} task(s) to worker {}",
+                    pending_tasks.len(),
+                    worker_id
+                );
+            } else {
+                pending_tasks.clear();
             }
         }
 
@@ -506,7 +519,6 @@ impl MasterHandler {
     }
 }
 
-
 /// Whether a heartbeat response carries nothing the worker must act on.
 fn response_has_nothing(r: &HeartbeatResponse) -> bool {
     r.pending_tasks.is_empty()
@@ -534,15 +546,27 @@ impl MasterService for MasterHandler {
         // Running for it (re-attach); only reassigned tasks get fenced.
         self.reattach_tasks(&reg.worker_id, reg.running_task_ids.clone())
             .await;
-        self.workers.write().unwrap().insert(
-            reg.worker_id.clone(),
-            WorkerEntry::new(reg.address.clone()),
-        );
+        self.workers
+            .write()
+            .unwrap()
+            .insert(reg.worker_id.clone(), WorkerEntry::new(reg.address.clone()));
 
+        // Workers should heartbeat the leader: a follower answering with
+        // its own address would park them on a node that cannot dispatch.
+        let leader_address = if self.writes.is_leader() {
+            self.info.advertise_addr.clone()
+        } else {
+            let hint = self.writes.leader_hint();
+            if hint.is_empty() {
+                self.info.advertise_addr.clone()
+            } else {
+                hint
+            }
+        };
         Ok(Response::new(WorkerRegistrationResponse {
             success: true,
             message: "registered".to_string(),
-            leader_address: self.info.advertise_addr.clone(),
+            leader_address,
             term: self.coordinator.term(),
         }))
     }
@@ -567,8 +591,7 @@ impl MasterService for MasterHandler {
         }
         let worker_id = inner.worker_id.clone();
         let mut notified = std::pin::pin!(self.wake.notified());
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         let woken = tokio::select! {
             _ = notified.as_mut() => true,
             _ = tokio::time::sleep_until(deadline) => false,
@@ -659,12 +682,14 @@ impl MasterService for MasterHandler {
         if !is_final
             && report.phase == seatunnel_engine_comm::CheckpointPhase::CheckpointPrepare as i32
         {
-            if let Some((stage_id, completed, participants)) = self.coordinator.note_checkpoint_prepare(
-                &report.job_id,
-                &report.task_id,
-                report.checkpoint_id.max(0) as u64,
-                report.success,
-            ) {
+            if let Some((stage_id, completed, participants)) =
+                self.coordinator.note_checkpoint_prepare(
+                    &report.job_id,
+                    &report.task_id,
+                    report.checkpoint_id.max(0) as u64,
+                    report.success,
+                )
+            {
                 let cmd = Command::CheckpointResolved {
                     job_id: report.job_id.clone(),
                     stage_id,

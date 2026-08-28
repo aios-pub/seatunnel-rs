@@ -256,6 +256,7 @@ pub fn JobDetail() -> impl IntoView {
                                         <th>"Processed"</th>
                                         <th>"Throughput"</th>
                                         <th>"Idle"</th>
+                                        <th>"Sink Delivery"</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -285,6 +286,26 @@ pub fn JobDetail() -> impl IntoView {
                                                     <td>{throughput}</td>
                                                     <td class=idle_class>
                                                         {if task.idle_ms < 0 { "—".to_string() } else { fmt_short_duration(task.idle_ms) }}
+                                                    </td>
+                                                    <td class="mono small">
+                                                        {match &task.sink_metrics {
+                                                            None => "—".to_string(),
+                                                            Some(m) => {
+                                                                let failed = if m.failed > 0 {
+                                                                    format!("  ✗{}", m.failed)
+                                                                } else {
+                                                                    String::new()
+                                                                };
+                                                                format!(
+                                                                    "{:.0}ms  ⇄{}  {}/{}{}",
+                                                                    m.latency_ema_ms,
+                                                                    m.in_flight,
+                                                                    m.delivered,
+                                                                    m.window_secs,
+                                                                    failed,
+                                                                )
+                                                            }
+                                                        }}
                                                     </td>
                                                 </tr>
                                             }

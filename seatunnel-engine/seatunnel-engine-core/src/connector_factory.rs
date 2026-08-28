@@ -128,6 +128,11 @@ where
 pub struct SinkPipeline {
     pub writer: BoxedSinkWriter,
     pub committer: Option<BoxedSinkCommitter>,
+    /// Shared sink-metrics handle the writer records into (`None` for
+    /// sinks without metrics support); the task layer snapshots it into
+    /// task status. Fan-out pipelines surface the FIRST sink's handle
+    /// (per-sink aggregation is not implemented yet).
+    pub metrics: Option<std::sync::Arc<seatunnel_api::sink::SinkMetrics>>,
 }
 
 /// Type-erased transform chain element.
@@ -968,7 +973,10 @@ pub fn create_sink_with_restore(
                     cfg.acks,
                     cfg.transactions_enabled
                 );
-                let mut writer = KafkaSinkWriter::new(cfg)?;
+                // Legacy direct-construction path (no SinkWriterContext):
+                // the handle is surfaced on the SinkPipeline instead.
+                let metrics = std::sync::Arc::new(seatunnel_api::sink::SinkMetrics::new());
+                let mut writer = KafkaSinkWriter::new(cfg, metrics.clone())?;
                 if let Some(bytes) = restore {
                     writer.restore_from_state_bytes(bytes)?;
                 }
@@ -977,6 +985,7 @@ pub fn create_sink_with_restore(
                     committer: Some(Box::new(CommitterAdapter {
                         inner: KafkaSinkCommitter::new(),
                     })),
+                    metrics: Some(metrics),
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -998,6 +1007,7 @@ pub fn create_sink_with_restore(
                         inner: JdbcSinkWriter::new(cfg, None),
                     }),
                     committer: None,
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1029,6 +1039,7 @@ pub fn create_sink_with_restore(
                             cfg.password.clone(),
                         ),
                     })),
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1052,6 +1063,7 @@ pub fn create_sink_with_restore(
                         inner: RedisSinkWriter::new(cfg),
                     }),
                     committer: None,
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1074,6 +1086,7 @@ pub fn create_sink_with_restore(
                         inner: EsSinkWriter::new(cfg, None),
                     }),
                     committer: None,
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1105,6 +1118,7 @@ pub fn create_sink_with_restore(
                 Ok(SinkPipeline {
                     writer: Box::new(SinkWriterAdapter { inner: writer }),
                     committer: None,
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1130,6 +1144,7 @@ pub fn create_sink_with_restore(
                 Ok(SinkPipeline {
                     writer: Box::new(SinkWriterAdapter { inner: writer }),
                     committer: None,
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1154,6 +1169,7 @@ pub fn create_sink_with_restore(
                 Ok(SinkPipeline {
                     writer: Box::new(SinkWriterAdapter { inner: writer }),
                     committer: None,
+                    metrics: None,
                 })
             }
             #[cfg(not(feature = "connectors"))]
@@ -1166,6 +1182,7 @@ pub fn create_sink_with_restore(
                 inner: ConsoleSinkWriter::new("[console] "),
             }),
             committer: None,
+            metrics: None,
         }),
         other => Err(anyhow::anyhow!("unknown sink plugin '{}'", other)),
     }
@@ -1240,6 +1257,7 @@ pub fn create_sink_pipeline(
         .unwrap_or_default();
     let mut writers = Vec::new();
     let mut committers = Vec::new();
+    let mut metrics: Option<std::sync::Arc<seatunnel_api::sink::SinkMetrics>> = None;
     for (idx, sink) in sinks.iter().enumerate() {
         let config = json_to_config_map(&sink.config);
         let name = format!("{}#{}", sink.plugin, idx);
@@ -1247,6 +1265,10 @@ pub fn create_sink_pipeline(
         let pipeline = create_sink_with_restore(&sink.plugin, &config, state)?;
         writers.push((name.clone(), pipeline.writer));
         committers.push((name, pipeline.committer));
+        // Fan-out surfaces the FIRST metrics-capable sink's handle.
+        if metrics.is_none() {
+            metrics = pipeline.metrics;
+        }
     }
     let mux: BoxedSinkWriter = Box::new(crate::fanout::FanoutSinkWriter::new(
         writers,
@@ -1257,6 +1279,7 @@ pub fn create_sink_pipeline(
     Ok(SinkPipeline {
         writer: mux,
         committer,
+        metrics,
     })
 }
 

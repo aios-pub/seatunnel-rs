@@ -80,6 +80,25 @@ impl ClientHandler {
         &self.coordinator
     }
 
+    /// Leadership gate for mutating RPCs: only the leader may propose.
+    /// The error message is a protocol — `seatunnel-engine-client`
+    /// parses "retry at <addr>" to follow the leader, so keep the format
+    /// stable.
+    fn require_leader(&self) -> Result<(), Status> {
+        if self.writes.is_leader() {
+            return Ok(());
+        }
+        let hint = self.writes.leader_hint();
+        Err(Status::failed_precondition(format!(
+            "not the leader; retry at {}",
+            if hint.is_empty() {
+                "another master"
+            } else {
+                &hint
+            }
+        )))
+    }
+
     fn worker_infos(&self) -> Vec<WorkerInfo> {
         // Live per-worker running-task counts from the coordinator's
         // view of assignments.
@@ -89,7 +108,9 @@ impl ClientHandler {
                 if info.state == crate::job_coordinator::JobState::Running
                     && !info.worker_id.is_empty()
                 {
-                    *running_per_worker.entry(info.worker_id.clone()).or_default() += 1;
+                    *running_per_worker
+                        .entry(info.worker_id.clone())
+                        .or_default() += 1;
                 }
             }
         }
@@ -139,13 +160,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             Status::invalid_argument(format!("invalid job config: {}", e))
         })?;
         // Leadership gate: only the leader accepts submissions.
-        if !self.writes.is_leader() {
-            let hint = self.writes.leader_hint();
-            return Err(Status::failed_precondition(format!(
-                "not the leader; retry at {}",
-                if hint.is_empty() { "another master" } else { &hint }
-            )));
-        }
+        self.require_leader()?;
         let workers = registry_snapshot_admission(&self.workers);
         let (job, descriptors, _tasks) = self
             .coordinator
@@ -156,10 +171,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             })?;
         let task_count = descriptors.len();
         let scheduled_id = job.job_id.clone();
-        let cmd = Command::SubmitJob {
-            job,
-            descriptors,
-        };
+        let cmd = Command::SubmitJob { job, descriptors };
         self.writes
             .propose(cmd)
             .await
@@ -189,6 +201,9 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         let req = request.into_inner();
         let job_id = req.job_id;
         tracing::info!("Cancelling job {}", job_id);
+
+        // Same leader gate as submission, same retry hint protocol.
+        self.require_leader()?;
 
         let cancelled = self
             .coordinator
@@ -244,6 +259,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 end_time: job.end_time.unwrap_or(0),
                 last_record_at: info.last_record_at,
                 worker_id: info.worker_id.clone(),
+                sink_metrics: info.sink_metrics.as_ref().map(|m| m.into()),
             })
             .collect();
         tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
@@ -275,14 +291,28 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             .filter(|t| t.state == crate::job_coordinator::JobState::Running)
             .count();
 
+        // Real leadership view: followers report the elected leader (or
+        // "-" while an election is in flight), not themselves.
+        let (leader_id, leader_address) = if self.writes.is_leader() {
+            let me = self.info.advertise_addr.clone();
+            (me.clone(), me)
+        } else {
+            let hint = self.writes.leader_hint();
+            if hint.is_empty() {
+                (String::new(), String::new())
+            } else {
+                (hint.clone(), hint)
+            }
+        };
+
         Ok(Response::new(ClusterInfo {
             available_workers: workers.len() as i32,
             workers,
             total_tasks: total_tasks as i32,
             running_tasks: running_tasks as i32,
-            leader_id: self.info.advertise_addr.clone(),
+            leader_id,
             term: self.coordinator.term(),
-            leader_address: self.info.advertise_addr.clone(),
+            leader_address,
             role: self.info.role.clone(),
         }))
     }

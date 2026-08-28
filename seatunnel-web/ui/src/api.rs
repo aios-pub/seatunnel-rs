@@ -112,6 +112,32 @@ pub struct TaskStatus {
     /// Ms since the last record (-1 = none yet).
     #[serde(default)]
     pub idle_ms: i64,
+    /// Sink delivery metrics (absent when the sink reports nothing).
+    #[serde(default)]
+    pub sink_metrics: Option<SinkMetrics>,
+}
+
+/// Sink-side delivery metrics of one task (windowed, not lifetime).
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
+pub struct SinkMetrics {
+    #[serde(default)]
+    pub window_secs: u64,
+    #[serde(default)]
+    pub sent: u64,
+    #[serde(default)]
+    pub delivered: u64,
+    #[serde(default)]
+    pub failed: u64,
+    #[serde(default)]
+    pub in_flight: u64,
+    #[serde(default)]
+    pub latency_ema_ms: f64,
+    #[serde(default)]
+    pub latency_max_ms: u64,
+    #[serde(default)]
+    pub last_error: String,
+    #[serde(default)]
+    pub last_error_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]

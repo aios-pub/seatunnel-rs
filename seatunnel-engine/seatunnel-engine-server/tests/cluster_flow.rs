@@ -60,7 +60,7 @@ async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
         coordinator.clone(),
         registry.clone(),
         info.clone(),
-        150,  // fast heartbeat for tests
+        150, // fast heartbeat for tests
         60_000,
     );
     let client = ClientHandler::new_direct(coordinator.clone(), registry, info);
@@ -120,8 +120,7 @@ async fn spawn_worker_named(master_addr: &str, worker_id: &str) -> anyhow::Resul
         loop {
             tick.tick().await;
             let tasks = hb_worker.heartbeat_tasks().await;
-            let (load_score, lag_ms, mem_permille, can_accept) =
-                hb_worker.admission_fields().await;
+            let (load_score, lag_ms, mem_permille, can_accept) = hb_worker.admission_fields().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
                     worker_id: hb_worker_id.clone(),
@@ -273,7 +272,7 @@ async fn coordinated_checkpoints_complete_through_cluster() {
         "env": {
             "job.name": "it-checkpoint",
             "parallelism": 2,
-            "checkpoint": { "interval": 300 }
+            "checkpoint": { "interval": 10000 }
         },
         // Plenty of rows so the job is still running while checkpoints fire.
         "source": { "Fake": { "row.num": 200000 } },
@@ -297,7 +296,9 @@ async fn coordinated_checkpoints_complete_through_cluster() {
     // The master is the checkpoint driver: wait until at least one
     // coordinated checkpoint is triggered, prepared by every task and
     // resolved (checkpoints_completed only increments on full resolution).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // 10s interval → the FIRST checkpoint lands no earlier than ~10s after
+    // submit; the deadline must comfortably exceed one full interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -335,8 +336,12 @@ async fn coordinated_checkpoints_complete_through_cluster() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
     let (master_addr, _coordinator) = spawn_master().await.unwrap();
-    let worker_a = spawn_worker_named(&master_addr, "it-worker-a").await.unwrap();
-    let worker_b = spawn_worker_named(&master_addr, "it-worker-b").await.unwrap();
+    let worker_a = spawn_worker_named(&master_addr, "it-worker-a")
+        .await
+        .unwrap();
+    let worker_b = spawn_worker_named(&master_addr, "it-worker-b")
+        .await
+        .unwrap();
 
     // Both workers over their lag watermark BEFORE submission: placement
     // picks a worker but the claim gate keeps the task PENDING — nobody
@@ -372,7 +377,10 @@ async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
     // Nobody may run it while both are over the watermark.
     tokio::time::sleep(Duration::from_millis(700)).await;
     let s = client.get_job_status(&job_id).await.unwrap();
-    assert_ne!(s.state, 3, "task must stay queued while all workers are overloaded");
+    assert_ne!(
+        s.state, 3,
+        "task must stay queued while all workers are overloaded"
+    );
 
     // Worker B recovers (heartbeats tick the hysteresis every 150ms, so
     // the cooldown clears after ~10 beats) and steals A's PENDING task.
@@ -397,10 +405,11 @@ async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
     }
     // And it runs on B (the only accepting worker).
     let s = client.get_job_status(&job_id).await.unwrap();
-    assert!(s
-        .tasks
-        .iter()
-        .all(|t| t.worker_id == "it-worker-b" || t.worker_id.is_empty()));
+    assert!(
+        s.tasks
+            .iter()
+            .all(|t| t.worker_id == "it-worker-b" || t.worker_id.is_empty())
+    );
 
     let _ = client.cancel_job(&job_id).await;
 }
@@ -419,20 +428,26 @@ async fn update_flow_resubmits_same_id_via_shared_path() {
         "env": {
             "job.name": "before-edit",
             "parallelism": 1,
-            "checkpoint": { "interval": 300 }
+            "checkpoint": { "interval": 10000 }
         },
         "source": { "Fake": { "row.num": -1, "sleep.ms": 5 } },
         "sink": { "Console": {} }
     });
     let resp = client
-        .submit_job(&job_id, "before-edit", serde_json::to_vec(&config).unwrap(), 0)
+        .submit_job(
+            &job_id,
+            "before-edit",
+            serde_json::to_vec(&config).unwrap(),
+            0,
+        )
         .await
         .unwrap();
     assert!(resp.success);
 
     // Wait until RUNNING with at least one checkpoint taken (the restore
-    // basis for the update).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // basis for the update). 10s interval → the first checkpoint lands
+    // no earlier than ~10s after submit.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
     loop {
         assert!(tokio::time::Instant::now() < deadline, "job never ran");
         let s = client.get_job_status(&job_id).await.unwrap();
@@ -468,7 +483,10 @@ async fn update_flow_resubmits_same_id_via_shared_path() {
     // The new incarnation runs again under the same id.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "resubmitted job never ran");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resubmitted job never ran"
+        );
         let s = client.get_job_status(&job_id).await.unwrap();
         if s.state == 3 {
             assert_eq!(s.job_name, "after-edit");

@@ -65,6 +65,55 @@ sink:
                    "update": { "score": "score" } } }
 ```
 
+### Multi-table sources & per-table topics
+
+With a CDC source that captures **several tables** (e.g.
+`table-pattern: "shop\\..*"`), each row carries its origin
+`database.table` identity and the encoder keeps one state per table:
+
+- the message `dbName` / `tableName` follow the row's **real** table
+  (not a static config value);
+- every table maps with its **own** columns and primary key, taken from
+  its per-table initial-schema event (automatic mode);
+- the update pairing state is per-table — same-key rows of different
+  tables never mis-pair into updates.
+
+Per-message topic routing:
+
+1. `topic-routes` — a JSON **array** of `{"pattern": ..., "topic": ...}`
+   entries with ANCHORED regexes over the origin `database.table`.
+   EVERY matching entry receives a copy of the message (the Java
+   `table_topic_mappings` fan-out: a table listed under several topics
+   is delivered to each); routes rendering the same topic name deliver
+   only once. Use it to group several tables into one topic, or to
+   double-route one table into several topics.
+2. records matching no route fall back to the `topic` value, which may
+   contain `${database}` / `${table}` placeholders (one topic per
+   table). A template `topic` without row origin (non-CDC sources) is a
+   configuration error — keep a literal topic for those.
+
+```yaml
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    topic: "cdc_${table}"                  # fallback: one topic per table
+    format: canal_client_json
+    topic-routes: >-
+      [
+        {"pattern": "seatunnel\\.orders_.*", "topic": "topic_orders"},
+        {"pattern": "seatunnel\\.(entity_question|entity_school_ksystem)",
+         "topic": "question_html_update_binlog"}
+      ]
+    canal-client.server-time-zone: local   # per-table automatic mapping
+```
+
+Copies fan out with the SAME payload and `requestId`, so consumers
+seeing several topics can dedupe or join by `requestId`. Ordering per
+topic is preserved (one producer, same partition key); delivery stays
+at-least-once per topic — with `transactions.enabled=true` the copies
+become atomically visible together at each checkpoint. See
+`examples/mysql-cdc-multi-table-to-kafka-canal.yaml` for a full job.
+
 ## Sink
 
 ```toml

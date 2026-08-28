@@ -142,6 +142,29 @@ message CheckpointResolution {
   bool completed = 3;
 }
 
+// Windowed sink-side delivery metrics (sliding-window counters, not
+// lifetime totals). Absent when the sink reports nothing yet.
+message SinkMetricsStats {
+  // Sliding window length the counts cover, seconds.
+  uint64 window_secs = 1;
+  // Messages enqueued to the transport within the window.
+  uint64 sent = 2;
+  // Delivery reports acknowledged OK within the window.
+  uint64 delivered = 3;
+  // Delivery reports failed within the window.
+  uint64 failed = 4;
+  // Messages currently in flight (enqueued, report pending).
+  uint64 in_flight = 5;
+  // Exponential moving average of enqueue→report latency, millis.
+  double latency_ema_ms = 6;
+  // Maximum enqueue→report latency within the window, millis.
+  uint64 latency_max_ms = 7;
+  // Detailed last delivery error (full message + context).
+  string last_error = 8;
+  // Epoch-ms of `last_error` (0 = none).
+  int64 last_error_at = 9;
+}
+
 message TaskHeartbeat {
   string task_id = 1;
   TaskState state = 2;
@@ -158,6 +181,8 @@ message TaskHeartbeat {
   // size — visible for every storage backend, unlike payload bytes.
   int64 last_checkpoint_id = 8;
   int64 last_checkpoint_size_bytes = 9;
+  // Latest sink delivery metrics snapshot (absent when not reported).
+  SinkMetricsStats sink_metrics = 10;
 }
 
 // --- Task Status ---
@@ -245,6 +270,8 @@ message TaskStatusInfo {
   int64 last_record_at = 7;
   // Worker currently (or last known) executing this task.
   string worker_id = 8;
+  // Latest sink delivery metrics snapshot (absent when not reported).
+  SinkMetricsStats sink_metrics = 9;
 }
 
 message JobList {

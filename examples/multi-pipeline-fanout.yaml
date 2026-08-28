@@ -13,7 +13,7 @@
 
 env:
   job.name: multi-pipeline-fanout
-  checkpoint.interval: 5000
+  checkpoint.interval: 10000
   # Default failure policy for every pipeline's fan-out sinks:
   #   fail    — any sink failure fails the task (strict at-least-once)
   #   isolate — remove the failed sink, keep the rest running

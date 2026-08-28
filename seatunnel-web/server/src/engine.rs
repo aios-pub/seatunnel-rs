@@ -98,8 +98,12 @@ fn task_state_name(code: i32) -> &'static str {
 pub trait EngineOps: Send + Sync {
     async fn list_jobs(&self) -> Result<Vec<JobSummaryDto>, EngineError>;
     async fn job_status(&self, job_id: &str) -> Result<JobStatusDto, EngineError>;
-    async fn submit_job(&self, job: SubmitJobDto, job_id: String, config_bytes: Vec<u8>)
-        -> Result<SubmitResultDto, EngineError>;
+    async fn submit_job(
+        &self,
+        job: SubmitJobDto,
+        job_id: String,
+        config_bytes: Vec<u8>,
+    ) -> Result<SubmitResultDto, EngineError>;
     async fn cancel_job(&self, job_id: &str) -> Result<(), EngineError>;
     /// Edit-and-restart: cancel (exit checkpoint) → resubmit same id.
     async fn update_job(
@@ -149,6 +153,17 @@ fn status_dto(s: JobStatus) -> JobStatusDto {
                 // Filled in by the handler from consecutive samples.
                 records_per_sec: 0.0,
                 idle_ms: if t.last_record_at > 0 { 0 } else { -1 },
+                sink_metrics: t.sink_metrics.as_ref().map(|m| crate::dto::SinkMetricsDto {
+                    window_secs: m.window_secs,
+                    sent: m.sent,
+                    delivered: m.delivered,
+                    failed: m.failed,
+                    in_flight: m.in_flight,
+                    latency_ema_ms: m.latency_ema_ms,
+                    latency_max_ms: m.latency_max_ms,
+                    last_error: m.last_error.clone(),
+                    last_error_at: m.last_error_at,
+                }),
             })
             .collect(),
     }
@@ -223,7 +238,9 @@ impl EngineOps for EngineClient {
         job_id: String,
         config_bytes: Vec<u8>,
     ) -> Result<SubmitResultDto, EngineError> {
-        let name = job.job_name.unwrap_or_else(|| format!("job-{}", &job_id[4..11]));
+        let name = job
+            .job_name
+            .unwrap_or_else(|| format!("job-{}", &job_id[4..11]));
         let resp = self
             .submit_job(&job_id, &name, config_bytes, job.parallelism.unwrap_or(0))
             .await
@@ -349,6 +366,7 @@ impl FakeEngine {
                 last_record_ms: 1,
                 records_per_sec: 0.0,
                 idle_ms: 0,
+                sink_metrics: None,
             }],
         };
         FakeEngine {

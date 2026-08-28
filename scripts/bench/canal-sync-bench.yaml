@@ -1,0 +1,188 @@
+# ============================================================================
+# canal-sync 压测 job — 与 jobs/configs/canal-sync-consolidated.yaml 完全同构
+# ============================================================================
+# 差异仅在连接信息：全部指向本地 docker 环境
+#   MySQL  127.0.0.1:13306 (seatunnel-rs-mysql-1, root/root, ROW binlog+GTID)
+#   Kafka  127.0.0.1:9092  (seatunnel-rs-kafka-1, topic 自动创建)
+#   RabbitMQ 127.0.0.1:5672 (seatunnel-rs-rabbitmq-1, guest/guest)
+# 表清单 / topic-routes / fan-out 语义 / checkpoint 间隔与生产配置 1:1。
+#
+# 基线运行不含 producer.* 调优参数；压测反馈迭代时在 sink 里加：
+#   producer.linger.ms: 5
+#   producer.compression.codec: lz4
+# ============================================================================
+
+env:
+  job.name: canal-sync-bench
+  parallelism: 1
+  checkpoint.interval: 10000
+
+pipelines:
+
+  # P1 v3 核心库：49+1 表 → 7 topic（含跨 topic 复投）
+  - name: v3-core
+    parallelism: 1
+    source:
+      MySQL-CDC:
+        hostname: 127.0.0.1
+        port: 13306
+        username: root
+        password: root
+        server-id: 5401
+        startup.mode: latest
+        database-names: neworiental_v3,neworiental_user,neworiental_product
+        table-names: >-
+          neworiental_v3.entity_subject,neworiental_v3.entity_public_school,
+          neworiental_v3.entity_private_school,neworiental_v3.link_school_microcourse,
+          neworiental_v3.link_platform_k_microcourse,neworiental_v3.link_schoolk_mirror_mcourse,
+          neworiental_v3.entity_school_ksystem,neworiental_v3.link_qiniu_convert,
+          neworiental_v3.yunying_question_info_topic,neworiental_v3.yunying_question_info_chapter,
+          neworiental_v3.link_teaching_chapter_knowledge,neworiental_v3.entity_res_clip,
+          neworiental_v3.entity_res_courseware,neworiental_v3.entity_exercise_paper,
+          neworiental_v3.counter_res,neworiental_v3.entity_exercise,
+          neworiental_v3.link_respackage_resource,neworiental_v3.base_word,
+          neworiental_v3.entity_course_package,neworiental_v3.link_course_package_resource,
+          neworiental_v3.link_custom_list_resource,neworiental_v3.link_custom_question_resource,
+          neworiental_v3.link_region_list_resource,neworiental_v3.base_word_translation,
+          neworiental_v3.entity_question,neworiental_v3.link_resource_chapter,
+          neworiental_v3.link_question_chapter,neworiental_v3.link_question_topic,
+          neworiental_v3.link_exercise_topic,neworiental_v3.link_resource_topic,
+          neworiental_v3.link_question_exam_sites,neworiental_v3.link_exercise_special,
+          neworiental_v3.link_resource_series,neworiental_v3.entity_question_check,
+          neworiental_v3.link_school_resourcelib_question,neworiental_v3.link_school_resourcelib_material,
+          neworiental_v3.link_school_resourcelib_microcourse,neworiental_v3.link_region_resourcelib_question,
+          neworiental_v3.link_region_resourcelib_resource,neworiental_v3.entity_question_version,
+          neworiental_v3.entity_question_weight,neworiental_v3.entity_teaching_chapter,
+          neworiental_v3.entity_topic,neworiental_v3.entity_teaching_directory,
+          neworiental_v3.entity_special_exam_sites,neworiental_v3.entity_region_list,
+          neworiental_v3.entity_region_list_group,neworiental_v3.entity_ksystem_dict,
+          neworiental_v3.entity_custom_ksystem,
+          neworiental_user.entity_user,neworiental_user.entity_profile_student,
+          neworiental_user.entity_profile_teacher,neworiental_user.entity_profile_parent,
+          neworiental_user.l_extend_user,neworiental_user.l_class_student,
+          neworiental_user.l_class_teacher,neworiental_user.link_student_school,
+          neworiental_product.entity_sku,neworiental_product.entity_sku_extend,
+          neworiental_product.entity_sku_info_json,neworiental_product.entity_sku_pic,
+          neworiental_product.link_item_category
+    sinks:
+      - Kafka:
+          bootstrap.servers: 127.0.0.1:9092
+          format: canal_client_json
+          topic: canal_sync_route_unmatched
+          canal-client.server-time-zone: local
+          topic-routes: >-
+            [
+              {"pattern": "neworiental_v3\\.entity_(subject|public_school|private_school|school_ksystem)", "topic": "ai_learn_ok_class_topic"},
+              {"pattern": "neworiental_v3\\.link_(school_microcourse|platform_k_microcourse|schoolk_mirror_mcourse|qiniu_convert)", "topic": "ai_learn_ok_class_topic"},
+              {"pattern": "neworiental_user\\.entity_user", "topic": "ai_learn_ok_class_topic"},
+              {"pattern": "neworiental_product\\.entity_sku_pic", "topic": "ai_learn_ok_class_topic"},
+              {"pattern": "neworiental_v3\\.yunying_question_info_(topic|chapter)", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.link_teaching_chapter_knowledge", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.counter_res", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.base_word(_translation)?", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.entity_(public_school|res_clip|res_courseware|exercise_paper|exercise|course_package|question_check|question_version|question_weight)", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.link_(respackage_resource|course_package_resource|custom_list_resource|custom_question_resource|region_list_resource|resource_chapter|question_chapter|question_topic|exercise_topic|resource_topic|question_exam_sites|exercise_special|resource_series)", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.link_(school_resourcelib_(question|material|microcourse)|region_resourcelib_(question|resource))", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.entity_question", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.entity_school_ksystem", "topic": "resource_binlog"},
+              {"pattern": "neworiental_v3\\.entity_question", "topic": "question_html_update_binlog"},
+              {"pattern": "neworiental_v3\\.entity_(teaching_chapter|topic|teaching_directory|school_ksystem|special_exam_sites|region_list|region_list_group)", "topic": "sub_catelog_binlog"},
+              {"pattern": "neworiental_v3\\.entity_(ksystem_dict|custom_ksystem|region_list|special_exam_sites|teaching_chapter|teaching_directory|topic|region_list_group)", "topic": "sub_knowledge_binlog"},
+              {"pattern": "neworiental_user\\.(entity_user|entity_profile_(student|teacher|parent)|l_extend_user|l_class_(student|teacher)|link_student_school)", "topic": "user_binlog"},
+              {"pattern": "neworiental_product\\.entity_(sku|sku_extend|sku_info_json)", "topic": "product_binlog"},
+              {"pattern": "neworiental_product\\.link_item_category", "topic": "product_binlog"}
+            ]
+
+  # P2 ailearn 库：18 表 → ai_learn_ok_class_topic
+  - name: ailearn
+    parallelism: 1
+    source:
+      MySQL-CDC:
+        hostname: 127.0.0.1
+        port: 13306
+        username: root
+        password: root
+        server-id: 5402
+        startup.mode: latest
+        table-names: >-
+          ailearn_okminicourse.ailearn_minicourse_v2,ailearn_okminicourse.ailearn_minicourse_content,
+          ailearn_okminicourse.ailearn_minicourse_latest_version,ailearn_okminicourse.link_minicourse_attach_v2,
+          ailearn_okminicourse.link_entity_tag,ailearn_okminicourse.ailearn_tag,
+          ailearn-english.english_dictionary_words,
+          ailearn_okminicourse.ailearn_resources_resource,ailearn_okminicourse.link_resources_attach,
+          ailearn_okminicourse.ailearn_minicourse_goods,ailearn_okminicourse.link_coupon_goods,
+          ailearn_okminicourse.ailearn_goods_coupon,ailearn_okminicourse.link_minicourse_goods,
+          ailearn_okminicourse.link_minicourse_serve_timetable,ailearn_okminicourse.link_goods_school_collect,
+          ailearn_okminicourse.ailearn_minicourse_img,ailearn_okminicourse.link_minicourse_resource,
+          ailearn_okminicourse.ailearn_account,ailearn_okminicourse.link_account_attach
+    sinks:
+      - Kafka:
+          bootstrap.servers: 127.0.0.1:9092
+          format: canal_client_json
+          topic: ai_learn_ok_class_topic
+          canal-client.server-time-zone: local
+
+  # P3 recommand 库：22 表（0-9 分表）→ teacher_ksystem_recommand_binlog
+  - name: recommand
+    parallelism: 1
+    source:
+      MySQL-CDC:
+        hostname: 127.0.0.1
+        port: 13306
+        username: root
+        password: root
+        server-id: 5403
+        startup.mode: latest
+        table-pattern: "neworiental_data_recommand\\.entity_((question|resource)_lib_\\d|question_used|resource_used)"
+    sinks:
+      - Kafka:
+          bootstrap.servers: 127.0.0.1:9092
+          format: canal_client_json
+          topic: teacher_ksystem_recommand_binlog
+          canal-client.server-time-zone: local
+
+  # P4 kefu 库：1 表 → kefu_binlog
+  - name: kefu
+    parallelism: 1
+    source:
+      MySQL-CDC:
+        hostname: 127.0.0.1
+        port: 13306
+        username: root
+        password: root
+        server-id: 5404
+        startup.mode: latest
+        table-names: ailearn_kefu.repository_content
+    sinks:
+      - Kafka:
+          bootstrap.servers: 127.0.0.1:9092
+          format: canal_client_json
+          topic: kefu_binlog
+          canal-client.server-time-zone: local
+
+  # P5 userRole → RabbitMQ（独立 pipeline；与 P1 重复捕获 entity_user）
+  - name: user-role-rabbitmq
+    parallelism: 1
+    source:
+      MySQL-CDC:
+        hostname: 127.0.0.1
+        port: 13306
+        username: root
+        password: root
+        server-id: 5405
+        startup.mode: latest
+        table-names: >-
+          neworiental_user.entity_user,neworiental_user.link_district_user_role,
+          neworiental_v3.entity_org_admin
+    sinks:
+      - RabbitMQ:
+          host: 127.0.0.1
+          port: 5672
+          username: bench
+          password: bench123
+          exchange: exchange_canal_sync_user
+          queue-name: queue_canal_sync_user
+          routing-key: queue_canal_sync_user
+          format: json
+          persistent: true
+          publisher-confirm: true

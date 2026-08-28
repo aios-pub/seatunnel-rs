@@ -124,7 +124,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 impl LogInner {
-    fn append_lines(&mut self, entries: impl Iterator<Item = Entry<Types>>) -> Result<(), StorageError<u64>> {
+    fn append_lines(
+        &mut self,
+        entries: impl Iterator<Item = Entry<Types>>,
+    ) -> Result<(), StorageError<u64>> {
         let path = self.dir.join("log.jsonl");
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -160,11 +163,7 @@ impl RaftLogReader<Types> for FileLogReader {
         range: RB,
     ) -> Result<Vec<Entry<Types>>, StorageError<u64>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .entries
-            .range(range)
-            .map(|(_, e)| e.clone())
-            .collect())
+        Ok(inner.entries.range(range).map(|(_, e)| e.clone()).collect())
     }
 }
 
@@ -175,11 +174,7 @@ impl RaftLogReader<Types> for FileLogStore {
         range: RB,
     ) -> Result<Vec<Entry<Types>>, StorageError<u64>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .entries
-            .range(range)
-            .map(|(_, e)| e.clone())
-            .collect())
+        Ok(inner.entries.range(range).map(|(_, e)| e.clone()).collect())
     }
 }
 
@@ -201,28 +196,43 @@ impl RaftLogStorage<Types> for FileLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        let inner = self.inner.lock().unwrap();
         let bytes = serde_json::to_vec(vote).map_err(storage_err)?;
-        write_atomic(&inner.dir.join("vote.json"), &bytes).map_err(storage_err)?;
-        drop(inner);
-        self.inner.lock().unwrap().vote = Some(*vote);
-        Ok(())
+        let path = self.inner.lock().unwrap().dir.join("vote.json");
+        let inner = Arc::clone(&self.inner);
+        let vote = *vote;
+        // fsync off the async runtime: a blocked reactor delays raft
+        // ticks/heartbeats, which ages leader contact and triggers
+        // elections.
+        tokio::task::spawn_blocking(move || {
+            write_atomic(&path, &bytes).map_err(storage_err)?;
+            inner.lock().unwrap().vote = Some(vote);
+            Ok(())
+        })
+        .await
+        .map_err(|e| storage_err(e))?
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         Ok(self.inner.lock().unwrap().vote)
     }
 
-    async fn append<I>(&mut self, entries: I, callback: openraft::storage::LogFlushed<Types>) -> Result<(), StorageError<u64>>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: openraft::storage::LogFlushed<Types>,
+    ) -> Result<(), StorageError<u64>>
     where
         I: IntoIterator<Item = Entry<Types>> + Send,
         I::IntoIter: Send,
     {
         let collected: Vec<Entry<Types>> = entries.into_iter().collect();
-        let res = {
-            let mut inner = self.inner.lock().unwrap();
+        let inner = Arc::clone(&self.inner);
+        let res = tokio::task::spawn_blocking(move || {
+            let mut inner = inner.lock().unwrap();
             inner.append_lines(collected.into_iter())
-        };
+        })
+        .await
+        .map_err(|e| storage_err(e))?;
         // openraft expects the callback regardless of ordering; call it
         // with the outcome once persistence completed.
         let io_result = match &res {
@@ -240,17 +250,27 @@ impl RaftLogStorage<Types> for FileLogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.entries.retain(|idx, _| *idx < log_id.index);
-        inner.rewrite_log()
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut inner = inner.lock().unwrap();
+            inner.entries.retain(|idx, _| *idx < log_id.index);
+            inner.rewrite_log()
+        })
+        .await
+        .map_err(|e| storage_err(e))?
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.entries.retain(|idx, _| *idx > log_id.index);
-        inner.last_purged = Some(log_id);
-        inner.rewrite_log()?;
-        let bytes = serde_json::to_vec(&log_id).map_err(storage_err)?;
-        write_atomic(&inner.dir.join("purged.json"), &bytes).map_err(storage_err)
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut inner = inner.lock().unwrap();
+            inner.entries.retain(|idx, _| *idx > log_id.index);
+            inner.last_purged = Some(log_id);
+            inner.rewrite_log()?;
+            let bytes = serde_json::to_vec(&log_id).map_err(storage_err)?;
+            write_atomic(&inner.dir.join("purged.json"), &bytes).map_err(storage_err)
+        })
+        .await
+        .map_err(|e| storage_err(e))?
     }
 }

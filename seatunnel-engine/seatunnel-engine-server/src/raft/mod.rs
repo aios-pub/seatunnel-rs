@@ -41,6 +41,7 @@ use openraft::BasicNode;
 use tracing::{info, warn};
 
 use crate::job_coordinator::{Command, CommandResult, JobCoordinator};
+use crate::server_config::RaftTiming;
 
 openraft::declare_raft_types!(
     /// Types of this engine's raft instance: commands as log payloads.
@@ -97,14 +98,23 @@ pub async fn start_node(
     members: Members,
     coordinator: Arc<JobCoordinator>,
     dir: std::path::PathBuf,
+    timing: RaftTiming,
 ) -> anyhow::Result<Arc<Raft>> {
+    // Per-node election window (member-list order = priority order).
+    // openraft draws the timeout ONCE per process and every follower
+    // counts from the leader's last heartbeat; without disjoint windows
+    // two survivors can campaign in lockstep forever (split vote every
+    // round, term inflation, no leader). With them, the lowest live
+    // voter always fires first and the others grant its vote.
+    let (election_min, election_max) = timing.election_window(node_id);
     let config = openraft::Config {
         cluster_name: "seatunnel-engine".to_string(),
-        // Fast failover (~1s election) is safe BECAUSE there is a quorum:
-        // the Java engine needs 180s only because it has none.
-        election_timeout_min: 800,
-        election_timeout_max: 1_600,
-        heartbeat_interval: 150,
+        // Fast failover is safe BECAUSE there is a quorum: the Java
+        // engine needs 180s only because it has none. Voter 1's window
+        // is [min, max); voter i's is shifted by (i-1)*skew.
+        election_timeout_min: election_min,
+        election_timeout_max: election_max,
+        heartbeat_interval: timing.heartbeat_interval_ms,
         install_snapshot_timeout: 5_000,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
             SNAPSHOT_EVERY_N_LOGS.try_into().expect("positive"),
@@ -113,14 +123,18 @@ pub async fn start_node(
         ..Default::default()
     };
     let config = Arc::new(config.validate()?);
+    info!(
+        "Raft: node {} election window {}-{}ms (skew {}ms, heartbeat {}ms) — \
+         member-list order is the leader priority order",
+        node_id, election_min, election_max, timing.election_skew_ms, timing.heartbeat_interval_ms
+    );
 
     std::fs::create_dir_all(&dir)?;
     let log_store = log_store::FileLogStore::new(&dir)?;
     let state_machine = state_machine::CoordinatorStateMachine::new(coordinator, &dir).await?;
 
-    let network = network::GrpcNetworkFactory {
-        members: members.clone(),
-    };
+    let mut network = network::GrpcNetworkFactory::default();
+    network.members = members.clone();
     let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
     // Membership bootstrap: node 1 owns it; later members join via
@@ -279,7 +293,12 @@ impl WritePath for RaftWrite {
 
 /// Watch raft metrics into the shared leader view + the coordinator's
 /// fencing term (the wire term IS the raft term).
-pub fn spawn_leader_watcher(raft: Raft, my_id: u64, leader: LeaderView, coordinator: Arc<JobCoordinator>) {
+pub fn spawn_leader_watcher(
+    raft: Raft,
+    my_id: u64,
+    leader: LeaderView,
+    coordinator: Arc<JobCoordinator>,
+) {
     tokio::spawn(async move {
         let mut rx = raft.metrics();
         loop {

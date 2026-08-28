@@ -32,6 +32,11 @@ use super::{Field, RowKind};
 pub struct Row {
     pub kind: RowKind,
     pub fields: Vec<Field>,
+    /// Origin table identity in `database.table` form, set by CDC sources
+    /// so sinks can stamp/route per-table (e.g. canal-client dbName /
+    /// tableName, Kafka topic templates). `None` for rows whose source
+    /// has no table identity (static queries, generated data).
+    pub origin_table: Option<String>,
 }
 
 impl Row {
@@ -40,6 +45,7 @@ impl Row {
         Row {
             kind: RowKind::Insert,
             fields: vec![Field::Null; field_count],
+            origin_table: None,
         }
     }
 
@@ -48,6 +54,7 @@ impl Row {
         Row {
             kind,
             fields: vec![Field::Null; field_count],
+            origin_table: None,
         }
     }
 
@@ -90,6 +97,7 @@ impl Default for Row {
 pub struct RowBuilder {
     fields: Vec<Field>,
     kind: RowKind,
+    origin_table: Option<String>,
 }
 
 impl RowBuilder {
@@ -97,6 +105,7 @@ impl RowBuilder {
         RowBuilder {
             fields: Vec::new(),
             kind,
+            origin_table: None,
         }
     }
 
@@ -105,10 +114,17 @@ impl RowBuilder {
         self
     }
 
+    /// Attach the origin table identity (`database.table`).
+    pub fn with_origin_table(mut self, origin: impl Into<String>) -> Self {
+        self.origin_table = Some(origin.into());
+        self
+    }
+
     pub fn build(self) -> Row {
         Row {
             kind: self.kind,
             fields: self.fields,
+            origin_table: self.origin_table,
         }
     }
 }

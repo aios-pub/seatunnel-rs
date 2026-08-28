@@ -24,8 +24,8 @@
 //! restarted worker resumes from the last binlog position / offset.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -236,12 +236,10 @@ impl WorkerNode {
     pub fn observe_term(&self, seen: u64) -> u64 {
         let mut current = self.term.load(Ordering::SeqCst);
         while seen > current {
-            match self.term.compare_exchange(
-                current,
-                seen,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .term
+                .compare_exchange(current, seen, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return seen,
                 Err(actual) => current = actual,
             }
@@ -260,7 +258,9 @@ impl WorkerNode {
         if response.term < self.term() {
             warn!(
                 "Worker {}: ignoring instructions from master term {} (highest seen {})",
-                self.worker_id, response.term, self.term()
+                self.worker_id,
+                response.term,
+                self.term()
             );
             return false;
         }
@@ -457,25 +457,25 @@ impl WorkerNode {
     pub async fn heartbeat_tasks(&self) -> Vec<seatunnel_engine_comm::TaskHeartbeat> {
         let mut out = Vec::with_capacity(self.running_tasks.lock().await.len());
         for (tid, handle) in self.running_tasks.lock().await.iter_mut() {
-            let (records, last_record_at, logs, last_cp) = match (&handle.status, &handle.logs) {
-                (Some(status), Some(ring)) => {
-                    let snapshot = status.lock().await;
-                    let entries = ring.entries_after(handle.log_cursor);
-                    handle.log_cursor = ring.cursor();
-                    let lines = entries.iter().map(|e| e.render()).collect::<Vec<_>>();
-                    let checkpoint = (
-                        snapshot.last_checkpoint_id,
-                        snapshot.last_checkpoint_size,
-                    );
-                    (
-                        snapshot.processed_records,
-                        snapshot.last_record_at,
-                        lines,
-                        checkpoint,
-                    )
-                }
-                _ => (0, 0, Vec::new(), (0, 0)),
-            };
+            let (records, last_record_at, logs, last_cp, sink_metrics) =
+                match (&handle.status, &handle.logs) {
+                    (Some(status), Some(ring)) => {
+                        let snapshot = status.lock().await;
+                        let entries = ring.entries_after(handle.log_cursor);
+                        handle.log_cursor = ring.cursor();
+                        let lines = entries.iter().map(|e| e.render()).collect::<Vec<_>>();
+                        let checkpoint =
+                            (snapshot.last_checkpoint_id, snapshot.last_checkpoint_size);
+                        (
+                            snapshot.processed_records,
+                            snapshot.last_record_at,
+                            lines,
+                            checkpoint,
+                            snapshot.sink_metrics.clone(),
+                        )
+                    }
+                    _ => (0, 0, Vec::new(), (0, 0), None),
+                };
             out.push(seatunnel_engine_comm::TaskHeartbeat {
                 task_id: tid.clone(),
                 state: 2, // TASK_RUNNING
@@ -486,6 +486,7 @@ impl WorkerNode {
                 logs,
                 last_checkpoint_id: last_cp.0 as i64,
                 last_checkpoint_size_bytes: last_cp.1 as i64,
+                sink_metrics: sink_metrics.map(|m| m.into()),
             });
         }
         out
@@ -830,8 +831,9 @@ async fn run_pipeline(
 
     // Sink side: pipeline descriptors carry a sink LIST (fan-out through
     // the FanoutSinkWriter mux); legacy descriptors fall back to a single
-    // sink.plugin/sink.config pair.
-    let writer = if let Some(sinks_raw) = cfg.get("pipeline.sinks") {
+    // sink.plugin/sink.config pair. The full SinkPipeline is kept so the
+    // writer's shared metrics handle can ride along into the task group.
+    let (writer, sink_metrics) = if let Some(sinks_raw) = cfg.get("pipeline.sinks") {
         let sinks: Vec<seatunnel_engine_core::connector_factory::SinkDeclaration> =
             serde_json::from_str(sinks_raw)?;
         let policy = seatunnel_engine_core::fanout::SinkFailurePolicy::parse(
@@ -846,7 +848,9 @@ async fn run_pipeline(
             sinks.len(),
             policy
         );
-        create_sinks(&sinks, policy)?
+        let pipeline =
+            seatunnel_engine_core::connector_factory::create_sink_pipeline(&sinks, policy, None)?;
+        (pipeline.writer, pipeline.metrics)
     } else {
         let sink_plugin = cfg
             .get("sink.plugin")
@@ -855,12 +859,19 @@ async fn run_pipeline(
         let sink_value: serde_json::Value =
             serde_json::from_str(cfg.get("sink.config").map(String::as_str).unwrap_or("{}"))?;
         let sink_config = seatunnel_engine_core::connector_factory::json_to_config_map(&sink_value);
-        create_sink(sink_plugin, &sink_config)?
+        let pipeline = seatunnel_engine_core::connector_factory::create_sink_with_restore(
+            sink_plugin,
+            &sink_config,
+            None,
+        )?;
+        (pipeline.writer, pipeline.metrics)
     };
 
     // Coordinated checkpoints: the master drives; this task's gate
     // receives barrier triggers and completion events over heartbeats.
-    let checkpoint_handle = worker.checkpoint_handle_for(&task.task_id, &task.job_id).await;
+    let checkpoint_handle = worker
+        .checkpoint_handle_for(&task.task_id, &task.job_id)
+        .await;
 
     let context = seatunnel_engine_core::task_group::TaskContext::new(
         task.task_id.clone(),
@@ -874,6 +885,9 @@ async fn run_pipeline(
     .with_checkpoint_handle(checkpoint_handle);
 
     let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
+    if let Some(metrics) = sink_metrics {
+        group = group.with_sink_metrics(metrics);
+    }
     // Expose live metrics/logs to the heartbeat before the loop starts.
     worker
         .attach_task_metrics(&task.task_id, group.status(), group.logs().clone())
@@ -924,10 +938,7 @@ impl CheckpointForwarder {
             );
             return;
         };
-        if let Err(e) = client
-            .report_checkpoint(tonic::Request::new(report))
-            .await
-        {
+        if let Err(e) = client.report_checkpoint(tonic::Request::new(report)).await {
             warn!("report_checkpoint failed: {}", e);
         }
     }
@@ -961,7 +972,12 @@ impl CheckpointForwarder {
                     //    (local disk already holds the state).
                     if let Some(store) = &self.s3_store {
                         store
-                            .save(&job_id, &report.task_id, report.checkpoint_id, &report.reader_state)
+                            .save(
+                                &job_id,
+                                &report.task_id,
+                                report.checkpoint_id,
+                                &report.reader_state,
+                            )
                             .await;
                     }
 
@@ -1076,10 +1092,7 @@ mod tests {
                     ("sink.plugin".to_string(), "Console".to_string()),
                     ("sink.config".to_string(), "{}".to_string()),
                     ("transform.config".to_string(), "[]".to_string()),
-                    (
-                        "checkpoint.interval".to_string(),
-                        "60000".to_string(),
-                    ),
+                    ("checkpoint.interval".to_string(), "60000".to_string()),
                 ]),
             }],
             cancel_jobs: vec!["j-doomed".into()],

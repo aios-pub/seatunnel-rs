@@ -123,8 +123,9 @@ pub struct TaskInfo {
     pub last_checkpoint_size: u64,
     /// Bounded tail of task log lines shipped by worker heartbeats.
     pub logs: std::collections::VecDeque<String>,
+    /// Latest sink delivery metrics snapshot from heartbeats (windowed).
+    pub sink_metrics: Option<seatunnel_api::sink::SinkMetricsSnapshot>,
 }
-
 
 // ---------------------------------------------------------------------------
 // Serializable state records: shared by HA export/import and the Raft
@@ -198,7 +199,6 @@ fn one() -> u64 {
     1
 }
 
-
 // ---------------------------------------------------------------------------
 // Raft command log: every durable coordinator mutation is one Command.
 // The leader computes non-deterministic inputs (worker snapshot, plan,
@@ -209,8 +209,14 @@ fn one() -> u64 {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Install a fully compiled job plan (leader pre-computes placement).
-    SubmitJob { job: JobDto, descriptors: Vec<TaskDto> },
-    CancelJob { job_id: String, at_ms: i64 },
+    SubmitJob {
+        job: JobDto,
+        descriptors: Vec<TaskDto>,
+    },
+    CancelJob {
+        job_id: String,
+        at_ms: i64,
+    },
     /// A task lifecycle transition rolled up to job state.
     TaskStatus {
         job_id: String,
@@ -227,7 +233,9 @@ pub enum Command {
     },
     /// A worker left the cluster (crash or graceful unregister): its
     /// non-terminal tasks become claimable again.
-    EvictWorker { worker_id: String },
+    EvictWorker {
+        worker_id: String,
+    },
     /// Re-attach still-assigned tasks to a returning worker.
     AdoptTasks {
         worker_id: String,
@@ -235,7 +243,11 @@ pub enum Command {
     },
     /// Allocate a coordinated checkpoint id for a pipeline and open the
     /// pending set (participants derived from applied state).
-    CheckpointTriggered { job_id: String, stage_id: String, at_ms: i64 },
+    CheckpointTriggered {
+        job_id: String,
+        stage_id: String,
+        at_ms: i64,
+    },
     /// Resolve a coordinated checkpoint (complete or abort): counters,
     /// per-task ids and the worker resolution outbox.
     CheckpointResolved {
@@ -246,7 +258,9 @@ pub enum Command {
         participants: Vec<(String, String)>,
     },
     /// Observe a fencing term (legacy merge path; Raft term ratchets too).
-    ObserveTerm { term: u64 },
+    ObserveTerm {
+        term: u64,
+    },
 }
 
 /// Result of applying one command (Raft AppDataResponse).
@@ -273,6 +287,7 @@ impl TaskInfo {
             last_checkpoint_id: 0,
             last_checkpoint_size: 0,
             logs: std::collections::VecDeque::new(),
+            sink_metrics: None,
         }
     }
 
@@ -329,7 +344,8 @@ pub struct JobCoordinator {
     pending_checkpoints: RwLock<HashMap<(String, String), PendingCheckpoint>>,
     /// Resolution events waiting for the owning worker's next heartbeat,
     /// keyed by worker_id.
-    checkpoint_outbox: std::sync::Mutex<HashMap<String, Vec<seatunnel_engine_comm::CheckpointResolution>>>,
+    checkpoint_outbox:
+        std::sync::Mutex<HashMap<String, Vec<seatunnel_engine_comm::CheckpointResolution>>>,
     /// Preemption fence events (task ids a worker must stop because
     /// another worker owns/executes them), delivered via heartbeats.
     preempt_outbox: std::sync::Mutex<HashMap<String, Vec<String>>>,
@@ -516,12 +532,10 @@ impl JobCoordinator {
     pub fn observe_term(&self, seen: u64) -> u64 {
         let mut current = self.term.load(Ordering::SeqCst);
         while seen > current {
-            match self.term.compare_exchange(
-                current,
-                seen,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .term
+                .compare_exchange(current, seen, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return seen,
                 Err(actual) => current = actual,
             }
@@ -540,13 +554,8 @@ impl JobCoordinator {
         parallelism_override: Option<usize>,
         workers: &[(String, String, u32, bool)],
     ) -> anyhow::Result<(JobDto, Vec<TaskDto>, Vec<TaskDescriptor>)> {
-        let (job_dto, dtos, tasks) = self.compile_plan_inner(
-            job_id,
-            job_name,
-            config,
-            parallelism_override,
-            workers,
-        )?;
+        let (job_dto, dtos, tasks) =
+            self.compile_plan_inner(job_id, job_name, config, parallelism_override, workers)?;
         Ok((job_dto, dtos, tasks))
     }
 
@@ -632,15 +641,11 @@ impl JobCoordinator {
                 let pick = workers
                     .iter()
                     .filter(|(_, _, _, can_accept)| *can_accept)
-                    .min_by_key(|(id, _, score, _)| {
-                        (*score, load.get(id).copied().unwrap_or(0))
-                    })
+                    .min_by_key(|(id, _, score, _)| (*score, load.get(id).copied().unwrap_or(0)))
                     .or_else(|| {
-                        workers
-                            .iter()
-                            .min_by_key(|(id, _, score, _)| {
-                                (*score, load.get(id).copied().unwrap_or(0))
-                            })
+                        workers.iter().min_by_key(|(id, _, score, _)| {
+                            (*score, load.get(id).copied().unwrap_or(0))
+                        })
                     });
                 let (worker_id, worker_addr, _, _) = pick.unwrap_or(&workers[0]);
                 *load.entry(worker_id.clone()).or_default() += 1;
@@ -795,7 +800,11 @@ impl JobCoordinator {
                             state: JobState::from(t.state.as_str()),
                             processed_records: t.processed_records,
                             error: t.error,
-                            ..TaskInfo::new(t.task_id.clone(), t.stage_id.clone(), t.worker_id.clone())
+                            ..TaskInfo::new(
+                                t.task_id.clone(),
+                                t.stage_id.clone(),
+                                t.worker_id.clone(),
+                            )
                         },
                     )
                 })
@@ -946,6 +955,50 @@ impl JobCoordinator {
             }
         }
         out
+    }
+
+    /// Evict a dead worker: mark its non-terminal tasks claimable again
+    /// (the heartbeat claim rule takes over from here). Returns the
+    /// affected task ids (for logging).
+    /// Workers owning non-terminal tasks (Deploying/Running), per the
+    /// replicated state. Input for leadership-change reconciliation: an
+    /// owner absent from the (leader-local) registry is either a worker
+    /// that has not re-registered yet or a dead one whose tasks must be
+    /// released.
+    pub fn task_owning_workers(&self) -> Vec<String> {
+        let jobs = self.jobs.read();
+        let mut owners = std::collections::BTreeSet::new();
+        for job in jobs.values() {
+            if job.state.is_terminal() {
+                continue;
+            }
+            for info in job.tasks.values() {
+                if !info.worker_id.is_empty()
+                    && matches!(info.state, JobState::Deploying | JobState::Running)
+                {
+                    owners.insert(info.worker_id.clone());
+                }
+            }
+        }
+        owners.into_iter().collect()
+    }
+
+    /// Whether a task is durably assigned (Deploying/Running) to the given
+    /// worker — the delivery check after a `MarkDispatched` proposal: the
+    /// claim may have picked a task whose ownership transfer was skipped
+    /// (still Running under another worker), and delivering it anyway
+    /// would only get the receiver's RUNNING report fenced.
+    pub fn task_owned_by(&self, task_id: &str, worker_id: &str) -> bool {
+        let jobs = self.jobs.read();
+        jobs.values().any(|j| {
+            j.tasks
+                .get(task_id)
+                .map(|t| {
+                    t.worker_id == worker_id
+                        && matches!(t.state, JobState::Deploying | JobState::Running)
+                })
+                .unwrap_or(false)
+        })
     }
 
     /// Evict a dead worker: mark its non-terminal tasks claimable again
@@ -1141,9 +1194,8 @@ impl JobCoordinator {
                 if let Some(existing) = jobs.get_mut(&dto.job_id) {
                     // The checkpoint id counter never rewinds, even when
                     // the local job record is otherwise kept (local wins).
-                    existing.next_checkpoint_id = existing
-                        .next_checkpoint_id
-                        .max(dto.next_checkpoint_id);
+                    existing.next_checkpoint_id =
+                        existing.next_checkpoint_id.max(dto.next_checkpoint_id);
                     continue;
                 }
                 let tasks: HashMap<String, TaskInfo> = dto
@@ -1156,7 +1208,11 @@ impl JobCoordinator {
                                 state: JobState::from(t.state.as_str()),
                                 processed_records: t.processed_records,
                                 error: t.error,
-                                ..TaskInfo::new(t.task_id.clone(), t.stage_id.clone(), t.worker_id.clone())
+                                ..TaskInfo::new(
+                                    t.task_id.clone(),
+                                    t.stage_id.clone(),
+                                    t.worker_id.clone(),
+                                )
                             },
                         )
                     })
@@ -1262,7 +1318,7 @@ impl JobCoordinator {
         self.import_state(snapshot).await;
     }
 
-/// Deterministic command application — the Raft state machine core.
+    /// Deterministic command application — the Raft state machine core.
     /// Every input the command needs (plans, timestamps, resolutions) was
     /// computed by the leader; replay on any node yields the same state.
     pub fn apply_command(&self, cmd: &Command) -> CommandResult {
@@ -1298,11 +1354,19 @@ impl JobCoordinator {
                 error,
             } => {
                 self.report_task_status_from(
-                    worker_id, job_id, task_id, state, *records, error.clone(),
+                    worker_id,
+                    job_id,
+                    task_id,
+                    state,
+                    *records,
+                    error.clone(),
                 );
                 CommandResult::Ok
             }
-            Command::MarkDispatched { task_ids, worker_id } => {
+            Command::MarkDispatched {
+                task_ids,
+                worker_id,
+            } => {
                 self.mark_tasks_dispatched(task_ids, worker_id);
                 CommandResult::Ok
             }
@@ -1310,7 +1374,10 @@ impl JobCoordinator {
                 self.evict_worker(worker_id);
                 CommandResult::Ok
             }
-            Command::AdoptTasks { worker_id, task_ids } => {
+            Command::AdoptTasks {
+                worker_id,
+                task_ids,
+            } => {
                 self.adopt_tasks(worker_id, task_ids);
                 CommandResult::Ok
             }
@@ -1417,14 +1484,13 @@ impl JobCoordinator {
         }
         let mut outbox = self.checkpoint_outbox.lock().unwrap();
         for (task_id, worker_id) in participants {
-            outbox
-                .entry(worker_id.clone())
-                .or_default()
-                .push(seatunnel_engine_comm::CheckpointResolution {
+            outbox.entry(worker_id.clone()).or_default().push(
+                seatunnel_engine_comm::CheckpointResolution {
                     task_id: task_id.clone(),
                     checkpoint_id,
                     completed,
-                });
+                },
+            );
         }
     }
 
@@ -1505,6 +1571,20 @@ impl JobCoordinator {
                 drop(jobs);
                 self.queue_preemption(worker_id, task_id);
                 let _ = owner;
+                return;
+            }
+            if new_state.is_terminal()
+                && task.state == JobState::Running
+                && !worker_id.is_empty()
+                && task.worker_id != worker_id
+            {
+                // A stale copy from a deposed owner (its dispatch was
+                // fenced above) must not clobber the task's terminal
+                // transition while the current owner keeps running it.
+                warn!(
+                    "Task {} reported {} by {} but owned by {}; ignoring stale report",
+                    task_id, state, worker_id, task.worker_id
+                );
                 return;
             }
             if new_state.is_terminal()
@@ -1606,6 +1686,7 @@ impl JobCoordinator {
         worker_id: &str,
         last_checkpoint_id: u64,
         last_checkpoint_size: u64,
+        sink_metrics: Option<seatunnel_api::sink::SinkMetricsSnapshot>,
     ) {
         let mut jobs = self.jobs.write();
         for job in jobs.values_mut() {
@@ -1620,6 +1701,9 @@ impl JobCoordinator {
                 if last_checkpoint_id > task.last_checkpoint_id {
                     task.last_checkpoint_id = last_checkpoint_id;
                     task.last_checkpoint_size = last_checkpoint_size;
+                }
+                if sink_metrics.is_some() {
+                    task.sink_metrics = sink_metrics;
                 }
                 if !job.state.is_terminal() && !logs.is_empty() {
                     task.append_logs(logs);
@@ -1771,11 +1855,7 @@ impl JobCoordinator {
     ) -> Option<(String, bool, Vec<(String, String)>)> {
         let stage_id = {
             let jobs = self.jobs.read();
-            jobs.get(job_id)?
-                .tasks
-                .get(task_id)?
-                .stage_id
-                .clone()
+            jobs.get(job_id)?.tasks.get(task_id)?.stage_id.clone()
         };
         let key = (job_id.to_string(), stage_id.clone());
         // Awaiting-bookkeeping is leader-local (a leader switch drops
@@ -1810,10 +1890,10 @@ impl JobCoordinator {
                 cp.awaiting.retain(|id| id != task_id);
                 if cp.awaiting.is_empty() {
                     let participants: Vec<(String, String)> = cp
-                    .participants
-                    .iter()
-                    .map(|(t, w)| (t.clone(), w.clone()))
-                    .collect();
+                        .participants
+                        .iter()
+                        .map(|(t, w)| (t.clone(), w.clone()))
+                        .collect();
                     decision = Some((true, participants));
                 }
             }
@@ -1822,7 +1902,10 @@ impl JobCoordinator {
         if completed {
             info!(
                 "Job {} pipeline {} checkpoint {} complete: {} task(s) prepared",
-                job_id, stage_id, checkpoint_id, participants.len()
+                job_id,
+                stage_id,
+                checkpoint_id,
+                participants.len()
             );
         } else {
             warn!(
@@ -1839,14 +1922,13 @@ impl JobCoordinator {
     fn resolve(&self, cp: &PendingCheckpoint, completed: bool) {
         let mut outbox = self.checkpoint_outbox.lock().unwrap();
         for (task_id, worker_id) in &cp.participants {
-            outbox
-                .entry(worker_id.clone())
-                .or_default()
-                .push(seatunnel_engine_comm::CheckpointResolution {
+            outbox.entry(worker_id.clone()).or_default().push(
+                seatunnel_engine_comm::CheckpointResolution {
                     task_id: task_id.clone(),
                     checkpoint_id: cp.checkpoint_id,
                     completed,
-                });
+                },
+            );
         }
     }
 
@@ -2039,9 +2121,15 @@ mod tests {
         let claimed = coordinator.claim_tasks_for_worker(
             "worker-0",
             "127.0.0.1:9999",
-            &live(&[("worker-0", WorkerState::Healthy), (dead, WorkerState::Dead)]),
+            &live(&[
+                ("worker-0", WorkerState::Healthy),
+                (dead, WorkerState::Dead),
+            ]),
         );
-        let orphan = claimed.iter().find(|t| t.task_id == ids[1]).expect("orphan claimed");
+        let orphan = claimed
+            .iter()
+            .find(|t| t.task_id == ids[1])
+            .expect("orphan claimed");
         assert_eq!(
             orphan.config.get("worker_id").map(String::as_str),
             Some("worker-1"),
@@ -2051,7 +2139,9 @@ mod tests {
         coordinator.mark_tasks_dispatched(std::slice::from_ref(&ids[1]), "worker-0");
         // The descriptor (assignment source of truth) moved to worker-0,
         // and a live peer can no longer claim it.
-        let snapshot = tokio::runtime::Runtime::new().unwrap().block_on(coordinator.export_state());
+        let snapshot = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(coordinator.export_state());
         let reassigned = snapshot["tasks"]
             .as_array()
             .unwrap()
@@ -2288,10 +2378,7 @@ mod tests {
         let snapshot = coordinator.export_state().await;
         let standby = JobCoordinator::new();
         standby.import_state(&snapshot).await;
-        assert_eq!(
-            standby.get_job("jedit").unwrap().raw_config,
-            job.raw_config
-        );
+        assert_eq!(standby.get_job("jedit").unwrap().raw_config, job.raw_config);
     }
 
     #[test]
@@ -2333,8 +2420,16 @@ mod tests {
             coordinator.handle_checkpoint_prepare(&job_id, t0, cp_id, true),
             None
         );
-        assert!(coordinator.drain_checkpoint_resolutions("worker-0").is_empty());
-        assert!(coordinator.drain_checkpoint_resolutions("worker-1").is_empty());
+        assert!(
+            coordinator
+                .drain_checkpoint_resolutions("worker-0")
+                .is_empty()
+        );
+        assert!(
+            coordinator
+                .drain_checkpoint_resolutions("worker-1")
+                .is_empty()
+        );
 
         // Second prepare resolves: completed events for both workers.
         assert_eq!(
@@ -2366,13 +2461,7 @@ mod tests {
             .compile_and_install("jcf", "f", &config, None, &workers(2))
             .unwrap();
         for (i, t) in tasks.iter().enumerate() {
-            coordinator.report_task_status(
-                &job_id,
-                &t.task_id,
-                "RUNNING",
-                0,
-                None,
-            );
+            coordinator.report_task_status(&job_id, &t.task_id, "RUNNING", 0, None);
             let _ = i;
         }
         let tr = coordinator.due_checkpoint_triggers("worker-0");
@@ -2421,7 +2510,12 @@ mod tests {
         // Consume two coordinated checkpoint ids on the primary. The
         // interval gate must be rewound between rounds (volatile field).
         for _ in 0..2 {
-            primary.jobs.write().get_mut(&job_id).unwrap().last_checkpoint_trigger_ms = 0;
+            primary
+                .jobs
+                .write()
+                .get_mut(&job_id)
+                .unwrap()
+                .last_checkpoint_trigger_ms = 0;
             let tr = primary.due_checkpoint_triggers("worker-0");
             assert_eq!(tr.len(), 1);
             let cp = tr[0].checkpoint_id;
@@ -2653,8 +2747,8 @@ mod tests {
         );
         assert_eq!(env_parallelism(&json!({})), 1);
         assert_eq!(
-            env_checkpoint_interval(&json!({"env":{"checkpoint":{"interval":5000}}})),
-            5000
+            env_checkpoint_interval(&json!({"env":{"checkpoint":{"interval":15000}}})),
+            15000
         );
         assert_eq!(
             env_checkpoint_interval(&json!({"env":{"checkpoint":12345}})),
@@ -2662,8 +2756,8 @@ mod tests {
         );
         // Flat dotted key produced by YAML/TOML parsers.
         assert_eq!(
-            env_checkpoint_interval(&json!({"env":{"checkpoint.interval":7000}})),
-            7000
+            env_checkpoint_interval(&json!({"env":{"checkpoint.interval":17000}})),
+            17000
         );
         assert_eq!(
             env_checkpoint_interval(&json!({})),

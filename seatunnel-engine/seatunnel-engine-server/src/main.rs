@@ -128,7 +128,13 @@ async fn main() -> anyhow::Result<()> {
             run_worker(&args.addr, master_list, &args.worker_id, engine_config).await?;
         }
         "hybrid" => {
-            run_hybrid(&args.addr, &args.advertise_addr, &args.worker_id, engine_config).await?
+            run_hybrid(
+                &args.addr,
+                &args.advertise_addr,
+                &args.worker_id,
+                engine_config,
+            )
+            .await?
         }
         other => {
             eprintln!(
@@ -189,12 +195,19 @@ struct MasterServing {
 /// Resolve this node's raft voter id: the position of its advertise
 /// address (or matching port) in the member list.
 fn my_voter_id(advertise: &str, members: &[String]) -> Option<u64> {
-    let my_port = advertise.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+    let my_port = advertise
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok());
     for (idx, member) in members.iter().enumerate() {
         if member == advertise {
             return Some(idx as u64 + 1);
         }
-        if let (Some(port), Some(mport)) = (my_port, member.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok())) {
+        if let (Some(port), Some(mport)) = (
+            my_port,
+            member
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok()),
+        ) {
             if port == mport && member.starts_with("127.0.0.1") {
                 return Some(idx as u64 + 1);
             }
@@ -234,7 +247,15 @@ async fn start_master(
     })?;
     let members = members_from_addresses(&config.member_list);
     let raft_dir = std::path::Path::new(&config.state_dir).join("raft");
-    let raft = (*start_node(node_id, members.clone(), Arc::clone(&coordinator), raft_dir).await?).clone();
+    let raft = (*start_node(
+        node_id,
+        members.clone(),
+        Arc::clone(&coordinator),
+        raft_dir,
+        config.raft,
+    )
+    .await?)
+        .clone();
     let leader: LeaderView = Arc::new(std::sync::RwLock::new(LeaderState::default()));
     spawn_leader_watcher(
         raft.clone(),
@@ -242,8 +263,12 @@ async fn start_master(
         Arc::clone(&leader),
         Arc::clone(&coordinator),
     );
-    let writes: Arc<dyn WritePath> =
-        Arc::new(RaftWrite::new(raft.clone(), node_id, members.clone(), Arc::clone(&leader)));
+    let writes: Arc<dyn WritePath> = Arc::new(RaftWrite::new(
+        raft.clone(),
+        node_id,
+        members.clone(),
+        Arc::clone(&leader),
+    ));
     tracing::info!(
         "Master({}) listening on {} advertise={} raft-id={} voters={} (cluster='{}')",
         role,
@@ -270,9 +295,8 @@ async fn start_master(
         writes.clone(),
         master_handler.wake_signal(),
     );
-    let raft_handler = seatunnel_engine_server::raft::network::RaftServiceHandler {
-        raft: raft.clone(),
-    };
+    let raft_handler =
+        seatunnel_engine_server::raft::network::RaftServiceHandler { raft: raft.clone() };
 
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
@@ -289,11 +313,20 @@ async fn start_master(
         let coordinator = Arc::clone(&coordinator);
         let writes = writes.clone();
         let wake = master_handler.wake_signal();
-        let timeout_ms = config.worker_timeout_ms.max(config.worker_soft_timeout_ms).max(1000);
+        let timeout_ms = config
+            .worker_timeout_ms
+            .max(config.worker_soft_timeout_ms)
+            .max(1000);
         let cp_timeout_ms = config.checkpoint_timeout_ms.max(1000);
         let cancel = shutdown.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(2000));
+            // Owners present in the replicated state but absent from this
+            // (leader-local) registry, and since when — a leader change
+            // loses the previous registry, so dead owners must be released
+            // through reconciliation rather than the heartbeat TTL alone.
+            let mut missing_since: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -316,12 +349,16 @@ async fn start_master(
                         };
                         for worker_id in stale {
                             registry.write().unwrap().remove(&worker_id);
-                            // Durable release of the dead worker's tasks.
-                            let cmd = seatunnel_engine_server::job_coordinator::Command::EvictWorker {
-                                worker_id: worker_id.clone(),
-                            };
-                            if let Err(e) = writes.propose(cmd).await {
-                                tracing::warn!("EvictWorker proposal failed: {}", e);
+                            // Durable release of the dead worker's tasks. Only the leader
+                            // proposes — a follower's proposal is always forwarded away.
+                            if writes.is_leader() {
+                                let cmd =
+                                    seatunnel_engine_server::job_coordinator::Command::EvictWorker {
+                                        worker_id: worker_id.clone(),
+                                    };
+                                if let Err(e) = writes.propose(cmd).await {
+                                    tracing::warn!("EvictWorker proposal failed: {}", e);
+                                }
                             }
                             // Released tasks are claimable — wake parked
                             // long-poll heartbeats.
@@ -331,6 +368,56 @@ async fn start_master(
                                 worker_id,
                                 timeout_ms
                             );
+                        }
+
+                        // Ownership reconciliation (leader only): task
+                        // ownership lives in the replicated state, worker
+                        // liveness in the leader-local registry. When the
+                        // previous leader died, its embedded worker's tasks
+                        // keep a dead owner nobody evicts — the orphan claim
+                        // is then fenced as a "duplicate". Release owners
+                        // that stay absent past the hard timeout; returning
+                        // workers re-register and ADOPT their tasks first.
+                        if writes.is_leader() {
+                            let owners = coordinator.task_owning_workers();
+                            let present: std::collections::HashSet<String> =
+                                registry.read().unwrap().keys().cloned().collect();
+                            for owner in owners {
+                                if present.contains(&owner) {
+                                    missing_since.remove(&owner);
+                                } else {
+                                    missing_since.entry(owner).or_insert(now);
+                                }
+                            }
+                            let expired: Vec<String> = missing_since
+                                .iter()
+                                .filter(|(_, since)| now - **since > timeout_ms as i64)
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            for worker_id in expired {
+                                missing_since.remove(&worker_id);
+                                let cmd =
+                                    seatunnel_engine_server::job_coordinator::Command::EvictWorker {
+                                        worker_id: worker_id.clone(),
+                                    };
+                                match writes.propose(cmd).await {
+                                    Ok(_) => {
+                                        tracing::warn!(
+                                            "Leader reconcile: evicted owner {} absent from \
+                                             the registry for > {}ms",
+                                            worker_id,
+                                            timeout_ms
+                                        );
+                                        wake.notify_waiters();
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "EvictWorker proposal failed: {}",
+                                        e
+                                    ),
+                                }
+                            }
+                        } else {
+                            missing_since.clear();
                         }
                     }
                 }
@@ -443,8 +530,13 @@ async fn run_hybrid(
         worker_id
     );
 
-    // The in-process worker talks to this node's own coordinator.
-    let master_list = vec![advertise_addr];
+    // The in-process worker prefers this node's own coordinator, then the
+    // other voters: on a multi-node hybrid cluster a follower's embedded
+    // worker is redirected to the leader via the heartbeat leader-hint
+    // (and can fail over through the list when the leader dies).
+    let mut master_list = config.member_list.clone();
+    master_list.retain(|m| m != &advertise_addr);
+    master_list.insert(0, advertise_addr);
     let worker_bind_addr = format!("127.0.0.1:{}", serving.local_addr.port());
     let worker_fut = run_worker(&worker_bind_addr, master_list, worker_id, config);
 
@@ -457,6 +549,46 @@ async fn run_hybrid(
         }
     }
     Ok(())
+}
+
+/// Connect to `target` (a master address), re-register with running tasks
+/// so reassigned tasks are fenced properly, and return the new client.
+/// Used by master failover and leader-hint redirection alike; `None` means
+/// the target is unreachable or rejected the registration.
+async fn switch_master(
+    target: &str,
+    worker: &Arc<WorkerNode>,
+    worker_id: &str,
+    addr: &str,
+    default_interval: u64,
+    slots: u32,
+) -> Option<MasterServiceClient<tonic::transport::Channel>> {
+    let mut new_client = MasterServiceClient::connect(format!("http://{}", target))
+        .await
+        .map_err(|e| tracing::warn!("Cannot connect to master {}: {}", target, e))
+        .ok()?;
+    let running = worker.running_task_ids().await;
+    let reg = tonic::Request::new(WorkerRegistration {
+        worker_id: worker_id.to_string(),
+        address: addr.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        resources: Default::default(),
+        heartbeat_interval_ms: default_interval as i64,
+        running_task_ids: running,
+        slots,
+    });
+    match new_client.register_worker(reg).await {
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            worker.observe_term(resp.term);
+            worker.set_master_client(new_client.clone()).await;
+            Some(new_client)
+        }
+        Err(e) => {
+            tracing::warn!("Re-registration with {} failed: {}", target, e);
+            None
+        }
+    }
 }
 
 async fn run_worker(
@@ -492,9 +624,11 @@ async fn run_worker(
         WorkerNode::new_with_clean(worker_id.to_string(), addr.clone(), state_store, clean);
     // Dynamic admission: measured pressure (lag + memory watermark), no
     // slot counts. Samplers run inside the controller.
-    worker = worker.with_admission(seatunnel_engine_server::admission::AdmissionController::new(
-        engine_config.admission_config(),
-    ));
+    worker = worker.with_admission(
+        seatunnel_engine_server::admission::AdmissionController::new(
+            engine_config.admission_config(),
+        ),
+    );
     // Checkpoint storage backend (master/s3 failover support).
     if engine_config.storage_type == "s3" && !engine_config.s3.bucket.is_empty() {
         match seatunnel_engine_server::checkpoint_store::build_object_store(&engine_config.s3) {
@@ -610,6 +744,11 @@ async fn run_worker(
             let mut failures: u32 = 0;
             let mut master_idx: usize = 0;
             let mut interval_ms = default_interval;
+            let mut current_master = masters[0].clone();
+            // A hint that failed to connect is not retried until the leader
+            // hint changes — during an election window followers briefly
+            // point at the DEAD previous leader.
+            let mut bad_hint: Option<String> = None;
             loop {
                 tokio::select! {
                     _ = shutdown_signal.cancelled() => break,
@@ -643,7 +782,20 @@ async fn run_worker(
                     can_accept,
                 };
 
-                match client.heartbeat(hb).await {
+                // Long-poll budget + slack; a request that never returns
+                // (dead channel) must degrade into a transport failure so
+                // the failover machinery can rotate masters.
+                let timeout = Duration::from_millis(interval_ms as u64 + 5_000);
+                let result = tokio::time::timeout(timeout, client.heartbeat(hb)).await;
+                let outcome = match result {
+                    Ok(r) => r,
+                    Err(_) => Err(tonic::Status::deadline_exceeded(format!(
+                        "heartbeat to {} timed out after {}ms",
+                        current_master,
+                        timeout.as_millis()
+                    ))),
+                };
+                match outcome {
                     Ok(resp) => {
                         failures = 0;
                         let response = resp.into_inner();
@@ -655,6 +807,40 @@ async fn run_worker(
                         // Term-fenced application: a deposed master's
                         // instructions are rejected inside.
                         worker.apply_master_response(&response).await;
+                        // Leader redirect: a non-leader master serves no
+                        // instructions and points at the leader via
+                        // `leader_hint`. Follow it immediately — otherwise
+                        // this worker would heartbeat a follower forever
+                        // (the follower never refreshes its liveness entry,
+                        // so it is evicted there while the leader never
+                        // hears of it).
+                        let hint = response.leader_hint;
+                        if !hint.is_empty()
+                            && hint != current_master
+                            && bad_hint.as_ref() != Some(&hint)
+                        {
+                            tracing::info!(
+                                "Master {} is a follower — following leader hint {}",
+                                current_master,
+                                hint
+                            );
+                            if let Some(new_client) = switch_master(
+                                &hint,
+                                &worker,
+                                &worker_id,
+                                &addr,
+                                default_interval,
+                                slots,
+                            )
+                            .await
+                            {
+                                client = new_client;
+                                current_master = hint;
+                                bad_hint = None;
+                            } else {
+                                bad_hint = Some(hint);
+                            }
+                        }
                     }
                     Err(e) => {
                         failures += 1;
@@ -666,43 +852,23 @@ async fn run_worker(
                                 "Master unreachable 3x — failing over to {} (data plane continues)",
                                 next
                             );
-                            match MasterServiceClient::connect(format!("http://{}", next)).await {
-                                Ok(mut new_client) => {
-                                    // Re-register with running tasks so the new
-                                    // master fences reassigned tasks properly.
-                                    let running = worker.running_task_ids().await;
-                                    let reg = tonic::Request::new(WorkerRegistration {
-                                        worker_id: worker_id.clone(),
-                                        address: addr.clone(),
-                                        version: env!("CARGO_PKG_VERSION").to_string(),
-                                        resources: Default::default(),
-                                        heartbeat_interval_ms: default_interval as i64,
-                                        running_task_ids: running,
-                                        slots,
-                                    });
-                                    match new_client.register_worker(reg).await {
-                                        Ok(resp) => {
-                                            let resp = resp.into_inner();
-                                            worker.observe_term(resp.term);
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                "Re-registration with {} failed: {}",
-                                                next,
-                                                err
-                                            );
-                                        }
-                                    }
-                                    worker.set_master_client(new_client.clone()).await;
-                                    client = new_client;
-                                    failures = 0;
-                                    tracing::info!("Failed over to master {}", next);
-                                }
-                                Err(err) => {
-                                    tracing::warn!("Failover target {} unreachable too: {}", next, err);
-                                    failures = 0; // rotate again next round
-                                }
+                            // switch_master re-registers with running tasks so
+                            // the new master fences reassigned tasks properly.
+                            if let Some(new_client) = switch_master(
+                                &next,
+                                &worker,
+                                &worker_id,
+                                &addr,
+                                default_interval,
+                                slots,
+                            )
+                            .await
+                            {
+                                client = new_client;
+                                current_master = next;
+                                tracing::info!("Failed over to master {}", current_master);
                             }
+                            failures = 0; // rotate again next round on failure
                         }
                     }
                 }

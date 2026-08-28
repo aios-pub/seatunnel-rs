@@ -61,15 +61,17 @@ seatunnel-rs/
 cargo build --release
 ```
 
-### MySQL CDC → Kafka in 5 commands
+### MySQL CDC → Kafka in 3 commands
 
 ```bash
 docker compose up -d kafka mysql
-seatunnel-engine-server --role master --addr 0.0.0.0:5800 &
-SEATUNNEL_STATE_DIR=./state seatunnel-engine-server --role worker \
-  --master 127.0.0.1:5800 --worker-id w1 --addr 0.0.0.0:5001 &
+seatunnel-engine-server --role hybrid --addr 0.0.0.0:5800 &   # coordinator + worker in one process
 seatunnel job submit -c examples/mysql-cdc-to-kafka.yaml -a 127.0.0.1:5800
 ```
+
+Helper scripts: `./scripts/start-hybrid.sh` (single node) and
+`./scripts/start-hybrid-cluster.sh` (3-node Raft pseudo-cluster on
+localhost) build, start and wait for readiness.
 
 See [Quick Start](docs/en/quickstart.md) for the full walkthrough, and
 `scripts/e2e-cdc-kafka.sh` for an automated verification of the whole loop.
@@ -93,8 +95,9 @@ cargo test -p seatunnel-e2e --test e2e
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| Local | Embedded Master + Worker in single process | Development, small jobs |
-| Cluster | Separate Master/Worker nodes via gRPC | Production, multi-node |
+| Local | Embedded execution in the CLI process (no server) | Development, small jobs |
+| Cluster (hybrid) | One process per node = Raft voter + worker | Production HA: 1 node, or 3/5 symmetric nodes |
+| Cluster (separated) | Master voters + dedicated workers via gRPC | Large clusters, control-plane isolation |
 
 ### Checkpoint Protocol
 

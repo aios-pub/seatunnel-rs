@@ -53,10 +53,7 @@ pub struct SmInner {
 }
 
 impl CoordinatorStateMachine {
-    pub async fn new(
-        coordinator: Arc<JobCoordinator>,
-        dir: &Path,
-    ) -> anyhow::Result<Self> {
+    pub async fn new(coordinator: Arc<JobCoordinator>, dir: &Path) -> anyhow::Result<Self> {
         let inner = SmInner {
             dir: dir.to_path_buf(),
             last_applied: None,
@@ -85,8 +82,7 @@ impl CoordinatorStateMachine {
         let state = value["state"].clone();
         self.coordinator.replace_state(&state).await;
         let mut inner = self.inner.lock().await;
-        inner.membership =
-            serde_json::from_value(value["membership"].clone()).unwrap_or_default();
+        inner.membership = serde_json::from_value(value["membership"].clone()).unwrap_or_default();
         inner.last_applied = serde_json::from_value(value["last_applied"].clone()).unwrap_or(None);
         inner.current_snapshot = None; // rebuilt lazily on demand
         tracing::info!(
@@ -127,7 +123,13 @@ impl RaftStateMachine<Types> for CoordinatorStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, openraft::BasicNode>), StorageError<u64>> {
+    ) -> Result<
+        (
+            Option<LogId<u64>>,
+            StoredMembership<u64, openraft::BasicNode>,
+        ),
+        StorageError<u64>,
+    > {
         let inner = self.inner.lock().await;
         Ok((inner.last_applied, inner.membership.clone()))
     }
@@ -163,7 +165,9 @@ impl RaftStateMachine<Types> for CoordinatorStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<<Types as RaftTypeConfig>::SnapshotData>, StorageError<u64>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<<Types as RaftTypeConfig>::SnapshotData>, StorageError<u64>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -177,10 +181,7 @@ impl RaftStateMachine<Types> for CoordinatorStateMachine {
         tokio::io::AsyncSeekExt::seek(&mut cursor, SeekFrom::Start(0))
             .await
             .map_err(storage_err)?;
-        cursor
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(storage_err)?;
+        cursor.read_to_end(&mut bytes).await.map_err(storage_err)?;
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(storage_err)?;
         let state = value["state"].clone();
 
@@ -188,10 +189,8 @@ impl RaftStateMachine<Types> for CoordinatorStateMachine {
         self.coordinator.replace_state(&state).await;
         {
             let mut inner = self.inner.lock().await;
-            inner.membership = StoredMembership::new(
-                meta.last_log_id,
-                meta.last_membership.membership().clone(),
-            );
+            inner.membership =
+                StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
             inner.last_applied = meta.last_log_id;
             // Persist: snapshot.json holds {state, membership, applied}.
             let doc = serde_json::json!({
@@ -201,7 +200,11 @@ impl RaftStateMachine<Types> for CoordinatorStateMachine {
             let path = inner.dir.join("snapshot.json");
             let tmp = inner.dir.join("snapshot.json.tmp");
             let bytes = serde_json::to_vec(&doc).map_err(storage_err)?;
-            write_synced(&tmp, &path, &bytes).map_err(storage_err)?;
+            // fsync off the async runtime so raft timers keep firing.
+            tokio::task::spawn_blocking(move || write_synced(&tmp, &path, &bytes))
+                .await
+                .map_err(|e| storage_err(e))?
+                .map_err(storage_err)?;
             inner.current_snapshot = None;
         }
         tracing::info!(
@@ -265,10 +268,17 @@ impl RaftSnapshotBuilder<Types> for SmSnapshotBuilder {
             "meta": serde_json::to_value(&meta).map_err(storage_err)?,
         });
         let bytes = serde_json::to_vec(&doc).map_err(storage_err)?;
-        // Persist the built snapshot immediately (persistent-snapshot model).
+        // Persist the built snapshot immediately (persistent-snapshot
+        // model); fsync off the async runtime so raft timers keep firing.
+        // `bytes` is still returned as the snapshot payload, so the write
+        // takes a copy (snapshot documents are small JSON).
         let path = inner.dir.join("snapshot.json");
         let tmp = inner.dir.join("snapshot.json.tmp");
-        write_synced(&tmp, &path, &bytes).map_err(storage_err)?;
+        let to_write = bytes.clone();
+        tokio::task::spawn_blocking(move || write_synced(&tmp, &path, &to_write))
+            .await
+            .map_err(|e| storage_err(e))?
+            .map_err(storage_err)?;
 
         inner.current_snapshot = None; // rebuilt with fresh bytes on demand
         Ok(Snapshot {

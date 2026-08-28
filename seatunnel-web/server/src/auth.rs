@@ -87,8 +87,8 @@ impl AuthConfig {
     }
 
     fn sign(&self, username: &str, expiry_ms: u64) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.signing_key)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.signing_key).expect("HMAC accepts any key length");
         mac.update(format!("{}:{}", username, expiry_ms).as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -126,7 +126,10 @@ impl AuthConfig {
 
     /// `Set-Cookie` header value that clears the session.
     pub fn clearing_cookie() -> String {
-        format!("{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0", SESSION_COOKIE)
+        format!(
+            "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+            SESSION_COOKIE
+        )
     }
 
     /// Extract the session token from a `Cookie` header value.

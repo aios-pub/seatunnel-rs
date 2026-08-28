@@ -27,9 +27,13 @@
 //! ride inside the response payloads. Snapshots are small JSON and are
 //! sent in ONE InstallSnapshot call, so no chunk assembly is needed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
-use openraft::error::{Fatal, InstallSnapshotError, NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::error::{
+    Fatal, InstallSnapshotError, NetworkError, RPCError, RaftError, ReplicationClosed,
+    StreamingError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use openraft::{BasicNode, Snapshot};
@@ -44,14 +48,33 @@ use tonic::{Request, Response, Status};
 
 use super::Types;
 
+/// One multiplexed tonic channel per target node, shared by every RPC
+/// openraft sends to it. openraft applies a hard timeout equal to
+/// heartbeat_interval (150ms) to append RPCs; paying a fresh TCP+HTTP/2
+/// handshake on every RPC frequently exceeds that under load and gets
+/// reported Unreachable — which ages the follower's leader contact and
+/// triggers elections. A cached connection costs one round trip per RPC.
+type ChannelCache = Arc<Mutex<HashMap<u64, tonic::transport::Channel>>>;
+
 /// Creates per-target connections; the member map is static.
 pub struct GrpcNetworkFactory {
     pub members: BTreeMap<u64, BasicNode>,
+    channels: ChannelCache,
+}
+
+impl Default for GrpcNetworkFactory {
+    fn default() -> Self {
+        GrpcNetworkFactory {
+            members: BTreeMap::new(),
+            channels: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 pub struct GrpcNetwork {
     target: u64,
     addr: String,
+    channels: ChannelCache,
 }
 
 fn unreachable(
@@ -72,6 +95,7 @@ impl RaftNetworkFactory<Types> for GrpcNetworkFactory {
         GrpcNetwork {
             target,
             addr: node.addr.clone(),
+            channels: Arc::clone(&self.channels),
         }
     }
 }
@@ -89,10 +113,36 @@ fn net_err<E: std::fmt::Display>(e: E) -> NetworkError {
 }
 
 impl GrpcNetwork {
-    async fn client(&self) -> Result<RaftServiceClient<tonic::transport::Channel>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        RaftServiceClient::connect(format!("http://{}", self.addr))
+    async fn client(
+        &self,
+    ) -> Result<
+        RaftServiceClient<tonic::transport::Channel>,
+        RPCError<u64, BasicNode, RaftError<u64>>,
+    > {
+        if let Some(channel) = self.channels.lock().unwrap().get(&self.target).cloned() {
+            return Ok(RaftServiceClient::new(channel));
+        }
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", self.addr))
+            .map_err(|e| unreachable(self.target, &self.addr, e))?
+            // Fail fast instead of hanging into openraft's hard RPC
+            // timeout; the outer timeout still bounds the whole call.
+            .connect_timeout(std::time::Duration::from_millis(250));
+        let channel = endpoint
+            .connect()
             .await
-            .map_err(|e| unreachable(self.target, &self.addr, e))
+            .map_err(|e| unreachable(self.target, &self.addr, e))?;
+        self.channels
+            .lock()
+            .unwrap()
+            .insert(self.target, channel.clone());
+        Ok(RaftServiceClient::new(channel))
+    }
+
+    /// Drop the cached channel so the next RPC reconnects — used after
+    /// any RPC failure (e.g. the target restarted and the old HTTP/2
+    /// connection broke). Reconnecting one call later is harmless.
+    fn invalidate(&self) {
+        self.channels.lock().unwrap().remove(&self.target);
     }
 }
 
@@ -101,18 +151,16 @@ impl RaftNetwork<Types> for GrpcNetwork {
         &mut self,
         rpc: AppendEntriesRequest<Types>,
         _option: RPCOption,
-    ) -> Result<
-        openraft::raft::AppendEntriesResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64>>,
-    > {
+    ) -> Result<openraft::raft::AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>>
+    {
         let mut client = self.client().await?;
         let req = Request::new(RaftAppendRequest {
             payload: encode(&rpc).map_err(|e| RPCError::Network(net_err(e)))?,
         });
-        let resp = client
-            .append_entries(req)
-            .await
-            .map_err(|e| unreachable(self.target, &self.addr, e))?;
+        let resp = client.append_entries(req).await.map_err(|e| {
+            self.invalidate();
+            unreachable(self.target, &self.addr, e)
+        })?;
         decode(&resp.into_inner().payload).map_err(|e| RPCError::Network(net_err(e)))
     }
 
@@ -124,20 +172,16 @@ impl RaftNetwork<Types> for GrpcNetwork {
         openraft::raft::InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        let mut client = self
-            .client()
-            .await
-            .map_err(|e| map_snapshot_rpc(e))?;
+        let mut client = self.client().await.map_err(|e| map_snapshot_rpc(e))?;
         let req = Request::new(RaftSnapshotRequest {
             payload: encode(&rpc).map_err(|e| map_snapshot_rpc(RPCError::Network(net_err(e))))?,
         });
-        let resp = client
-            .install_snapshot(req)
-            .await
-            .map_err(|e| map_snapshot_rpc(unreachable(self.target, &self.addr, e)))?;
-        decode(&resp.into_inner().payload).map_err(|e| {
-            map_snapshot_rpc(RPCError::Network(net_err(e)))
-        })
+        let resp = client.install_snapshot(req).await.map_err(|e| {
+            self.invalidate();
+            map_snapshot_rpc(unreachable(self.target, &self.addr, e))
+        })?;
+        decode(&resp.into_inner().payload)
+            .map_err(|e| map_snapshot_rpc(RPCError::Network(net_err(e))))
     }
 
     async fn vote(
@@ -149,10 +193,10 @@ impl RaftNetwork<Types> for GrpcNetwork {
         let req = Request::new(RaftVoteRequest {
             payload: encode(&rpc).map_err(|e| RPCError::Network(net_err(e)))?,
         });
-        let resp = client
-            .vote(req)
-            .await
-            .map_err(|e| unreachable(self.target, &self.addr, e))?;
+        let resp = client.vote(req).await.map_err(|e| {
+            self.invalidate();
+            unreachable(self.target, &self.addr, e)
+        })?;
         decode(&resp.into_inner().payload).map_err(|e| RPCError::Network(net_err(e)))
     }
 
@@ -183,20 +227,16 @@ impl RaftNetwork<Types> for GrpcNetwork {
         };
         let mut client = self.client().await.map_err(|e| streaming_from_rpc(e))?;
         let req = Request::new(RaftSnapshotRequest {
-            payload: encode(&rpc)
-                .map_err(|e| streaming_from_rpc(RPCError::Network(net_err(e))))?,
+            payload: encode(&rpc).map_err(|e| streaming_from_rpc(RPCError::Network(net_err(e))))?,
         });
-        let resp = client
-            .install_snapshot(req)
-            .await
-            .map_err(|e| streaming_from_rpc(unreachable(self.target, &self.addr, e)))?;
-        let decoded: openraft::raft::InstallSnapshotResponse<u64> = decode(
-            &resp.into_inner().payload,
-        )
-        .map_err(|e| streaming_from_rpc(RPCError::Network(net_err(e))))?;
-        Ok(openraft::raft::SnapshotResponse {
-            vote: decoded.vote,
-        })
+        let resp = client.install_snapshot(req).await.map_err(|e| {
+            self.invalidate();
+            streaming_from_rpc(unreachable(self.target, &self.addr, e))
+        })?;
+        let decoded: openraft::raft::InstallSnapshotResponse<u64> =
+            decode(&resp.into_inner().payload)
+                .map_err(|e| streaming_from_rpc(RPCError::Network(net_err(e))))?;
+        Ok(openraft::raft::SnapshotResponse { vote: decoded.vote })
     }
 }
 
@@ -291,5 +331,52 @@ impl RaftService for RaftServiceHandler {
         let resp = openraft::raft::InstallSnapshotResponse { vote };
         let payload = serde_json::to_vec(&resp).map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(RaftSnapshotResponse { payload }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn network(target: u64, cache: &ChannelCache) -> GrpcNetwork {
+        GrpcNetwork {
+            target,
+            addr: format!("127.0.0.1:1{}", target),
+            channels: Arc::clone(cache),
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_cache_invalidation_drops_only_the_failed_target() {
+        let cache: ChannelCache = Arc::new(Mutex::new(HashMap::new()));
+        // Two nodes share one cache; both get an entry (placeholders —
+        // the map holds channels, only key semantics are under test).
+        cache.lock().unwrap().insert(1, make_channel());
+        cache.lock().unwrap().insert(2, make_channel());
+        let net = network(1, &cache);
+        net.invalidate();
+        assert!(
+            !cache.lock().unwrap().contains_key(&1),
+            "failed target dropped"
+        );
+        assert!(cache.lock().unwrap().contains_key(&2), "other target kept");
+    }
+
+    #[tokio::test]
+    async fn channel_cache_is_shared_between_networks() {
+        let cache: ChannelCache = Arc::new(Mutex::new(HashMap::new()));
+        let a = network(1, &cache);
+        let b = network(1, &cache);
+        a.channels.lock().unwrap().insert(1, make_channel());
+        assert!(
+            b.channels.lock().unwrap().contains_key(&1),
+            "factory hands every client the same cache"
+        );
+    }
+
+    /// A never-connected channel value; real values are only produced by
+    /// `Endpoint::connect`, which these map-semantics tests never call.
+    fn make_channel() -> tonic::transport::Channel {
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
     }
 }

@@ -336,13 +336,23 @@ impl TableSelector {
 
     /// Exact `db.table` refs match their own pair; regexes are matched
     /// against the fully-qualified `db.table` string (official semantics).
+    ///
+    /// Table-level selection (exact pairs or `table-pattern`) decides on
+    /// its own — the refs/patterns already carry the database part, so a
+    /// `table-names`-only config captures without `database-names`. When a
+    /// database list IS also given it only narrows table-level selection
+    /// further (official combined semantics). With no table-level
+    /// selectors, `database-names`/`database-pattern` alone subscribe to
+    /// every table of the matching databases.
     pub fn matches(&self, database: &str, table: &str) -> bool {
-        if !self.matches_database(database) {
-            return false;
+        let table_selected = self.has_exact() || !self.table_patterns.is_empty();
+        if table_selected {
+            let qualified = format!("{}.{}", database, table);
+            let hit = self.tables.iter().any(|(d, t)| d == database && t == table)
+                || self.table_patterns.iter().any(|re| re.is_match(&qualified));
+            return hit && (self.databases.is_empty() || self.matches_database(database));
         }
-        let qualified = format!("{}.{}", database, table);
-        self.tables.iter().any(|(d, t)| d == database && t == table)
-            || self.table_patterns.iter().any(|re| re.is_match(&qualified))
+        self.matches_database(database)
     }
 
     /// Database names in the selection (diagnostics).
@@ -388,7 +398,12 @@ pub fn build_table_selector(
             .get_string("table-pattern", &config.get_string("table_pattern", ""))
             .is_empty();
     let mut selector = TableSelector::from_legacy(
-        if has_official_databases {
+        // The legacy database only applies when NEITHER official database
+        // NOR table selection is present: official `table-names` refs and
+        // `table-pattern` regexes are fully qualified (`db.table`), so
+        // folding a legacy default database name on top would gate out
+        // every database other than that default.
+        if has_official_databases || has_official_tables {
             ""
         } else {
             legacy_db
@@ -556,6 +571,19 @@ impl SchemaWatcher {
     /// Set the baseline column list (no events emitted).
     pub fn prime(&mut self, columns: Vec<seatunnel_api::ColumnDef>) {
         self.columns = columns;
+    }
+
+    /// Queue an initial-schema event carrying the primed column layout.
+    /// Called once after [`prime`](Self::prime): the event flows through
+    /// the stream before the table's first row, letting schema-driven
+    /// sinks configure themselves without static column config.
+    pub fn queue_initial(&mut self) {
+        if self.columns.is_empty() {
+            return;
+        }
+        let schema = seatunnel_api::TableSchema::new(self.table_id.clone(), self.columns.clone());
+        self.pending
+            .push_back(SchemaChangeEvent::initial_schema(schema));
     }
 
     pub fn columns(&self) -> &[seatunnel_api::ColumnDef] {

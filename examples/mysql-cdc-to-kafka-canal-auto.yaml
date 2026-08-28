@@ -1,0 +1,56 @@
+# MySQL CDC → Kafka with the canal-client JSON format and AUTOMATIC
+# column mapping: no canal-client.columns / canal-client.sub-table-fields.
+#
+# The MySQL-CDC source emits an initial-schema event (column list +
+# primary key from information_schema) before the table's first row; the
+# Kafka sink builds its canal-client encoder from it:
+#   - every column identity-mapped (always present in `data`)
+#   - the schema primary key as the Kafka partition key
+#   - empty `update` mapping → updates are never filtered
+#
+# Optional DELTA mapping — define only what differs from the identity
+# baseline (a sub-table-fields entry, still no canal-client.columns):
+#   canal-client.sub-table-fields: >-
+#     {
+#       "users": {
+#         "key": "id",
+#         "must":   { "name": "userName" },
+#         "update": { "score": "score" }
+#       }
+#     }
+#   `must` renames a column's target field (stays always present),
+#   `update` moves a column to changed-only, `key` overrides the
+#   partition key; every unmentioned column keeps the identity mapping.
+# Full Java subTableFields parity (authoritative entry + change
+# filtering) additionally needs explicit canal-client.columns.
+#
+# Submit:
+#   seatunnel job submit -c examples/mysql-cdc-to-kafka-canal-auto.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: mysql-cdc-to-kafka-canal-auto
+  parallelism: 1
+  checkpoint.interval: 10000
+
+source:
+  MySQL-CDC:
+    hostname: "127.0.0.1"
+    port: 13306
+    username: root
+    password: root
+    database-name: seatunnel
+    table-name: users
+    startup.mode: initial
+    split.column: id
+
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    topic: users-canal-auto
+    format: canal_client_json
+    # Message dbName/tableName (lowercased in the payload).
+    canal-client.database-name: seatunnel
+    canal-client.table-name: users
+    # Automatic mapping: columns + primary key from the initial-schema
+    # event. Naive datetimes are interpreted in this zone.
+    canal-client.server-time-zone: local

@@ -174,6 +174,9 @@ pub struct TaskGroup {
     last_record_at: i64,
     /// (id, state size) of the most recent completed checkpoint.
     last_checkpoint_meta: (u64, u64),
+    /// Shared sink-metrics handle (same `Arc` the writer received via
+    /// `SinkWriterContext`); snapshotted into the published status.
+    sink_metrics: Option<std::sync::Arc<seatunnel_api::sink::SinkMetrics>>,
     /// Bounded task log ring surfaced through the worker heartbeat.
     logs: crate::task_log::TaskLogRing,
 }
@@ -197,6 +200,7 @@ impl TaskGroup {
             empty_streak: 0,
             last_record_at: 0,
             last_checkpoint_meta: (0, 0),
+            sink_metrics: None,
             logs: crate::task_log::TaskLogRing::default(),
         }
     }
@@ -208,6 +212,17 @@ impl TaskGroup {
 
     pub fn with_committer(mut self, committer: Option<BoxedSinkCommitter>) -> Self {
         self.committer = committer;
+        self
+    }
+
+    /// Attach the sink-metrics handle the writer was created with (same
+    /// `Arc` that went into `SinkWriterContext`), so status publishes can
+    /// snapshot it. Mirrors the `attach_task_metrics` wiring pattern.
+    pub fn with_sink_metrics(
+        mut self,
+        metrics: std::sync::Arc<seatunnel_api::sink::SinkMetrics>,
+    ) -> Self {
+        self.sink_metrics = Some(metrics);
         self
     }
 
@@ -308,13 +323,14 @@ impl TaskGroup {
                     self.last_record_at = crate::now_millis();
                     // Sample one row per DATA_LOG_SAMPLE records so the
                     // console can show live data without flooding the ring.
-                    if self.records_processed % DATA_LOG_SAMPLE == 0 || self.records_processed == rows.len() as u64 {
+                    if self.records_processed % DATA_LOG_SAMPLE == 0
+                        || self.records_processed == rows.len() as u64
+                    {
                         if let Some(row) = rows.last() {
-                            self.logs.push("DATA", format!(
-                                "record #{}: {}",
-                                self.records_processed,
-                                row_summary(row)
-                            ));
+                            self.logs.push(
+                                "DATA",
+                                format!("record #{}: {}", self.records_processed, row_summary(row)),
+                            );
                         }
                     }
                     self.publish_status_throttled().await;
@@ -458,11 +474,22 @@ impl TaskGroup {
         let records = self.records_processed;
         let last_record_at = self.last_record_at;
         let checkpoint_meta = self.last_checkpoint_meta;
+        // Windowed sink snapshot; stay `None` until the sink has actually
+        // recorded something (unused sinks never surface zero noise).
+        let sink_metrics = self.sink_metrics.as_ref().map(|metrics| {
+            let snapshot = metrics.snapshot();
+            (snapshot.sent > 0
+                || snapshot.failed > 0
+                || snapshot.in_flight > 0
+                || snapshot.last_error.is_some())
+            .then_some(snapshot)
+        });
         let mut status = self.status.lock().await;
         status.processed_records = records;
         status.last_record_at = last_record_at;
         status.last_checkpoint_id = checkpoint_meta.0;
         status.last_checkpoint_size = checkpoint_meta.1;
+        status.sink_metrics = sink_metrics.flatten();
     }
 
     /// Trigger a checkpoint when the configured interval has elapsed.

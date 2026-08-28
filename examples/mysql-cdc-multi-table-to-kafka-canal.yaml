@@ -1,0 +1,75 @@
+# MySQL CDC (MULTI-TABLE) → Kafka canal-client JSON with per-table topic
+# routing — one pipeline captures every table of the database and routes
+# each message to its topic group.
+#
+# What makes multi-table work:
+#   - the MySQL-CDC source tags every row with its origin `database.table`
+#     identity (snapshot and binlog phases alike);
+#   - the Kafka canal-client encoder keeps one state per table (its own
+#     column mapping from the per-table initial-schema event, its own
+#     update-pairing slot), so dbName/tableName in each message follow
+#     the row's REAL table and same-key rows of different tables never
+#     mis-pair into updates;
+#   - the topic is resolved per MESSAGE:
+#       1. EVERY topic-routes entry whose anchored regex matches the
+#          origin `database.table` receives a copy (group several tables
+#          into one topic, or double-route one table into several —
+#          same payload/requestId across topics), and
+#       2. records matching no route fall back to the `topic` template
+#          rendering `${database}` / `${table}` (one topic per table).
+#
+# The example below routes orders* tables to topic_orders and every other
+# table to `cdc_<table>` (cdc_users, cdc_products, ...). Scale the route
+# list to your 10 groups.
+#
+# canal-client.database-name / canal-client.table-name stay optional
+# defaults for rows WITHOUT origin identity (not produced by MySQL-CDC);
+# per-message identity always comes from the row itself.
+#
+# Submit:
+#   seatunnel job submit -c examples/mysql-cdc-multi-table-to-kafka-canal.yaml -a 127.0.0.1:5800
+
+env:
+  job.name: mysql-cdc-multi-table-to-kafka-canal
+  parallelism: 1
+  checkpoint.interval: 10000
+
+source:
+  MySQL-CDC:
+    hostname: "127.0.0.1"
+    port: 13306
+    username: root
+    password: root
+    database-name: seatunnel
+    # Regex over the qualified `db.table` string: capture every table.
+    # Group tighter with e.g. "seatunnel\\.(users|orders.*)".
+    table-pattern: "seatunnel\\..*"
+    startup.mode: initial
+    split.column: id
+
+sink:
+  Kafka:
+    bootstrap.servers: "127.0.0.1:9092"
+    # Template fallback for tables no route matches: cdc_<table>.
+    topic: "cdc_${table}"
+    format: canal_client_json
+    # Anchored regex over `database.table`, in declaration order.
+    # JSON array (order matters — a map would not preserve it).
+    topic-routes: >-
+      [
+        {"pattern": "seatunnel\\.orders_.*", "topic": "topic_orders"},
+        {"pattern": "seatunnel\\.users", "topic": "topic_users"}
+      ]
+    # Automatic per-table mapping: columns + primary key come from each
+    # table's initial-schema event. Naive datetimes are interpreted in
+    # this zone.
+    canal-client.server-time-zone: local
+    # Optional per-table DELTA overrides (camelCase table key):
+    # canal-client.sub-table-fields: >-
+    #   {
+    #     "orders_2024": {
+    #       "key": "order_id",
+    #       "must":   { "buyer": "buyerName" },
+    #       "update": { "status": "status" }
+    #     }
+    #   }

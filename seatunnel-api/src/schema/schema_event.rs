@@ -192,6 +192,12 @@ pub struct SchemaChangeEvent {
     pub changes: Vec<SchemaChange>,
     /// Raw DDL statement (if the change originated from a captured DDL).
     pub statement: Option<String>,
+    /// Full schema snapshot for initial-schema events: sources emit one
+    /// per captured table BEFORE its first row so schema-driven sinks
+    /// (e.g. the canal-client format) can configure themselves without
+    /// static column config. `changes` is empty for these events.
+    #[serde(default)]
+    pub initial_schema: Option<TableSchema>,
 }
 
 impl SchemaChangeEvent {
@@ -200,12 +206,29 @@ impl SchemaChangeEvent {
             table: table.into(),
             changes,
             statement: None,
+            initial_schema: None,
+        }
+    }
+
+    /// An initial-schema event: the table's full column layout, no changes.
+    pub fn initial_schema(schema: TableSchema) -> Self {
+        SchemaChangeEvent {
+            table: schema.table_identifier.clone(),
+            changes: Vec::new(),
+            statement: None,
+            initial_schema: Some(schema),
         }
     }
 
     pub fn with_statement(mut self, statement: impl Into<String>) -> Self {
         self.statement = Some(statement.into());
         self
+    }
+
+    /// The schema snapshot carried by an initial-schema event (None for
+    /// regular DDL change events).
+    pub fn initial_schema_snapshot(&self) -> Option<&TableSchema> {
+        self.initial_schema.as_ref()
     }
 }
 

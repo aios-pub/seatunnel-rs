@@ -33,11 +33,62 @@ pub use generated::{
     CancelJobRequest, CheckpointEntry, CheckpointPhase, CheckpointReport, CheckpointResolution,
     CheckpointTrigger, ClusterInfo, Empty, FetchCheckpointRequest, FetchCheckpointResponse,
     HeartbeatRequest, HeartbeatResponse, JobCheckpointHistory, JobList, JobLogs, JobStatus,
-    JobStatusRequest, JobSummary, SubmitJobRequest,
-    SubmitJobResponse, TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs,
-    TaskStatusInfo, TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
+    JobStatusRequest, JobSummary, SinkMetricsStats, SubmitJobRequest, SubmitJobResponse,
+    TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs, TaskStatusInfo,
+    TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
     WorkerRegistrationResponse,
 };
+
+use seatunnel_api::sink::SinkMetricsSnapshot;
+
+impl From<SinkMetricsSnapshot> for SinkMetricsStats {
+    fn from(m: SinkMetricsSnapshot) -> Self {
+        SinkMetricsStats {
+            window_secs: m.window_secs,
+            sent: m.sent,
+            delivered: m.delivered,
+            failed: m.failed,
+            in_flight: m.in_flight,
+            latency_ema_ms: m.latency_ema_ms,
+            latency_max_ms: m.latency_max_ms,
+            last_error: m.last_error.unwrap_or_default(),
+            last_error_at: m.last_error_at,
+        }
+    }
+}
+
+impl From<&SinkMetricsSnapshot> for SinkMetricsStats {
+    fn from(m: &SinkMetricsSnapshot) -> Self {
+        SinkMetricsStats {
+            window_secs: m.window_secs,
+            sent: m.sent,
+            delivered: m.delivered,
+            failed: m.failed,
+            in_flight: m.in_flight,
+            latency_ema_ms: m.latency_ema_ms,
+            latency_max_ms: m.latency_max_ms,
+            last_error: m.last_error.clone().unwrap_or_default(),
+            last_error_at: m.last_error_at,
+        }
+    }
+}
+
+impl From<&SinkMetricsStats> for SinkMetricsSnapshot {
+    fn from(m: &SinkMetricsStats) -> Self {
+        let last_error = (!m.last_error.is_empty()).then(|| m.last_error.clone());
+        SinkMetricsSnapshot {
+            window_secs: m.window_secs,
+            sent: m.sent,
+            delivered: m.delivered,
+            failed: m.failed,
+            in_flight: m.in_flight,
+            latency_ema_ms: m.latency_ema_ms,
+            latency_max_ms: m.latency_max_ms,
+            last_error,
+            last_error_at: m.last_error_at,
+        }
+    }
+}
 
 use generated::{JobState as ProtoJobState, TaskState as ProtoTaskState};
 

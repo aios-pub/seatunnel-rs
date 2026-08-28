@@ -117,10 +117,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
 
 /// Wrap the router with request counting and latency histograms.
 pub fn http_middleware(app: Router, state: AppState) -> Router {
-    app.layer(middleware::from_fn_with_state(
-        state,
-        http_metrics_mw,
-    ))
+    app.layer(middleware::from_fn_with_state(state, http_metrics_mw))
 }
 
 async fn http_metrics_mw(

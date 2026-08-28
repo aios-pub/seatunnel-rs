@@ -38,10 +38,12 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
-    ConfirmSelectOptions, QueueBindOptions, QueueDeclareOptions,
+    ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
 use lapin::types::FieldTable;
-use lapin::{BasicProperties, Channel, Confirmation, Connection, ConnectionProperties};
+use lapin::{
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
+};
 use seatunnel_api::row::{Row, RowKind};
 use seatunnel_api::schema::TableSchema;
 use seatunnel_api::sink::sink_writer::SinkWriter;
@@ -185,14 +187,23 @@ impl RabbitMqConfig {
 
     /// AMQP connection URI with percent-encoded credentials and vhost.
     fn amqp_uri(&self) -> String {
-        let vhost = self.virtual_host.trim_start_matches('/');
+        // The vhost is a single PATH SEGMENT, not a hierarchy: the
+        // default vhost "/" must stay percent-encoded as %2F, and
+        // stripping leading slashes would turn it into the
+        // non-existent "" vhost ("vhost not found" on connection open).
+        let vhost = self.virtual_host.trim();
+        let vhost = if vhost.is_empty() {
+            "%2F".to_string()
+        } else {
+            percent_encode(vhost)
+        };
         format!(
             "amqp://{}:{}@{}:{}/{}",
             percent_encode(&self.username),
             percent_encode(&self.password),
             self.host,
             self.port,
-            percent_encode(vhost)
+            vhost
         )
     }
 
@@ -433,6 +444,19 @@ impl SourceReader for RabbitMqSourceReader {
                 .await
                 .map_err(|e| anyhow::anyhow!("queue_declare failed: {}", e))?;
             if !self.config.exchange.is_empty() {
+                // The exchange must exist before the queue can bind to it.
+                channel
+                    .exchange_declare(
+                        self.config.exchange.as_str().into(),
+                        ExchangeKind::Direct,
+                        ExchangeDeclareOptions {
+                            durable: true,
+                            ..Default::default()
+                        },
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("exchange_declare failed: {}", e))?;
                 let routing_key = self.config.effective_routing_key();
                 channel
                     .queue_bind(
@@ -690,6 +714,48 @@ impl RabbitMqSinkWriter {
                 .await
                 .map_err(|e| anyhow::anyhow!("confirm_select failed: {}", e))?;
         }
+        // Publish topology: the exchange, queue and binding must EXIST
+        // before the first basic.publish — publishing to a missing
+        // exchange kills the channel with a 404. Idempotent declares.
+        if !self.config.exchange.is_empty() {
+            channel
+                .exchange_declare(
+                    self.config.exchange.as_str().into(),
+                    ExchangeKind::Direct,
+                    ExchangeDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("exchange_declare failed: {}", e))?;
+        }
+        if !self.config.queue_name.is_empty() {
+            channel
+                .queue_declare(
+                    self.config.queue_name.as_str().into(),
+                    QueueDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("queue_declare failed: {}", e))?;
+            if !self.config.exchange.is_empty() {
+                channel
+                    .queue_bind(
+                        self.config.queue_name.as_str().into(),
+                        self.config.exchange.as_str().into(),
+                        self.config.effective_routing_key().as_str().into(),
+                        QueueBindOptions::default(),
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("queue_bind failed: {}", e))?;
+            }
+        }
         self.connection = Some(connection);
         self.channel = Some(channel);
         Ok(())
@@ -933,12 +999,14 @@ mod tests {
 
     #[test]
     fn test_amqp_uri_default_and_encoding() {
+        // The default vhost "/" percent-encodes to %2F — an empty vhost
+        // segment is rejected by the broker ("vhost not found").
         let config = RabbitMqConfig::default();
-        assert_eq!(config.amqp_uri(), "amqp://guest:guest@127.0.0.1:5672/");
+        assert_eq!(config.amqp_uri(), "amqp://guest:guest@127.0.0.1:5672/%2F");
         let config = config_from(&[("password", "p@ss/word")]);
         assert_eq!(
             config.amqp_uri(),
-            "amqp://guest:p%40ss%2Fword@127.0.0.1:5672/"
+            "amqp://guest:p%40ss%2Fword@127.0.0.1:5672/%2F"
         );
     }
 

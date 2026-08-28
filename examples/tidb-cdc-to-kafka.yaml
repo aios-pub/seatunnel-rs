@@ -11,7 +11,7 @@
 env:
   job.name: tidb-cdc-to-kafka
   parallelism: 1
-  checkpoint.interval: 5000
+  checkpoint.interval: 10000
 
 source:
   TiDB-CDC:

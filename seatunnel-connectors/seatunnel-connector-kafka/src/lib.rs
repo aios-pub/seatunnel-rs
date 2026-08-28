@@ -769,6 +769,27 @@ pub struct KafkaSinkConfig {
     pub canal_client: Option<seatunnel_formats::canal_client_json::CanalClientConfig>,
     /// Delimiter joining fields for TEXT format payloads.
     pub field_delimiter: String,
+    /// Ordered per-table topic routes (`topic-routes`): the first entry
+    /// whose `pattern` matches the row's origin `database.table` wins;
+    /// unmatched rows fall back to `topic`.
+    pub topic_routes: Vec<TopicRoute>,
+    /// Raw librdkafka producer overrides collected from `producer.*`
+    /// sink options (prefix stripped), applied AFTER the built-in
+    /// defaults so jobs can re-enable e.g. `producer.linger.ms` batching
+    /// or `producer.compression.codec` without code changes.
+    pub producer_props: Vec<(String, String)>,
+}
+
+/// One `topic-routes` entry.
+///
+/// `pattern` is an ANCHORED regex over the origin `database.table`
+/// identifier (e.g. `shop\.orders_.*`, `shop\.users`); `topic` is the
+/// destination and may itself contain the `${database}` / `${table}`
+/// placeholders.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TopicRoute {
+    pub pattern: String,
+    pub topic: String,
 }
 
 impl Default for KafkaSinkConfig {
@@ -788,6 +809,8 @@ impl Default for KafkaSinkConfig {
             partition_key_fields: Vec::new(),
             field_delimiter: ",".to_string(),
             canal_client: None,
+            topic_routes: Vec::new(),
+            producer_props: Vec::new(),
         }
     }
 }
@@ -872,7 +895,415 @@ impl KafkaSinkConfig {
                 "field.delimiter",
                 &config.get_string("field_delimiter", ","),
             ),
+            topic_routes: parse_topic_routes(config),
+            producer_props: {
+                let mut props: Vec<(String, String)> = config
+                    .to_hashmap()
+                    .into_iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix("producer.")
+                            .map(|name| (name.to_string(), value))
+                    })
+                    .collect();
+                props.sort();
+                props
+            },
         }
+    }
+}
+
+/// Parse `topic-routes` / `topic_routes` as a JSON ARRAY of
+/// `{"pattern": ..., "topic": ...}` objects (array form keeps the
+/// declaration order, which decides the delivery order of multi-topic
+/// fan-out; every matching entry receives a copy).
+fn parse_topic_routes(config: &ConnectorConfig) -> Vec<TopicRoute> {
+    let raw = config.get_string("topic-routes", &config.get_string("topic_routes", ""));
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str(&raw) {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::warn!("Kafka sink: ignoring invalid topic-routes ({}): {}", raw, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Resolves the destination topic(s) per record.
+///
+/// ALL `topic-routes` entries whose anchored regex matches the record's
+/// origin `database.table` identifier receive a copy of the message
+/// (mirroring the Java `table_topic_mappings` fan-out: a table listed
+/// under several topics is delivered to each); rendered duplicates are
+/// collapsed. Records matching no route fall back to the `topic` config
+/// value, which may contain the `${database}` / `${table}` placeholders.
+/// A plain `topic` without placeholders and without routes keeps every
+/// record on one topic (the historical behavior) — non-overlapping
+/// route sets behave exactly as before.
+struct TopicRouter {
+    routes: Vec<(regex::Regex, String)>,
+    default_topic: String,
+    /// Resolved destinations per origin table. Routes are static after
+    /// construction, so entries never expire; the map is bounded by the
+    /// number of distinct tables the source emits. Without it every single
+    /// record would re-run the full route regex list and re-render the
+    /// topic strings.
+    cache: HashMap<String, std::sync::Arc<Vec<String>>>,
+}
+
+impl TopicRouter {
+    fn new(default_topic: &str, routes: &[TopicRoute]) -> anyhow::Result<Self> {
+        let compiled = routes
+            .iter()
+            .map(|route| {
+                // Anchored so `shop\.users` matches exactly that table
+                // while `shop\.orders_.*` groups a prefix.
+                let regex =
+                    regex::Regex::new(&format!("^(?s:{})$", route.pattern)).map_err(|e| {
+                        anyhow::anyhow!(
+                            "topic-routes pattern '{}' is not a valid regex: {}",
+                            route.pattern,
+                            e
+                        )
+                    })?;
+                Ok((regex, route.topic.clone()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(TopicRouter {
+            routes: compiled,
+            default_topic: default_topic.to_string(),
+            cache: HashMap::new(),
+        })
+    }
+
+    /// Resolve every destination topic for one record; `origin_table`
+    /// is the `database.table` identifier when the source carried one.
+    /// Results per table are cached (the mapping is static); the shared
+    /// `Arc` clone is a refcount bump on the hot path.
+    fn resolve_all(
+        &mut self,
+        origin_table: Option<&str>,
+    ) -> anyhow::Result<std::sync::Arc<Vec<String>>> {
+        if let Some(identifier) = origin_table {
+            if let Some(cached) = self.cache.get(identifier) {
+                return Ok(std::sync::Arc::clone(cached));
+            }
+            let resolved = std::sync::Arc::new(self.resolve_uncached(origin_table)?);
+            self.cache
+                .insert(identifier.to_string(), std::sync::Arc::clone(&resolved));
+            return Ok(resolved);
+        }
+        // Rows without an origin table never hit the cache path; they are
+        // rare (non-CDC sources) and resolve to the static default topic.
+        Ok(std::sync::Arc::new(self.resolve_uncached(origin_table)?))
+    }
+
+    fn resolve_uncached(&self, origin_table: Option<&str>) -> anyhow::Result<Vec<String>> {
+        let mut topics = Vec::new();
+        if let Some(identifier) = origin_table {
+            for (regex, topic) in &self.routes {
+                if regex.is_match(identifier) {
+                    let rendered = render_topic(topic, identifier)?;
+                    if !topics.contains(&rendered) {
+                        topics.push(rendered);
+                    }
+                }
+            }
+            if topics.len() > 1 {
+                tracing::debug!(
+                    "Kafka sink: table '{}' fans out to {} topics {:?}",
+                    identifier,
+                    topics.len(),
+                    topics
+                );
+            }
+            if !topics.is_empty() {
+                return Ok(topics);
+            }
+        }
+        if !topic_has_placeholders(&self.default_topic) {
+            return Ok(vec![self.default_topic.clone()]);
+        }
+        match origin_table {
+            Some(identifier) => Ok(vec![render_topic(&self.default_topic, identifier)?]),
+            None => anyhow::bail!(
+                "topic '{}' contains ${{table}}/${{database}} placeholders but the row has \
+                 no origin table — only CDC sources (MySQL-CDC) support per-table routing",
+                self.default_topic
+            ),
+        }
+    }
+}
+
+fn topic_has_placeholders(topic: &str) -> bool {
+    topic.contains("${table}") || topic.contains("${database}")
+}
+
+/// Replace the `${database}` / `${table}` placeholders of an identifier
+/// split at the LAST dot (a dot-less identifier degrades to an empty
+/// database).
+fn render_topic(topic: &str, identifier: &str) -> anyhow::Result<String> {
+    let (database, table) = match identifier.rsplit_once('.') {
+        Some((database, table)) => (database, table),
+        None => ("", identifier),
+    };
+    if topic_has_placeholders(topic) && (database.is_empty() || table.is_empty()) {
+        anyhow::bail!(
+            "topic '{}' requires the ${{database}}/${{table}} placeholders but origin \
+             '{}' does not carry both parts",
+            topic,
+            identifier
+        );
+    }
+    Ok(topic
+        .replace("${database}", database)
+        .replace("${table}", table))
+}
+
+/// One enqueued delivery awaiting its broker report. The rdkafka
+/// `send()` call has ALREADY queued the message with the producer's
+/// background thread — this future only observes the delivery report.
+struct InFlightDelivery {
+    topic: String,
+    key: String,
+    payload_head: String,
+    enqueued_at: std::time::Instant,
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+}
+
+/// Bounded FIFO of undelivered messages.
+///
+/// Flush paths only ENQUEUE (`push`) and return immediately, so the
+/// task loop keeps reading the source while librdkafka's background
+/// thread batches and delivers — the read/encode/deliver stages fully
+/// overlap. Backpressure: [`Self::reap_to_limit`] awaits the OLDEST
+/// futures until the queue is back under [`IN_FLIGHT_LIMIT`], keeping
+/// memory bounded. [`Self::drain`] awaits everything (checkpoint /
+/// close barriers — at-least-once delivery is preserved because the
+/// checkpoint cannot advance past undelivered messages).
+struct InFlightDeliveries {
+    pending: std::collections::VecDeque<InFlightDelivery>,
+}
+
+/// Max undelivered messages buffered before flush blocks on the oldest
+/// (~8× the default flush batch; each entry is small — the payload
+/// itself is owned by librdkafka's queue).
+const IN_FLIGHT_LIMIT: usize = 8192;
+
+/// Detail prefix length kept from a payload for error logs.
+const PAYLOAD_HEAD_CHARS: usize = 200;
+
+impl InFlightDeliveries {
+    fn new() -> Self {
+        InFlightDeliveries {
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Register a delivery future (the message is already queued with
+    /// the producer; the future resolves on the delivery report).
+    /// Production paths use [`Self::push_delivery`]; this is the
+    /// synthetic-future entry point for tests.
+    #[cfg(test)]
+    fn push(
+        &mut self,
+        topic: &str,
+        key: &str,
+        payload: &str,
+        future: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        self.pending.push_back(InFlightDelivery {
+            topic: topic.to_string(),
+            key: key.to_string(),
+            payload_head: payload.chars().take(PAYLOAD_HEAD_CHARS).collect(),
+            enqueued_at: std::time::Instant::now(),
+            future: Box::pin(future),
+        });
+    }
+
+    /// Enqueue one owned message for delivery. The rdkafka delivery
+    /// future borrows its record, so the record moves into the future's
+    /// closure (making it 'static) and the `send` itself happens inside
+    /// the closure — calling this does NOT block on the broker.
+    fn push_delivery(
+        &mut self,
+        producer: FutureProducer,
+        topic: String,
+        key: String,
+        payload: String,
+        timeout: Duration,
+    ) {
+        let payload_head: String = payload.chars().take(PAYLOAD_HEAD_CHARS).collect();
+        let future = {
+            let topic = topic.clone();
+            let key = key.clone();
+            async move {
+                producer
+                    .send(
+                        FutureRecord::<str, str>::to(&topic)
+                            .key(&key)
+                            .payload(&payload),
+                        timeout,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|(e, _)| e.to_string())
+            }
+        };
+        self.pending.push_back(InFlightDelivery {
+            topic,
+            key,
+            payload_head,
+            enqueued_at: std::time::Instant::now(),
+            future: Box::pin(future),
+        });
+    }
+
+    /// Await futures (oldest first) collecting outcomes into the
+    /// metrics; returns (delivered, failed, first-few error details).
+    async fn reap(
+        &mut self,
+        take: usize,
+        metrics: &seatunnel_api::sink::SinkMetrics,
+    ) -> (u64, u64, Vec<String>) {
+        let mut delivered = 0u64;
+        let mut failed = 0u64;
+        let mut latencies = Vec::new();
+        let mut errors = Vec::new();
+        let mut last_error: Option<String> = None;
+        for _ in 0..take.min(self.pending.len()) {
+            let Some(delivery) = self.pending.pop_front() else {
+                break;
+            };
+            let latency_ms = delivery.enqueued_at.elapsed().as_millis() as u64;
+            match delivery.future.await {
+                Ok(()) => {
+                    delivered += 1;
+                    latencies.push(latency_ms);
+                }
+                Err(error) => {
+                    failed += 1;
+                    // Detailed per-delivery error log: full rdkafka error
+                    // plus routing context and the payload prefix.
+                    tracing::error!(
+                        topic = %delivery.topic,
+                        key = %delivery.key,
+                        elapsed_ms = latency_ms,
+                        error = %error,
+                        payload_head = %delivery.payload_head,
+                        "kafka delivery failed"
+                    );
+                    let detail = format!(
+                        "{} (topic={}, key={}, after {}ms, payload~'{}')",
+                        error, delivery.topic, delivery.key, latency_ms, delivery.payload_head
+                    );
+                    if last_error.is_none() {
+                        last_error = Some(detail.clone());
+                    }
+                    if errors.len() < 3 {
+                        errors.push(detail);
+                    }
+                }
+            }
+        }
+        metrics.record_deliveries(delivered, failed, &latencies, last_error.as_deref());
+        (delivered, failed, errors)
+    }
+
+    /// Non-blocking sweep over already-resolved futures (polled with
+    /// `now_or_never`, never parks the write loop). Without it, outcomes
+    /// are only observed at the backpressure/drain barriers — under low
+    /// outstanding counts that means the CHECKPOINT boundary, so the
+    /// windowed delivery metrics would report checkpoint cadence instead
+    /// of the real broker latency.
+    fn reap_completed(&mut self, metrics: &seatunnel_api::sink::SinkMetrics) {
+        use futures::FutureExt;
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut delivered = 0u64;
+        let mut failed = 0u64;
+        let mut latencies = Vec::new();
+        let mut last_error: Option<String> = None;
+        let mut retained = VecDeque::with_capacity(self.pending.len());
+        while let Some(mut delivery) = self.pending.pop_front() {
+            let latency_ms = delivery.enqueued_at.elapsed().as_millis() as u64;
+            // `&mut` (always Unpin) lets now_or_never poll without
+            // consuming the boxed future, so unresolved deliveries can
+            // be retained untouched.
+            match (&mut delivery.future).now_or_never() {
+                Some(Ok(())) => {
+                    delivered += 1;
+                    latencies.push(latency_ms);
+                }
+                Some(Err(error)) => {
+                    failed += 1;
+                    tracing::error!(
+                        topic = %delivery.topic,
+                        key = %delivery.key,
+                        elapsed_ms = latency_ms,
+                        error = %error,
+                        payload_head = %delivery.payload_head,
+                        "kafka delivery failed"
+                    );
+                    if last_error.is_none() {
+                        last_error = Some(format!(
+                            "{} (topic={}, key={}, after {}ms, payload~'{}')",
+                            error, delivery.topic, delivery.key, latency_ms, delivery.payload_head
+                        ));
+                    }
+                }
+                None => retained.push_back(delivery),
+            }
+        }
+        self.pending = retained;
+        metrics.record_deliveries(delivered, failed, &latencies, last_error.as_deref());
+    }
+
+    /// Backpressure barrier: await the oldest futures until the queue
+    /// is back under [`IN_FLIGHT_LIMIT`]. Delivery failures surface as
+    /// an aggregated error (task restart replays from the checkpoint).
+    async fn reap_to_limit(
+        &mut self,
+        metrics: &seatunnel_api::sink::SinkMetrics,
+    ) -> anyhow::Result<()> {
+        if self.len() < IN_FLIGHT_LIMIT {
+            return Ok(());
+        }
+        let excess = self.len() - IN_FLIGHT_LIMIT + 1;
+        let (_, failed, errors) = self.reap(excess, metrics).await;
+        if failed > 0 {
+            anyhow::bail!(
+                "failed to deliver {} record(s); first errors: [{}]",
+                failed,
+                errors.join(" | ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Full barrier: await every undelivered message (checkpoint /
+    /// close). Returns the delivered count.
+    async fn drain(&mut self, metrics: &seatunnel_api::sink::SinkMetrics) -> anyhow::Result<u64> {
+        let total = self.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        let (delivered, failed, errors) = self.reap(total, metrics).await;
+        if failed > 0 {
+            anyhow::bail!(
+                "failed to deliver {}/{} record(s); first errors: [{}]",
+                failed,
+                total,
+                errors.join(" | ")
+            );
+        }
+        Ok(delivered)
     }
 }
 
@@ -904,7 +1335,7 @@ impl Sink for KafkaSink {
 
     fn create_writer(
         &self,
-        _ctx: &SinkWriterContext,
+        ctx: &SinkWriterContext,
     ) -> anyhow::Result<
         Box<
             dyn SinkWriter<
@@ -914,12 +1345,15 @@ impl Sink for KafkaSink {
                 >,
         >,
     > {
-        Ok(Box::new(KafkaSinkWriter::new(self.config.clone())?))
+        Ok(Box::new(KafkaSinkWriter::new(
+            self.config.clone(),
+            ctx.metrics.clone(),
+        )?))
     }
 
     fn restore_writer(
         &self,
-        _ctx: &SinkWriterContext,
+        ctx: &SinkWriterContext,
         states: &[Vec<u8>],
     ) -> anyhow::Result<
         Box<
@@ -930,7 +1364,7 @@ impl Sink for KafkaSink {
                 >,
         >,
     > {
-        let mut writer = KafkaSinkWriter::new(self.config.clone())?;
+        let mut writer = KafkaSinkWriter::new(self.config.clone(), ctx.metrics.clone())?;
         if let Some(bytes) = states.last() {
             writer.restore_from_state_bytes(bytes)?;
         }
@@ -977,7 +1411,18 @@ pub struct KafkaSinkWriter {
     /// When the last flush happened; drives the `batch.timeout.ms` linger.
     last_flush: std::time::Instant,
     /// Stateful canal-client encoder (row pairing + filtering + keys).
+    /// Explicit `canal-client.columns` builds a single-table encoder
+    /// eagerly; otherwise the encoder starts EMPTY and registers one
+    /// state per table as the initial-schema events arrive (see
+    /// `apply_schema_change`).
     canal_encoder: Option<seatunnel_formats::canal_client_json::CanalClientEncoder>,
+    /// Per-record topic resolution (`topic-routes` + `topic` template).
+    topic_router: TopicRouter,
+    /// Undelivered messages; flush enqueues without blocking, the
+    /// checkpoint/close barriers drain (see [`InFlightDeliveries`]).
+    in_flight: InFlightDeliveries,
+    /// Windowed delivery metrics shared with the task layer.
+    metrics: std::sync::Arc<seatunnel_api::sink::SinkMetrics>,
     /// Full transactional id (`{prefix}-{pipeline}-{subtask}`); stable
     /// across restarts of the same job so zombies can be fenced.
     txn_base: Option<String>,
@@ -990,13 +1435,26 @@ pub struct KafkaSinkWriter {
 }
 
 impl KafkaSinkWriter {
-    pub fn new(config: KafkaSinkConfig) -> anyhow::Result<Self> {
-        let canal_encoder = config
-            .canal_client
-            .clone()
-            .map(seatunnel_formats::canal_client_json::CanalClientEncoder::new)
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("canal-client format config: {}", e))?;
+    pub fn new(
+        config: KafkaSinkConfig,
+        metrics: std::sync::Arc<seatunnel_api::sink::SinkMetrics>,
+    ) -> anyhow::Result<Self> {
+        let topic_router = TopicRouter::new(&config.topic, &config.topic_routes)?;
+        // Explicit canal-client config (columns + sub-table-fields entry)
+        // builds the single-table encoder eagerly and fails fast on a
+        // missing mapping. Without `canal-client.columns` the encoder
+        // starts empty and registers per-table states from the source's
+        // initial-schema events (automatic column mapping).
+        let canal_encoder = match &config.canal_client {
+            Some(canal) if !canal.columns.is_empty() => Some(
+                seatunnel_formats::canal_client_json::CanalClientEncoder::new(canal.clone())
+                    .map_err(|e| anyhow::anyhow!("canal-client format config: {}", e))?,
+            ),
+            Some(canal) => Some(
+                seatunnel_formats::canal_client_json::CanalClientEncoder::new_auto(canal.clone()),
+            ),
+            None => None,
+        };
         let txn_base = config.transactions_enabled.then(|| {
             format!(
                 "{}-{}-{}",
@@ -1015,11 +1473,40 @@ impl KafkaSinkWriter {
             producer: None,
             last_flush: std::time::Instant::now(),
             canal_encoder,
+            topic_router,
+            in_flight: InFlightDeliveries::new(),
+            metrics,
             txn_base,
             txn_open: false,
             txn_messages: 0,
             last_committed_checkpoint: 0,
         })
+    }
+
+    /// Register one table's schema in the schema-driven canal-client
+    /// encoder. Explicit encoders ignore registrations (their static
+    /// column list stays authoritative); replayed events are idempotent.
+    fn register_canal_schema(&mut self, schema: &seatunnel_api::TableSchema) -> anyhow::Result<()> {
+        let Some(encoder) = &mut self.canal_encoder else {
+            return Ok(());
+        };
+        if encoder.is_explicit() {
+            return Ok(());
+        }
+        let already_registered = encoder.registered_tables();
+        encoder
+            .register_schema(schema)
+            .map_err(|e| anyhow::anyhow!("canal-client auto mapping: {}", e))?;
+        if encoder.registered_tables() != already_registered {
+            tracing::info!(
+                "KafkaSinkWriter: canal-client auto mapping registered schema '{}' \
+                 ({} columns, {} table(s) total)",
+                schema.table_identifier,
+                schema.columns.len(),
+                encoder.registered_tables()
+            );
+        }
+        Ok(())
     }
 
     /// Restore the writer's checkpoint progress (last committed checkpoint
@@ -1045,7 +1532,7 @@ impl KafkaSinkWriter {
         Ok(())
     }
 
-    /// Whether the canal-client stateful encoder is active (diagnostics).
+    /// Whether the canal-client stateful encoder is active.
     pub fn uses_canal_client(&self) -> bool {
         self.canal_encoder.is_some()
     }
@@ -1070,6 +1557,14 @@ impl KafkaSinkWriter {
             // Batch without the artificial delay and let TCP stack coalesce.
             .set("linger.ms", "0")
             .set("socket.nagle.disable", "true");
+        // `producer.*` overrides come last so they win over the defaults
+        // above — e.g. `producer.linger.ms: 5` re-enables librdkafka
+        // batching on links that tolerate it (with the in-flight delivery
+        // pipeline the task loop no longer blocks per message).
+        for (name, value) in &self.config.producer_props {
+            tracing::debug!("Kafka sink: producer override {}={}", name, value);
+            builder.set(name, value);
+        }
         if let Some(txn_base) = &self.txn_base {
             tracing::info!("Kafka sink: transactional producer id={}", txn_base);
             builder.set("transactional.id", txn_base);
@@ -1090,6 +1585,44 @@ impl KafkaSinkWriter {
         Ok(())
     }
 
+    /// Resolve the destination topic(s) for one encoded message and
+    /// enqueue a delivery to each (fan-out copies share the same
+    /// payload/requestId). The owned key and payload move into the LAST
+    /// delivery — single-topic delivery (the common case) never clones
+    /// the payload, earlier fan-out copies clone once per extra topic.
+    /// Returns the number of deliveries enqueued.
+    fn fanout_delivery(
+        router: &mut TopicRouter,
+        in_flight: &mut InFlightDeliveries,
+        producer: &FutureProducer,
+        origin: Option<&str>,
+        key: String,
+        payload: String,
+        timeout: Duration,
+    ) -> anyhow::Result<usize> {
+        let topics = router
+            .resolve_all(origin)
+            .map_err(|e| anyhow::anyhow!("topic routing: {}", e))?;
+        let last_idx = topics.len().saturating_sub(1);
+        let mut key = Some(key);
+        let mut payload = Some(payload);
+        for (i, topic) in topics.iter().enumerate() {
+            let is_last = i == last_idx;
+            let key = if is_last {
+                key.take().unwrap()
+            } else {
+                key.as_ref().unwrap().clone()
+            };
+            let payload = if is_last {
+                payload.take().unwrap()
+            } else {
+                payload.as_ref().unwrap().clone()
+            };
+            in_flight.push_delivery(producer.clone(), topic.clone(), key, payload, timeout);
+        }
+        Ok(topics.len())
+    }
+
     /// Deliver buffered records to Kafka. With transactions enabled the
     /// records are produced into the currently OPEN transaction but never
     /// committed here — only `prepare_commit` (checkpoint boundary) commits.
@@ -1107,51 +1640,59 @@ impl KafkaSinkWriter {
         // message. Runs even for empty batches so held before-images
         // whose pairing window expired are emitted as real deletes.
         if let Some(encoder) = &mut self.canal_encoder {
-            let topic = self.config.topic.clone();
+            if encoder.registered_tables() == 0 && !records.is_empty() {
+                // Automatic mapping still waiting for every table's
+                // initial-schema event; reaching here with buffered rows
+                // means the source emitted data before its schema (or
+                // never emitted one).
+                anyhow::bail!(
+                    "canal-client automatic column mapping: {} row(s) arrived before any \
+                     initial schema event — the source must emit the table schema first \
+                     (MySQL-CDC does; or configure canal-client.columns explicitly)",
+                    records.len()
+                );
+            }
             let mut sent = 0usize;
-            let mut failures = Vec::new();
+            let timeout = Duration::from_millis(self.config.message_timeout_ms);
             for record in &records {
                 let messages = encoder
                     .encode(record)
                     .map_err(|e| anyhow::anyhow!("canal-client encode: {}", e))?;
-                for (key, payload) in messages {
-                    match producer
-                        .send(
-                            FutureRecord::<str, str>::to(&topic)
-                                .key(key.as_str())
-                                .payload(&payload),
-                            Duration::from_millis(self.config.message_timeout_ms),
-                        )
-                        .await
-                    {
-                        Ok(_) => sent += 1,
-                        Err((e, _)) => failures.push(e.to_string()),
-                    }
+                for message in messages {
+                    // Multi-topic fan-out: every matching route gets the
+                    // SAME encoded message (same requestId — a usable
+                    // idempotency key across topics).
+                    sent += Self::fanout_delivery(
+                        &mut self.topic_router,
+                        &mut self.in_flight,
+                        &producer,
+                        Some(message.table.as_str()),
+                        message.key,
+                        message.payload,
+                        timeout,
+                    )?;
                 }
             }
-            for (key, payload) in encoder.expire_pending() {
-                match producer
-                    .send(
-                        FutureRecord::<str, str>::to(&topic)
-                            .key(key.as_str())
-                            .payload(&payload),
-                        Duration::from_millis(self.config.message_timeout_ms),
-                    )
-                    .await
-                {
-                    Ok(_) => sent += 1,
-                    Err((e, _)) => failures.push(e.to_string()),
-                }
+            for message in encoder.expire_pending() {
+                sent += Self::fanout_delivery(
+                    &mut self.topic_router,
+                    &mut self.in_flight,
+                    &producer,
+                    Some(message.table.as_str()),
+                    message.key,
+                    message.payload,
+                    timeout,
+                )?;
             }
-            if !failures.is_empty() {
-                anyhow::bail!(
-                    "failed to deliver {} record(s): {}",
-                    failures.len(),
-                    failures.first().map(String::as_str).unwrap_or("unknown")
-                );
-            }
+            self.metrics.record_sent(sent as u64);
             self.total_written += sent;
             self.txn_messages += sent;
+            // Non-blocking sweep of resolved futures keeps the
+            // windowed metrics at real broker latency, then bounded
+            // backpressure (normally returns immediately, letting the
+            // source keep reading while delivery overlaps).
+            self.in_flight.reap_completed(&self.metrics);
+            self.in_flight.reap_to_limit(&self.metrics).await?;
             return Ok(sent);
         }
 
@@ -1159,14 +1700,8 @@ impl KafkaSinkWriter {
             return Ok(0);
         }
 
-        let topic = self.config.topic.clone();
         let timeout = Duration::from_millis(self.config.message_timeout_ms);
         let mut sent = 0usize;
-        let mut failures = Vec::new();
-        // Enqueue every record first (librdkafka batches internally), then
-        // await the delivery reports. Awaiting each send serializes a
-        // broker round trip per record; pipelining keeps the producer
-        // queue full so batches actually form.
         let payloads: Vec<String> = records
             .iter()
             .map(|record| encode_row(record, &self.config.format, &self.config.field_delimiter))
@@ -1175,34 +1710,36 @@ impl KafkaSinkWriter {
             .iter()
             .map(|record| row_key(record, &self.config.partition_key_fields))
             .collect();
-        let mut deliveries = Vec::with_capacity(payloads.len());
-        for (payload, key) in payloads.iter().zip(keys.iter()) {
-            let message = FutureRecord::<str, str>::to(&topic).payload(payload.as_str());
-            let message = match key {
-                Some(key) => message.key(key.as_str()),
-                None => message,
-            };
-            deliveries.push(producer.send(message, timeout));
+        // Rows carrying an origin table (CDC sources) resolve their
+        // topic(s) per record — possibly several when overlapping routes
+        // fan out; rows without one share the static topic.
+        //
+        // Enqueue every record (librdkafka batches in the background);
+        // the delivery futures are observed at the reap/drain barriers,
+        // so the source keeps reading while delivery overlaps.
+        for ((payload, key), record) in payloads
+            .into_iter()
+            .zip(keys.into_iter())
+            .zip(records.iter())
+        {
+            sent += Self::fanout_delivery(
+                &mut self.topic_router,
+                &mut self.in_flight,
+                &producer,
+                record.origin_table.as_deref(),
+                key.unwrap_or_default(),
+                payload,
+                timeout,
+            )?;
         }
-        for delivery in deliveries {
-            match delivery.await {
-                Ok(_) => sent += 1,
-                Err((e, _)) => failures.push(e.to_string()),
-            }
-        }
-
-        if !failures.is_empty() {
-            // At-least-once delivery contract: surface partial failures so
-            // the engine can retry from the last checkpoint.
-            anyhow::bail!(
-                "failed to deliver {} record(s): {}",
-                failures.len(),
-                failures.first().map(String::as_str).unwrap_or("unknown")
-            );
-        }
-
+        self.metrics.record_sent(sent as u64);
         self.total_written += sent;
         self.txn_messages += sent;
+        // Non-blocking sweep of resolved futures keeps the windowed
+        // metrics at real broker latency; bounded backpressure only —
+        // normally returns immediately.
+        self.in_flight.reap_completed(&self.metrics);
+        self.in_flight.reap_to_limit(&self.metrics).await?;
         Ok(sent)
     }
 }
@@ -1255,6 +1792,25 @@ impl SinkWriter for KafkaSinkWriter {
         })
     }
 
+    fn apply_schema_change(
+        &mut self,
+        event: &seatunnel_api::SchemaChangeEvent,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        // Canal-client automatic mapping: EVERY initial-schema event
+        // registers its table (positional columns, primary key, identity
+        // field mapping), so multi-table sources map each table with its
+        // own schema. Regular DDL changes are still ignored in auto mode;
+        // tracking schema evolution needs the explicit
+        // canal-client.columns config.
+        if self.config.canal_client.is_some() {
+            if let Some(schema) = event.initial_schema_snapshot() {
+                let schema = schema.clone();
+                return Box::pin(async move { self.register_canal_schema(&schema) });
+            }
+        }
+        Box::pin(async move { Ok(()) })
+    }
+
     fn prepare_commit(
         &mut self,
         checkpoint_id: u64,
@@ -1262,6 +1818,13 @@ impl SinkWriter for KafkaSinkWriter {
         Box::pin(async move {
             let pending = self.batch.len();
             let delivered = self.flush_batch().await?;
+            // Checkpoint barrier: every message enqueued before this
+            // checkpoint must be DELIVERED before it advances, otherwise
+            // a crash right after the commit would lose buffered sends
+            // (at-least-once contract). The drained count spans all
+            // write-triggered flushes since the previous checkpoint, not
+            // just this flush's batch.
+            self.in_flight.drain(&self.metrics).await?;
             let mut info = KafkaCommitInfo {
                 transaction_id: self
                     .txn_base
@@ -1341,19 +1904,27 @@ impl SinkWriter for KafkaSinkWriter {
             }
             // Canal-client: emit any held before-image as a final delete.
             if let (Some(encoder), Some(producer)) = (&mut self.canal_encoder, &self.producer) {
-                for (key, payload) in encoder.flush() {
-                    if let Err((e, _)) = producer
-                        .send(
-                            FutureRecord::<str, str>::to(&self.config.topic)
-                                .key(key.as_str())
-                                .payload(&payload),
-                            Duration::from_millis(self.config.message_timeout_ms),
-                        )
-                        .await
-                    {
-                        tracing::warn!("KafkaSinkWriter: canal-client final flush failed: {}", e);
+                let timeout = Duration::from_millis(self.config.message_timeout_ms);
+                for message in encoder.flush() {
+                    if let Err(e) = Self::fanout_delivery(
+                        &mut self.topic_router,
+                        &mut self.in_flight,
+                        producer,
+                        Some(message.table.as_str()),
+                        message.key,
+                        message.payload,
+                        timeout,
+                    ) {
+                        tracing::warn!(
+                            "KafkaSinkWriter: canal-client final flush routing failed: {}",
+                            e
+                        );
                     }
                 }
+            }
+            // Close barrier: wait for every undelivered message.
+            if let Err(e) = self.in_flight.drain(&self.metrics).await {
+                tracing::warn!("KafkaSinkWriter: final drain failed: {}", e);
             }
             // Transactional mode: the graceful path committed at the final
             // checkpoint; whatever landed in the still-open transaction
@@ -1595,12 +2166,19 @@ mod tests {
         assert_eq!(splits.len(), 4);
     }
 
+    fn metrics() -> std::sync::Arc<seatunnel_api::sink::SinkMetrics> {
+        std::sync::Arc::new(seatunnel_api::sink::SinkMetrics::new())
+    }
+
     #[test]
     fn test_kafka_sink_writer_creation() {
-        let writer = KafkaSinkWriter::new(KafkaSinkConfig {
-            batch_size: 50,
-            ..KafkaSinkConfig::default()
-        })
+        let writer = KafkaSinkWriter::new(
+            KafkaSinkConfig {
+                batch_size: 50,
+                ..KafkaSinkConfig::default()
+            },
+            metrics(),
+        )
         .unwrap();
         assert!(writer.batch.is_empty());
         assert_eq!(writer.total_written, 0);
@@ -1735,8 +2313,130 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         let cfg = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
-        let writer = KafkaSinkWriter::new(cfg).unwrap();
+        let writer = KafkaSinkWriter::new(cfg, metrics()).unwrap();
         assert!(writer.uses_canal_client());
+    }
+
+    #[test]
+    fn test_canal_client_auto_mode_defers_to_schema_event() {
+        // No canal-client.columns / sub-table-fields: the encoder starts
+        // empty and registers one state per table as the initial-schema
+        // events arrive. The producer connects lazily, so this path never
+        // contacts a broker in the error case.
+        let props: HashMap<String, String> = [
+            ("bootstrap.servers", "127.0.0.1:9092"),
+            ("topic", "users-canal-auto"),
+            ("format", "canal_client_json"),
+            ("canal-client.database-name", "seatunnel"),
+            ("canal-client.table-name", "users"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let cfg = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
+        let mut writer = KafkaSinkWriter::new(cfg, metrics()).unwrap();
+        assert!(writer.uses_canal_client());
+        assert_eq!(
+            writer.canal_encoder.as_ref().unwrap().registered_tables(),
+            0,
+            "auto mode starts with no table registered"
+        );
+
+        // Data before the schema event must fail loudly, not encode as
+        // plain JSON.
+        writer.batch.push({
+            let mut row = Row::new(RowKind::Insert, 3);
+            row.set(0, seatunnel_api::Field::Int64(1));
+            row.set(1, seatunnel_api::Field::String("alice".into()));
+            row.set(2, seatunnel_api::Field::Int64(90));
+            row
+        });
+        let flushed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(writer.flush_batch());
+        assert!(flushed.is_err(), "rows before the schema event must error");
+        assert!(
+            writer.batch.is_empty(),
+            "failed flush still drains the batch"
+        );
+
+        // The initial-schema event configures the automatic mapping:
+        // all columns identity-mapped, primary key as partition key.
+        let schema = seatunnel_api::TableSchema::new(
+            "seatunnel.users",
+            vec![
+                seatunnel_api::ColumnDef::new("id", seatunnel_api::ColumnType::Int64).primary_key(),
+                seatunnel_api::ColumnDef::new("name", seatunnel_api::ColumnType::String),
+                seatunnel_api::ColumnDef::new("score", seatunnel_api::ColumnType::Int64),
+            ],
+        );
+        let event = seatunnel_api::SchemaChangeEvent::initial_schema(schema);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(writer.apply_schema_change(&event))
+            .unwrap();
+        assert_eq!(
+            writer.canal_encoder.as_ref().unwrap().registered_tables(),
+            1
+        );
+        assert_eq!(writer.canal_encoder.as_ref().unwrap().fields().key, "id");
+
+        // A row without origin identity falls back to the first
+        // registered table (single-table backward compatibility) and
+        // encodes as a canal-client insert message.
+        let mut row = Row::new(RowKind::Insert, 3);
+        row.set(0, seatunnel_api::Field::Int64(1));
+        row.set(1, seatunnel_api::Field::String("alice".into()));
+        row.set(2, seatunnel_api::Field::Int64(90));
+        let mut encoder = writer.canal_encoder.take().expect("encoder configured");
+        let messages = encoder.encode(&row).unwrap();
+        writer.canal_encoder = Some(encoder);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].key, "1");
+        let payload: serde_json::Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(payload["dbName"], "seatunnel");
+        assert_eq!(payload["tableName"], "users");
+        assert_eq!(payload["eventType"], "insert");
+        assert_eq!(payload["data"]["name"], "alice");
+        assert_eq!(payload["data"]["score"], 90);
+
+        // A later initial event REGISTERS its own table: multi-table
+        // sources map each table with its own schema.
+        let schema2 = seatunnel_api::TableSchema::new(
+            "seatunnel.users_2",
+            vec![
+                seatunnel_api::ColumnDef::new("id", seatunnel_api::ColumnType::Int64).primary_key(),
+                seatunnel_api::ColumnDef::new("other", seatunnel_api::ColumnType::String),
+            ],
+        );
+        let event2 = seatunnel_api::SchemaChangeEvent::initial_schema(schema2);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(writer.apply_schema_change(&event2))
+            .unwrap();
+        let encoder = writer.canal_encoder.as_ref().unwrap();
+        assert_eq!(encoder.registered_tables(), 2, "every schema registers");
+        assert_eq!(
+            encoder.fields().must.len(),
+            3,
+            "the default (first) table keeps its mapping"
+        );
+
+        // A row tagged with the second table encodes against ITS schema.
+        let mut row2 = Row::new(RowKind::Insert, 2);
+        row2.set(0, seatunnel_api::Field::Int64(7));
+        row2.set(1, seatunnel_api::Field::String("bob".into()));
+        row2.origin_table = Some("seatunnel.users_2".to_string());
+        let mut encoder = writer.canal_encoder.take().unwrap();
+        let messages = encoder.encode(&row2).unwrap();
+        writer.canal_encoder = Some(encoder);
+        assert_eq!(messages.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(payload["tableName"], "users_2");
+        assert_eq!(payload["data"]["other"], "bob");
     }
 
     #[test]
@@ -1750,5 +2450,355 @@ mod tests {
         assert_eq!(kafka_config.bootstrap_servers, "broker:9092");
         assert_eq!(kafka_config.topic, "my-topic");
         assert_eq!(kafka_config.format, MessageFormat::Json);
+    }
+
+    #[test]
+    fn test_topic_router_literal_topic_is_static() {
+        let mut router = TopicRouter::new("plain-topic", &[]).unwrap();
+        assert_eq!(*router.resolve_all(None).unwrap(), vec!["plain-topic"]);
+        assert_eq!(
+            (*router.resolve_all(Some("shop.orders")).unwrap()),
+            vec!["plain-topic"],
+            "a literal topic ignores row origins"
+        );
+    }
+
+    #[test]
+    fn test_topic_router_caches_resolved_topics_per_table() {
+        let routes: Vec<TopicRoute> = serde_json::from_str(
+            r#"[
+                {"pattern": "shop\\.orders", "topic": "topic_orders"},
+                {"pattern": "shop\\..*", "topic": "log_${table}"}
+            ]"#,
+        )
+        .unwrap();
+        let mut router = TopicRouter::new("fallback", &routes).unwrap();
+        let first = router.resolve_all(Some("shop.orders")).unwrap();
+        assert_eq!(*first, vec!["topic_orders", "log_orders"]);
+        let second = router.resolve_all(Some("shop.orders")).unwrap();
+        // Cache hit: same allocation, not a re-resolve through the regexes.
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "repeated tables must resolve through the cache"
+        );
+        assert_eq!(router.cache.len(), 1, "only the seen table is cached");
+        // A different table resolves independently.
+        assert_eq!(
+            (*router.resolve_all(Some("shop.users")).unwrap()),
+            vec!["log_users"]
+        );
+        assert_eq!(router.cache.len(), 2);
+    }
+
+    #[test]
+    fn test_producer_props_passthrough_parsed_and_isolated() {
+        let props: HashMap<String, String> = [
+            ("bootstrap.servers", "127.0.0.1:9092"),
+            ("topic", "users"),
+            // Producer overrides: prefix stripped, value kept verbatim.
+            ("producer.linger.ms", "5"),
+            ("producer.compression.codec", "lz4"),
+            ("producer.queue.buffering.max.messages", "200000"),
+            // The bare `linger.ms` is the INTERNAL batch linger, not a
+            // librdkafka property — it must NOT leak into producer_props.
+            ("linger.ms", "100"),
+            ("batch.size", "500"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let cfg = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
+        assert_eq!(
+            cfg.producer_props,
+            vec![
+                ("compression.codec".to_string(), "lz4".to_string()),
+                ("linger.ms".to_string(), "5".to_string()),
+                (
+                    "queue.buffering.max.messages".to_string(),
+                    "200000".to_string()
+                ),
+            ],
+            "producer.* options pass through with the prefix stripped (sorted)"
+        );
+        // The internal batch linger stays separate from the passthrough.
+        assert_eq!(cfg.batch_timeout_ms, 100);
+        assert_eq!(cfg.batch_size, 500);
+    }
+
+    #[test]
+    fn test_topic_router_template_renders_per_table() {
+        let mut router = TopicRouter::new("cdc_${table}", &[]).unwrap();
+        assert_eq!(
+            (*router.resolve_all(Some("shop.orders")).unwrap()),
+            vec!["cdc_orders"],
+            "identifier splits at the LAST dot"
+        );
+        assert_eq!(
+            (*router.resolve_all(Some("shop.a.b")).unwrap()),
+            vec!["cdc_b"],
+            "dots inside table names keep everything after the last dot"
+        );
+        assert!(
+            router.resolve_all(None).is_err(),
+            "a template without origin identity must fail loudly"
+        );
+    }
+
+    #[test]
+    fn test_topic_router_all_matches_fan_out() {
+        let routes: Vec<TopicRoute> = serde_json::from_str(
+            r#"[
+                {"pattern": "shop\\.orders_.*", "topic": "topic_orders"},
+                {"pattern": "shop\\..*", "topic": "topic_shop_${table}"}
+            ]"#,
+        )
+        .unwrap();
+        let mut router = TopicRouter::new("cdc_catch_all", &routes).unwrap();
+        // Overlapping routes deliver to EVERY match, in declaration order
+        // (the Java table_topic_mappings fan-out semantics).
+        assert_eq!(
+            (*router.resolve_all(Some("shop.orders_2024")).unwrap()),
+            vec!["topic_orders", "topic_shop_orders_2024"],
+            "every matching route receives a copy"
+        );
+        assert_eq!(
+            (*router.resolve_all(Some("shop.users")).unwrap()),
+            vec!["topic_shop_users"],
+            "a single match stays single"
+        );
+        assert_eq!(
+            (*router.resolve_all(Some("other.db.users")).unwrap()),
+            vec!["cdc_catch_all"],
+            "unmatched rows fall back to the default topic"
+        );
+        // Patterns are anchored: a substring alone does not match.
+        assert_eq!(
+            (*router.resolve_all(Some("shopx.users")).unwrap()),
+            vec!["cdc_catch_all"]
+        );
+    }
+
+    #[test]
+    fn test_topic_router_dedupes_identical_rendered_topics() {
+        // Three routes match `shop.users`, two of them rendering the SAME
+        // topic name — the duplicate collapses to one delivery.
+        let routes: Vec<TopicRoute> = serde_json::from_str(
+            r#"[
+                {"pattern": "shop\\.users", "topic": "topic_users"},
+                {"pattern": "shop\\..*", "topic": "topic_users"},
+                {"pattern": "shop\\..*", "topic": "log_${table}"}
+            ]"#,
+        )
+        .unwrap();
+        let mut router = TopicRouter::new("t", &routes).unwrap();
+        assert_eq!(
+            (*router.resolve_all(Some("shop.users")).unwrap()),
+            vec!["topic_users", "log_users"],
+            "routes rendering the same topic deliver only once"
+        );
+    }
+
+    #[test]
+    fn test_topic_router_invalid_regex_fails_fast() {
+        let routes: Vec<TopicRoute> =
+            serde_json::from_str(r#"[{"pattern": "shop\\.(users", "topic": "t"}]"#).unwrap();
+        assert!(TopicRouter::new("t", &routes).is_err());
+    }
+
+    #[test]
+    fn test_topic_routes_config_parsing() {
+        let props: HashMap<String, String> = [
+            ("bootstrap.servers", "127.0.0.1:9092"),
+            ("topic", "cdc_${table}"),
+            (
+                "topic-routes",
+                "[{\"pattern\": \"shop\\\\.orders.*\", \"topic\": \"topic_orders\"}]",
+            ),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let config = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
+        assert_eq!(config.topic_routes.len(), 1);
+        assert_eq!(config.topic_routes[0].pattern, "shop\\.orders.*");
+        assert_eq!(config.topic_routes[0].topic, "topic_orders");
+
+        // Underscore alias parses too.
+        let props: HashMap<String, String> =
+            [("topic_routes", "[{\"pattern\": \"a\", \"topic\": \"b\"}]")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        assert_eq!(
+            KafkaSinkConfig::from_config(&ConnectorConfig::new(props))
+                .topic_routes
+                .len(),
+            1
+        );
+
+        // Invalid JSON degrades to no routes (with a warning), not a panic.
+        let props: HashMap<String, String> = [("topic-routes", "not-json".to_string())]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert!(
+            KafkaSinkConfig::from_config(&ConnectorConfig::new(props))
+                .topic_routes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_canal_topic_routing_resolves_per_message_table() {
+        // The canal path routes each ENCODED MESSAGE (not each row) so
+        // paired updates and expired pairing deletes land on their own
+        // table's topic(s).
+        let routes: Vec<TopicRoute> = serde_json::from_str(
+            r#"[
+                {"pattern": "neworiental_v3\\.entity_question", "topic": "resource_binlog"},
+                {"pattern": "neworiental_v3\\.entity_.*", "topic": "entity_binlog"}
+            ]"#,
+        )
+        .unwrap();
+        let props: HashMap<String, String> = [
+            ("bootstrap.servers", "127.0.0.1:9092"),
+            ("topic", "cdc_${table}"),
+            ("format", "canal_client_json"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut cfg = KafkaSinkConfig::from_config(&ConnectorConfig::new(props));
+        cfg.topic_routes = routes;
+        let mut writer = KafkaSinkWriter::new(cfg, metrics()).unwrap();
+        for identifier in ["neworiental_v3.entity_question", "shop.orders"] {
+            let schema = seatunnel_api::TableSchema::new(
+                identifier,
+                vec![
+                    seatunnel_api::ColumnDef::new("id", seatunnel_api::ColumnType::Int64)
+                        .primary_key(),
+                    seatunnel_api::ColumnDef::new("name", seatunnel_api::ColumnType::String),
+                ],
+            );
+            let event = seatunnel_api::SchemaChangeEvent::initial_schema(schema);
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(writer.apply_schema_change(&event))
+                .unwrap();
+        }
+
+        let tagged_row = |kind: RowKind, id: i64, name: &str| {
+            let mut row = Row::new(kind, 2);
+            row.set(0, seatunnel_api::Field::Int64(id));
+            row.set(1, seatunnel_api::Field::String(name.into()));
+            row.origin_table = Some("neworiental_v3.entity_question".to_string());
+            row
+        };
+
+        // An UPDATE (delete+insert pair) becomes ONE message that fans
+        // out to BOTH matching topics — the real-business double-routing
+        // case (entity_question → resource_binlog + question_html…).
+        let mut encoder = writer.canal_encoder.take().unwrap();
+        encoder
+            .encode(&tagged_row(RowKind::Delete, 1, "old"))
+            .unwrap();
+        let messages = encoder
+            .encode(&tagged_row(RowKind::Insert, 1, "new"))
+            .unwrap();
+        writer.canal_encoder = Some(encoder);
+        assert_eq!(messages.len(), 1, "paired update is one message");
+        assert_eq!(
+            writer
+                .topic_router
+                .resolve_all(Some(messages[0].table.as_str()))
+                .unwrap()
+                .as_ref()
+                .clone(),
+            vec!["resource_binlog", "entity_binlog"],
+            "both matching routes receive the same update message"
+        );
+
+        // A single-table row resolves through the template fallback.
+        let mut encoder = writer.canal_encoder.take().unwrap();
+        let mut row = Row::new(RowKind::Insert, 2);
+        row.set(0, seatunnel_api::Field::Int64(1));
+        row.set(1, seatunnel_api::Field::String("a".into()));
+        row.origin_table = Some("shop.orders".to_string());
+        let messages = encoder.encode(&row).unwrap();
+        writer.canal_encoder = Some(encoder);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].table, "shop.orders");
+        assert_eq!(
+            writer
+                .topic_router
+                .resolve_all(Some(messages[0].table.as_str()))
+                .unwrap()
+                .as_ref()
+                .clone(),
+            vec!["cdc_orders"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_tracker_fifo_reap_and_drain() {
+        let mut tracker = InFlightDeliveries::new();
+        let metrics = seatunnel_api::sink::SinkMetrics::new();
+        // Push in order: ok, err, ok.
+        tracker.push("t1", "k1", "p1", async { Ok(()) });
+        tracker.push("t2", "k2", "p2", async { Err("boom t2".to_string()) });
+        tracker.push("t3", "k3", "p3", async { Ok(()) });
+        assert_eq!(tracker.len(), 3);
+
+        // Partial reap (FIFO order) surfaces the failure.
+        let (delivered, failed, errors) = tracker.reap(2, &metrics).await;
+        assert_eq!((delivered, failed), (1, 1));
+        assert_eq!(
+            errors,
+            vec!["boom t2 (topic=t2, key=k2, after 0ms, payload~'p2')"]
+        );
+        assert_eq!(tracker.len(), 1);
+
+        // Drain finishes the rest.
+        let delivered = tracker.drain(&metrics).await.unwrap();
+        assert_eq!(delivered, 1);
+        assert_eq!(tracker.len(), 0);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sent, 0, "push itself does not count as sent");
+        assert_eq!(snapshot.delivered, 2);
+        assert_eq!(snapshot.failed, 1);
+        assert!(snapshot.last_error.as_deref().unwrap().contains("boom t2"));
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_drain_aggregates_error_details() {
+        let mut tracker = InFlightDeliveries::new();
+        let metrics = seatunnel_api::sink::SinkMetrics::new();
+        for i in 0..5 {
+            tracker.push(
+                &format!("topic-{i}"),
+                &format!("key-{i}"),
+                &format!("payload-{i}"),
+                async move { Err(format!("err-{i}")) },
+            );
+        }
+        let err = tracker.drain(&metrics).await.unwrap_err().to_string();
+        assert!(err.contains("5/5"), "message names the total: {err}");
+        // Only the first few details are embedded.
+        assert!(err.contains("err-0") && err.contains("err-2"));
+        assert!(!err.contains("err-4"), "details capped at 3: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_reap_to_limit_is_noop_below_limit() {
+        let mut tracker = InFlightDeliveries::new();
+        let metrics = seatunnel_api::sink::SinkMetrics::new();
+        tracker.push("t", "k", "p", async { Ok(()) });
+        // Under the limit: returns without awaiting (verified by the
+        // queue staying full afterwards until drain).
+        tracker.reap_to_limit(&metrics).await.unwrap();
+        assert_eq!(tracker.len(), 1);
+        tracker.drain(&metrics).await.unwrap();
     }
 }

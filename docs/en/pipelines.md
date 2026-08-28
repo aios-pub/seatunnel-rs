@@ -11,7 +11,7 @@ read connection.
 env:
   job.name: demo
   parallelism: 2                  # default parallelism for every pipeline
-  checkpoint.interval: 5000
+  checkpoint.interval: 10000
   on-sink-failure: fail           # default fan-out failure policy
 
 pipelines:

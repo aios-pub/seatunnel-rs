@@ -29,16 +29,15 @@ state. Ports/login can be overridden (`WEB_LISTEN`, `MASTER_ADDR`,
 
 > A job submission fails with `no worker registered` when the console's
 > master has no registered worker — jobs are only scheduled to workers.
-> The demo script (or starting a worker manually) fixes it.
+> The demo script (or a `--role hybrid` node, which embeds a worker)
+> fixes it.
 
 ### Manual startup
 
-Start a cluster (master + at least one worker), then the console:
+Start a cluster node, then the console:
 
 ```bash
-seatunnel-engine-server --role master --addr 127.0.0.1:5800
-seatunnel-engine-server --role worker --addr 127.0.0.1:5801 \
-    --master 127.0.0.1:5800 --worker-id w1
+seatunnel-engine-server --role hybrid --addr 127.0.0.1:5800
 
 seatunnel-web --master 127.0.0.1:5800 --listen 0.0.0.0:8080
 ```

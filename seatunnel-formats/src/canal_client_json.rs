@@ -46,6 +46,16 @@
 //!   before-image regardless of the changed flag;
 //! - the Kafka partition key is the configured primary-key value.
 //!
+//! Schema-driven mode ([`CanalClientEncoder::from_schema`], no explicit
+//! `canal-client.columns`): the effective mapping starts from the
+//! identity baseline (every schema column identity-mapped, no update
+//! filter, schema primary key as partition key) and the table's
+//! `sub-table-fields` entry applies DIFFERENCES ONLY — `must` entries
+//! rename their column's target, `update` entries move their column to
+//! changed-only, `key` overrides the partition key. Full Java
+//! `subTableFields` parity (authoritative entry + change filtering)
+//! requires the explicit positional `canal-client.columns` config.
+//!
 //! The CDC sources emit UPDATE as a delete(before) + insert(after) row
 //! pair; [`CanalClientEncoder`] is a STATEFUL encoder that pairs
 //! adjacent rows with the same key back into a single `update` message.
@@ -273,6 +283,7 @@ fn convert_string(tz: &ServerTz, s: &str) -> Value {
 
 /// Before-image held until its after-image arrives. Held images older
 /// than [`PAIRING_WINDOW`] are emitted as real deletes.
+#[derive(Debug)]
 struct PendingDelete {
     key: String,
     source_row: Row,
@@ -285,11 +296,26 @@ struct PendingDelete {
 /// back-to-back, well inside this window).
 pub const PAIRING_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Stateful encoder: maps rows into canal-client messages, pairing the
-/// CDC delete(before)+insert(after) row pairs of one UPDATE into a single
-/// `update` message with `oldData`.
-pub struct CanalClientEncoder {
-    config: CanalClientConfig,
+/// One encoded canal-client message, bound to its origin table identity
+/// (`database.table`) so routing sinks can pick a topic per table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanalMessage {
+    /// Origin `database.table` of the row that produced this message.
+    pub table: String,
+    /// Kafka partition key.
+    pub key: String,
+    /// JSON payload.
+    pub payload: String,
+}
+
+/// Per-table encoding state: the identity stamped into messages, the
+/// resolved field mapping, positional columns and the update-pairing
+/// pending slot (isolated per table so same-key rows of different
+/// tables never mis-pair).
+#[derive(Debug)]
+struct TableState {
+    db_name: String,
+    table_name: String,
     fields: TableFields,
     tz: ServerTz,
     column_positions: HashMap<String, usize>,
@@ -297,42 +323,7 @@ pub struct CanalClientEncoder {
     pending: Option<PendingDelete>,
 }
 
-impl CanalClientEncoder {
-    pub fn new(config: CanalClientConfig) -> anyhow::Result<Self> {
-        let tz_string = config.server_time_zone.clone();
-        let camel = camel_case_name(&config.table_name);
-        let fields = config.tables.get(&camel).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "canal-client config has no field mapping for table '{}'",
-                camel
-            )
-        })?;
-        let column_positions: HashMap<String, usize> = config
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.clone(), i))
-            .collect();
-        if fields.must.is_empty() && fields.update.is_empty() {
-            anyhow::bail!(
-                "canal-client table '{}' has empty must/update mappings",
-                camel
-            );
-        }
-        Ok(CanalClientEncoder {
-            config,
-            fields,
-            tz: ServerTz::parse(&tz_string),
-            column_positions,
-            pending: None,
-        })
-    }
-
-    /// The resolved server timezone (diagnostics).
-    pub fn server_tz(&self) -> &ServerTz {
-        &self.tz
-    }
-
+impl TableState {
     fn get<'r>(&self, row: &'r Row, column: &str) -> Option<&'r Field> {
         self.column_positions
             .get(column)
@@ -399,55 +390,53 @@ impl CanalClientEncoder {
         key: &str,
         data: Map<String, Value>,
         old_data: Option<Map<String, Value>>,
-    ) -> (String, String) {
+    ) -> CanalMessage {
         let mut message = Map::new();
         message.insert(
             "requestId".into(),
             Value::String(uuid::Uuid::new_v4().simple().to_string()),
         );
-        message.insert(
-            "dbName".into(),
-            Value::String(self.config.database_name.to_lowercase()),
-        );
+        message.insert("dbName".into(), Value::String(self.db_name.to_lowercase()));
         message.insert(
             "tableName".into(),
-            Value::String(self.config.table_name.to_lowercase()),
+            Value::String(self.table_name.to_lowercase()),
         );
         message.insert("eventType".into(), Value::String(event_type.to_string()));
         message.insert("data".into(), Value::Object(data));
         if let Some(old) = old_data {
             message.insert("oldData".into(), Value::Object(old));
         }
-        (key.to_string(), Value::Object(message).to_string())
+        CanalMessage {
+            table: format!("{}.{}", self.db_name, self.table_name),
+            key: key.to_string(),
+            payload: Value::Object(message).to_string(),
+        }
     }
 
-    fn stash_delete(&mut self, row: &Row) -> (String, String) {
+    fn stash_delete(&mut self, row: &Row) -> CanalMessage {
         // Delete data carries the must fields only (canal before-images
         // carry no changed flags, so update fields stay out).
-        let (data, _) = {
-            let mut out = Map::new();
-            for (col, target) in &self.fields.must {
-                if let Some(field) = self.get(row, col) {
-                    out.insert(target.clone(), convert_field(&self.tz, field));
-                }
+        let mut data = Map::new();
+        for (col, target) in &self.fields.must {
+            if let Some(field) = self.get(row, col) {
+                data.insert(target.clone(), convert_field(&self.tz, field));
             }
-            (out, ())
-        };
-        let pending = PendingDelete {
-            key: self.row_key(row),
+        }
+        let key = self.row_key(row);
+        let message = self.build_message("delete", &key, data.clone(), None);
+        self.pending = Some(PendingDelete {
+            key,
             source_row: row.clone(),
             data,
             since: std::time::Instant::now(),
-        };
-        let message = self.build_message("delete", &pending.key, pending.data.clone(), None);
-        self.pending = Some(pending);
+        });
         message
     }
 
-    /// Encode one row; returns 0..2 messages `(kafka_key, payload)`.
+    /// Encode one row; returns 0..2 messages.
     /// Zero = filtered (update without any configured column change, or
     /// a before-image held for pairing).
-    pub fn encode(&mut self, row: &Row) -> anyhow::Result<Vec<(String, String)>> {
+    fn encode(&mut self, row: &Row) -> Vec<CanalMessage> {
         let key = self.row_key(row);
         match row.kind {
             RowKind::Delete | RowKind::UpdateBefore => {
@@ -458,7 +447,7 @@ impl CanalClientEncoder {
                     messages.push(self.build_message("delete", &pending.key, pending.data, None));
                 }
                 self.stash_delete(row);
-                Ok(messages)
+                messages
             }
             RowKind::Insert | RowKind::UpdateAfter => {
                 let mut messages = Vec::new();
@@ -502,13 +491,13 @@ impl CanalClientEncoder {
                     }
                 };
                 messages.extend(current);
-                Ok(messages)
+                messages
             }
         }
     }
 
     /// Flush any held before-image (job close / bounded end).
-    pub fn flush(&mut self) -> Vec<(String, String)> {
+    fn flush(&mut self) -> Vec<CanalMessage> {
         match self.pending.take() {
             Some(pending) => vec![self.build_message("delete", &pending.key, pending.data, None)],
             None => Vec::new(),
@@ -517,12 +506,339 @@ impl CanalClientEncoder {
 
     /// Emit a held before-image as a real delete once the pairing window
     /// expired (called from each sink flush cycle).
-    pub fn expire_pending(&mut self) -> Vec<(String, String)> {
+    fn expire_pending(&mut self) -> Vec<CanalMessage> {
         match &self.pending {
             Some(pending) if pending.since.elapsed() >= PAIRING_WINDOW => {}
             _ => return Vec::new(),
         }
         self.flush()
+    }
+}
+
+/// Stateful multi-table encoder: maps rows into canal-client messages,
+/// pairing the CDC delete(before)+insert(after) row pairs of one UPDATE
+/// into a single `update` message with `oldData`.
+///
+/// Rows carrying [`Row::origin_table`] are encoded against their own
+/// table's state (identity, columns, pairing slot); rows without origin
+/// fall back to the static default table for single-table backward
+/// compatibility.
+#[derive(Debug)]
+pub struct CanalClientEncoder {
+    config: CanalClientConfig,
+    tz: ServerTz,
+    /// `database.table` → per-table state.
+    tables: HashMap<String, TableState>,
+    /// State serving rows without origin identity: the explicit config
+    /// table, or (schema-driven mode) the FIRST registered schema.
+    default_table: String,
+    /// Built from explicit `canal-client.columns`: single-table
+    /// authoritative — rows from other tables are rejected instead of
+    /// being silently stamped with the wrong identity.
+    explicit: bool,
+}
+
+impl CanalClientEncoder {
+    pub fn new(config: CanalClientConfig) -> anyhow::Result<Self> {
+        let tz = ServerTz::parse(&config.server_time_zone);
+        let camel = camel_case_name(&config.table_name);
+        let fields = config.tables.get(&camel).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "canal-client config has no field mapping for table '{}'",
+                camel
+            )
+        })?;
+        let column_positions: HashMap<String, usize> = config
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i))
+            .collect();
+        if fields.must.is_empty() && fields.update.is_empty() {
+            anyhow::bail!(
+                "canal-client table '{}' has empty must/update mappings",
+                camel
+            );
+        }
+        let default_table = format!("{}.{}", config.database_name, config.table_name);
+        let mut tables = HashMap::new();
+        tables.insert(
+            default_table.clone(),
+            TableState {
+                db_name: config.database_name.clone(),
+                table_name: config.table_name.clone(),
+                fields,
+                tz,
+                column_positions,
+                pending: None,
+            },
+        );
+        Ok(CanalClientEncoder {
+            config,
+            tz,
+            tables,
+            default_table,
+            explicit: true,
+        })
+    }
+
+    /// Empty schema-driven encoder: tables register themselves as their
+    /// initial-schema events arrive (see [`Self::register_schema`]).
+    pub fn new_auto(config: CanalClientConfig) -> Self {
+        CanalClientEncoder {
+            tz: ServerTz::parse(&config.server_time_zone),
+            config,
+            tables: HashMap::new(),
+            default_table: String::new(),
+            explicit: false,
+        }
+    }
+
+    /// Schema-driven constructor (automatic column mapping + delta
+    /// overrides) for a SINGLE table; see [`Self::register_schema`] for
+    /// what the mapping resolves to.
+    pub fn from_schema(config: CanalClientConfig, schema: &TableSchema) -> anyhow::Result<Self> {
+        let mut encoder = Self::new_auto(config);
+        encoder.register_schema(schema)?;
+        Ok(encoder)
+    }
+
+    /// Register (or idempotently re-register) one table's schema.
+    ///
+    /// `canal-client.columns` absent → the positional column list is taken
+    /// from `schema` (information_schema ordinal order — the order CDC
+    /// rows arrive in) and the effective field mapping is built from the
+    /// identity baseline with the table's `sub-table-fields` entry (when
+    /// present) applied as DIFFERENCES ONLY:
+    ///
+    /// - baseline: EVERY schema column identity-mapped into `must`
+    ///   (always present in `data`), empty `update` (which disables the
+    ///   no-configured-change update filter — full pass-through, like
+    ///   the Java `LessonCanalClient`), partition key = the schema
+    ///   primary key;
+    /// - `must` entries override the target of their column (rename),
+    ///   the column stays always-present;
+    /// - `update` entries MOVE their column from the always-present set
+    ///   to the changed-only set (target rename allowed) and enable the
+    ///   Java update filter (an update changing no configured column is
+    ///   dropped);
+    /// - `key` overrides the partition key column.
+    ///
+    /// Columns or keys named by the entry but absent from the schema are
+    /// configuration mistakes and fail loudly. The FIRST registered
+    /// schema also serves rows without origin identity (backward
+    /// compatibility with single-table pipelines).
+    pub fn register_schema(&mut self, schema: &TableSchema) -> anyhow::Result<()> {
+        let identifier = schema.table_identifier.clone();
+        if self.tables.contains_key(&identifier) {
+            return Ok(()); // replayed initial-schema event
+        }
+        let (db_name, table_name) = split_table_identifier(&identifier);
+        let db_name = db_name.to_string();
+        let table_name = table_name.to_string();
+        let camel = camel_case_name(&table_name);
+        let schema_key = || {
+            schema
+                .primary_key_columns()
+                .first()
+                .cloned()
+                .or_else(|| schema.columns.first().map(|c| c.name.clone()))
+                .unwrap_or_default()
+        };
+        let fields = match self.config.tables.get(&camel).cloned() {
+            None => TableFields {
+                key: schema_key(),
+                must: schema
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.name.clone()))
+                    .collect(),
+                update: HashMap::new(),
+            },
+            Some(fields) => {
+                let known = |name: &str| schema.columns.iter().any(|c| c.name == name);
+                for name in fields.must.keys().chain(fields.update.keys()) {
+                    if !known(name) {
+                        anyhow::bail!(
+                            "canal-client table '{}': mapped column '{}' is not in the source schema",
+                            camel,
+                            name
+                        );
+                    }
+                }
+                if !fields.key.is_empty() && !known(&fields.key) {
+                    anyhow::bail!(
+                        "canal-client table '{}': key column '{}' is not in the source schema",
+                        camel,
+                        fields.key
+                    );
+                }
+                // Identity baseline with the explicit deltas applied:
+                // `update` columns become changed-only, `must` renames,
+                // everything else stays identity always-present.
+                let mut must = HashMap::new();
+                let mut update = HashMap::new();
+                for col in &schema.columns {
+                    if let Some(target) = fields.update.get(&col.name) {
+                        update.insert(col.name.clone(), target.clone());
+                    } else {
+                        let target = fields
+                            .must
+                            .get(&col.name)
+                            .cloned()
+                            .unwrap_or_else(|| col.name.clone());
+                        must.insert(col.name.clone(), target);
+                    }
+                }
+                TableFields {
+                    key: if fields.key.is_empty() {
+                        schema_key()
+                    } else {
+                        fields.key
+                    },
+                    must,
+                    update,
+                }
+            }
+        };
+        let column_positions: HashMap<String, usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .collect();
+        if column_positions.is_empty() {
+            anyhow::bail!(
+                "canal-client table '{}': source schema has no columns",
+                camel
+            );
+        }
+        if self.default_table.is_empty() {
+            self.default_table = identifier.clone();
+        }
+        self.tables.insert(
+            identifier,
+            TableState {
+                db_name: db_name.to_string(),
+                table_name: table_name.to_string(),
+                fields,
+                tz: self.tz,
+                column_positions,
+                pending: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// The resolved server timezone (diagnostics).
+    pub fn server_tz(&self) -> &ServerTz {
+        &self.tz
+    }
+
+    /// The effective canal-client configuration (diagnostics).
+    pub fn config(&self) -> &CanalClientConfig {
+        &self.config
+    }
+
+    /// The effective field mapping of the default table (diagnostics).
+    pub fn fields(&self) -> &TableFields {
+        &self
+            .tables
+            .get(&self.default_table)
+            .map(|s| &s.fields)
+            .expect("default table state exists")
+    }
+
+    /// Number of registered per-table states (diagnostics).
+    pub fn registered_tables(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// Whether this encoder was built from explicit `canal-client.columns`
+    /// (single-table authoritative) instead of schema registration.
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// Pick the state serving this row: its origin table when carried,
+    /// the static default table otherwise.
+    fn state_for(&mut self, row: &Row) -> anyhow::Result<&mut TableState> {
+        // Resolve the key first, then borrow once (the bail paths return
+        // before any borrow is live).
+        let key: String = match row.origin_table.as_deref() {
+            None => {
+                if self.default_table.is_empty() {
+                    anyhow::bail!(
+                        "canal-client automatic column mapping: row arrived before any \
+                         initial schema event — the source must emit the table schema first \
+                         (MySQL-CDC does; or configure canal-client.columns explicitly)"
+                    );
+                }
+                self.default_table.clone()
+            }
+            Some(origin) => {
+                if self.tables.contains_key(origin) {
+                    origin.to_string()
+                } else if self.explicit {
+                    // Case-insensitive: the static config may spell the
+                    // identity differently than the binlog does.
+                    if origin.eq_ignore_ascii_case(&self.default_table) {
+                        self.default_table.clone()
+                    } else {
+                        anyhow::bail!(
+                            "canal-client explicit config targets table '{}' but a row arrived \
+                             from '{}' — multi-table sources need the schema-driven mode (drop \
+                             canal-client.columns and let the initial-schema events map them)",
+                            self.default_table,
+                            origin
+                        );
+                    }
+                } else {
+                    anyhow::bail!(
+                        "canal-client automatic column mapping: row from table '{}' arrived \
+                         before its initial schema event",
+                        origin
+                    );
+                }
+            }
+        };
+        Ok(self
+            .tables
+            .get_mut(&key)
+            .expect("resolved table state exists"))
+    }
+
+    /// Encode one row into 0..2 messages of its own table. Zero messages
+    /// = filtered (update without any configured column change, or a
+    /// before-image held for pairing).
+    pub fn encode(&mut self, row: &Row) -> anyhow::Result<Vec<CanalMessage>> {
+        Ok(self.state_for(row)?.encode(row))
+    }
+
+    /// Flush every held before-image (job close / bounded end).
+    pub fn flush(&mut self) -> Vec<CanalMessage> {
+        self.tables
+            .values_mut()
+            .flat_map(TableState::flush)
+            .collect()
+    }
+
+    /// Emit held before-images as real deletes once the pairing window
+    /// expired (called from each sink flush cycle).
+    pub fn expire_pending(&mut self) -> Vec<CanalMessage> {
+        self.tables
+            .values_mut()
+            .flat_map(TableState::expire_pending)
+            .collect()
+    }
+}
+
+/// Split a `database.table` identifier at the last dot; an identifier
+/// without a dot degrades to an empty database.
+fn split_table_identifier(identifier: &str) -> (&str, &str) {
+    match identifier.rsplit_once('.') {
+        Some((db, table)) => (db, table),
+        None => ("", identifier),
     }
 }
 
@@ -593,8 +909,16 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
         "requestId".to_string(),
         Value::String(uuid::Uuid::new_v4().simple().to_string()),
     );
-    message.insert("dbName".to_string(), Value::String(String::new()));
-    message.insert("tableName".to_string(), Value::String(String::new()));
+    let (db_name, table_name) = row
+        .origin_table
+        .as_deref()
+        .map(split_table_identifier)
+        .unwrap_or(("", ""));
+    message.insert("dbName".to_string(), Value::String(db_name.to_lowercase()));
+    message.insert(
+        "tableName".to_string(),
+        Value::String(table_name.to_lowercase()),
+    );
     let (event_type, _) = match row.kind {
         RowKind::Insert => ("insert", ()),
         RowKind::UpdateAfter => ("update", ()),
@@ -739,7 +1063,7 @@ mod tests {
             .encode(&row_of(RowKind::Insert, 1001, "张三", 1))
             .unwrap();
         assert_eq!(messages.len(), 1);
-        let (key, payload) = &messages[0];
+        let (key, payload) = (&messages[0].key, &messages[0].payload);
         assert_eq!(key, "1001");
         let json: Value = serde_json::from_str(payload).unwrap();
         assert_eq!(json["dbName"], "neworiental_data_recommand");
@@ -765,7 +1089,7 @@ mod tests {
             .encode(&row_of(RowKind::Insert, 1001, "张三", 0))
             .unwrap();
         assert_eq!(messages.len(), 1);
-        let json: Value = serde_json::from_str(&messages[0].1).unwrap();
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
         assert_eq!(json["eventType"], "update");
         assert_eq!(json["data"]["name"], "张三");
         assert_eq!(json["oldData"]["name"], "李四");
@@ -800,12 +1124,12 @@ mod tests {
             .encode(&row_of(RowKind::Insert, 1001, "new", 1))
             .unwrap();
         assert_eq!(messages.len(), 2);
-        let delete: Value = serde_json::from_str(&messages[0].1).unwrap();
+        let delete: Value = serde_json::from_str(&messages[0].payload).unwrap();
         assert_eq!(delete["eventType"], "delete");
         assert_eq!(delete["data"]["id"], 7);
         // Delete data carries must fields only (no status).
         assert!(delete["data"].get("status").is_none());
-        let insert: Value = serde_json::from_str(&messages[1].1).unwrap();
+        let insert: Value = serde_json::from_str(&messages[1].payload).unwrap();
         assert_eq!(insert["eventType"], "insert");
     }
 
@@ -817,8 +1141,361 @@ mod tests {
             .unwrap();
         let flushed = encoder.flush();
         assert_eq!(flushed.len(), 1);
-        let json: Value = serde_json::from_str(&flushed[0].1).unwrap();
+        let json: Value = serde_json::from_str(&flushed[0].payload).unwrap();
         assert_eq!(json["eventType"], "delete");
         assert_eq!(json["data"]["id"], 9);
+    }
+
+    fn auto_schema() -> seatunnel_api::TableSchema {
+        seatunnel_api::TableSchema::new(
+            "neworiental_user.l_class_student",
+            vec![
+                seatunnel_api::ColumnDef::new("id", seatunnel_api::ColumnType::Int64).primary_key(),
+                seatunnel_api::ColumnDef::new("name", seatunnel_api::ColumnType::String),
+                seatunnel_api::ColumnDef::new("status", seatunnel_api::ColumnType::Int32),
+            ],
+        )
+    }
+
+    fn auto_config() -> CanalClientConfig {
+        CanalClientConfig {
+            database_name: "neworiental_user".into(),
+            table_name: "l_class_student".into(),
+            columns: Vec::new(), // automatic: derived from the schema
+            tables: HashMap::new(),
+            server_time_zone: "UTC".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_from_schema_auto_maps_all_columns_identity() {
+        let mut encoder = CanalClientEncoder::from_schema(auto_config(), &auto_schema()).unwrap();
+        // All columns in `must`, no update filter, PK as the key column.
+        assert_eq!(encoder.fields().key, "id");
+        assert_eq!(encoder.fields().must.len(), 3);
+        assert!(encoder.fields().update.is_empty());
+        let messages = encoder
+            .encode(&row_of(RowKind::Insert, 7, "张三", 2))
+            .unwrap();
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["data"]["id"], 7);
+        assert_eq!(json["data"]["name"], "张三");
+        assert_eq!(json["data"]["status"], 2);
+    }
+
+    #[test]
+    fn test_from_schema_delta_entry_merges_over_identity() {
+        // The explicit entry defines only the DIFFERENCES from the
+        // identity baseline: `status` moves to changed-only, unmentioned
+        // columns stay identity always-present, empty `key` falls back
+        // to the schema primary key.
+        let mut config = auto_config();
+        config.tables.insert(
+            "lClassStudent".into(),
+            TableFields {
+                key: String::new(),
+                must: HashMap::new(),
+                update: [("status".to_string(), "status".to_string())].into(),
+            },
+        );
+        let mut encoder = CanalClientEncoder::from_schema(config, &auto_schema()).unwrap();
+        assert_eq!(encoder.fields().key, "id");
+        assert_eq!(encoder.fields().must.len(), 2, "id + name stay in must");
+        assert_eq!(encoder.fields().update.len(), 1);
+
+        // INSERT carries every column (changed-only columns included).
+        let messages = encoder
+            .encode(&row_of(RowKind::Insert, 7, "张三", 2))
+            .unwrap();
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["data"]["id"], 7);
+        assert_eq!(json["data"]["name"], "张三");
+        assert_eq!(json["data"]["status"], 2);
+
+        // UPDATE touching only `name` (identity must): still emitted,
+        // `data` carries the must columns; unchanged `status` stays out
+        // of data but appears in oldData.
+        encoder
+            .encode(&row_of(RowKind::Delete, 7, "李四", 2))
+            .unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::Insert, 7, "张三", 2))
+            .unwrap();
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["eventType"], "update");
+        assert_eq!(json["data"]["name"], "张三");
+        assert!(json["data"].get("status").is_none());
+        assert_eq!(json["oldData"]["status"], 2);
+
+        // UPDATE touching only `status` (changed-only column): emitted
+        // with status in data.
+        encoder
+            .encode(&row_of(RowKind::Delete, 7, "张三", 2))
+            .unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::Insert, 7, "张三", 5))
+            .unwrap();
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["eventType"], "update");
+        assert_eq!(json["data"]["status"], 5);
+        assert_eq!(json["oldData"]["status"], 2);
+    }
+
+    #[test]
+    fn test_from_schema_delta_entry_renames_field() {
+        // A `must` rename only changes the target field name; the column
+        // stays always-present and every other column stays identity.
+        let mut config = auto_config();
+        config.tables.insert(
+            "lClassStudent".into(),
+            TableFields {
+                key: "name".to_string(),
+                must: [("name".to_string(), "studentName".to_string())].into(),
+                update: HashMap::new(),
+            },
+        );
+        let mut encoder = CanalClientEncoder::from_schema(config, &auto_schema()).unwrap();
+        assert_eq!(encoder.fields().key, "name");
+        let messages = encoder
+            .encode(&row_of(RowKind::Insert, 7, "张三", 2))
+            .unwrap();
+        // Partition key is the renamed column's VALUE.
+        assert_eq!(messages[0].key, "张三");
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["data"]["studentName"], "张三");
+        assert!(json["data"].get("name").is_none(), "renamed away");
+        assert_eq!(json["data"]["id"], 7, "unmentioned column identity");
+        assert_eq!(json["data"]["status"], 2);
+    }
+
+    #[test]
+    fn test_from_schema_delta_entry_rejects_unknown_columns() {
+        let mut config = auto_config();
+        config.tables.insert(
+            "lClassStudent".into(),
+            TableFields {
+                key: String::new(),
+                must: [("bogus".to_string(), "x".to_string())].into(),
+                update: HashMap::new(),
+            },
+        );
+        let err = CanalClientEncoder::from_schema(config, &auto_schema())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bogus"), "error names the column: {err}");
+
+        let mut config = auto_config();
+        config.tables.insert(
+            "lClassStudent".into(),
+            TableFields {
+                key: "nope".to_string(),
+                must: HashMap::new(),
+                update: HashMap::new(),
+            },
+        );
+        let err = CanalClientEncoder::from_schema(config, &auto_schema())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "error names the key: {err}");
+    }
+
+    #[test]
+    fn test_from_schema_no_pk_falls_back_to_first_column() {
+        let schema = seatunnel_api::TableSchema::new(
+            "db.t",
+            vec![
+                seatunnel_api::ColumnDef::new("code", seatunnel_api::ColumnType::String),
+                seatunnel_api::ColumnDef::new("value", seatunnel_api::ColumnType::String),
+            ],
+        );
+        let config = CanalClientConfig {
+            database_name: "db".into(),
+            table_name: "t".into(),
+            columns: Vec::new(),
+            tables: HashMap::new(),
+            server_time_zone: "UTC".to_string(),
+        };
+        let encoder = CanalClientEncoder::from_schema(config, &schema).unwrap();
+        assert_eq!(encoder.fields().key, "code");
+    }
+
+    #[test]
+    fn test_from_schema_empty_schema_errors() {
+        let schema = seatunnel_api::TableSchema::new("db.t", Vec::new());
+        assert!(CanalClientEncoder::from_schema(auto_config(), &schema).is_err());
+    }
+
+    fn second_auto_schema() -> seatunnel_api::TableSchema {
+        seatunnel_api::TableSchema::new(
+            "neworiental_user.l_class_course",
+            vec![
+                seatunnel_api::ColumnDef::new("cid", seatunnel_api::ColumnType::Int64)
+                    .primary_key(),
+                seatunnel_api::ColumnDef::new("title", seatunnel_api::ColumnType::String),
+            ],
+        )
+    }
+
+    /// `l_class_student` row carrying its origin identity.
+    fn origin_row_of(kind: RowKind, id: i64, name: &str, status: i64) -> Row {
+        let mut row = row_of(kind, id, name, status);
+        row.origin_table = Some("neworiental_user.l_class_student".to_string());
+        row
+    }
+
+    /// `l_class_course` row (different column layout) with its origin.
+    fn course_row_of(kind: RowKind, cid: i64, title: &str) -> Row {
+        let mut row = Row::new(kind, 2);
+        row.set(0, Field::Int64(cid));
+        row.set(1, Field::String(title.into()));
+        row.origin_table = Some("neworiental_user.l_class_course".to_string());
+        row
+    }
+
+    #[test]
+    fn test_multi_table_auto_registers_and_stamps_identity() {
+        let mut encoder = CanalClientEncoder::new_auto(auto_config());
+        encoder.register_schema(&auto_schema()).unwrap();
+        encoder.register_schema(&second_auto_schema()).unwrap();
+        assert_eq!(encoder.registered_tables(), 2);
+        // Re-registration (event replay) is idempotent.
+        encoder.register_schema(&auto_schema()).unwrap();
+        assert_eq!(encoder.registered_tables(), 2);
+
+        // Each row encodes against ITS table's schema and identity.
+        let messages = encoder
+            .encode(&origin_row_of(RowKind::Insert, 1001, "张三", 1))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].table, "neworiental_user.l_class_student");
+        let student: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(student["dbName"], "neworiental_user");
+        assert_eq!(student["tableName"], "l_class_student");
+        assert_eq!(student["data"]["name"], "张三");
+
+        let messages = encoder
+            .encode(&course_row_of(RowKind::Insert, 7, "math"))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].table, "neworiental_user.l_class_course");
+        let course: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(course["tableName"], "l_class_course");
+        assert_eq!(course["data"]["title"], "math");
+
+        // UPDATE pairs within the same table only.
+        let held = encoder
+            .encode(&origin_row_of(RowKind::Delete, 1001, "李四", 0))
+            .unwrap();
+        assert!(held.is_empty());
+        let messages = encoder
+            .encode(&origin_row_of(RowKind::Insert, 1001, "张三", 0))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let update: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(update["tableName"], "l_class_student");
+        assert_eq!(update["eventType"], "update");
+        assert_eq!(update["oldData"]["name"], "李四");
+    }
+
+    #[test]
+    fn test_multi_table_same_key_rows_never_cross_pair() {
+        let mut encoder = CanalClientEncoder::new_auto(auto_config());
+        encoder.register_schema(&auto_schema()).unwrap();
+        encoder.register_schema(&second_auto_schema()).unwrap();
+
+        // student delete(id=1) held; a course insert with the SAME key
+        // value must NOT pair with it — it stays a plain insert of its
+        // own table.
+        encoder
+            .encode(&origin_row_of(RowKind::Delete, 1, "gone", 0))
+            .unwrap();
+        let messages = encoder
+            .encode(&course_row_of(RowKind::Insert, 1, "math"))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let course: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(course["tableName"], "l_class_course");
+        assert_eq!(
+            course["eventType"], "insert",
+            "same key on another table must not pair into an update"
+        );
+
+        // The held student before-image still pairs with its own table's
+        // after-image afterwards.
+        let messages = encoder
+            .encode(&origin_row_of(RowKind::Insert, 1, "renamed", 0))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let update: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(update["eventType"], "update");
+        assert_eq!(update["tableName"], "l_class_student");
+    }
+
+    #[test]
+    fn test_multi_table_flush_and_expire_carry_each_table() {
+        let mut encoder = CanalClientEncoder::new_auto(auto_config());
+        encoder.register_schema(&auto_schema()).unwrap();
+        encoder.register_schema(&second_auto_schema()).unwrap();
+
+        // Leave one unpaired before-image per table.
+        encoder
+            .encode(&origin_row_of(RowKind::Delete, 9, "tail-student", 0))
+            .unwrap();
+        encoder
+            .encode(&course_row_of(RowKind::Delete, 3, "tail-course"))
+            .unwrap();
+
+        let flushed = encoder.flush();
+        assert_eq!(flushed.len(), 2, "one trailing delete per table");
+        let tables: Vec<&str> = flushed.iter().map(|m| m.table.as_str()).collect();
+        assert!(tables.contains(&"neworiental_user.l_class_student"));
+        assert!(tables.contains(&"neworiental_user.l_class_course"));
+        for message in &flushed {
+            let json: Value = serde_json::from_str(&message.payload).unwrap();
+            assert_eq!(json["eventType"], "delete");
+        }
+    }
+
+    #[test]
+    fn test_explicit_encoder_rejects_foreign_table_row() {
+        let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
+        // Without origin the row belongs to the configured table.
+        assert!(encoder.encode(&row_of(RowKind::Insert, 1, "a", 0)).is_ok());
+        // With a foreign origin it must fail loudly instead of being
+        // stamped with the wrong identity.
+        let mut foreign = row_of(RowKind::Insert, 1, "a", 0);
+        foreign.origin_table = Some("other_db.other_table".to_string());
+        let err = encoder.encode(&foreign).unwrap_err().to_string();
+        assert!(
+            err.contains("other_db.other_table"),
+            "error names the foreign table: {err}"
+        );
+        // Case differences are tolerated (binlog vs config spelling).
+        let mut casing = row_of(RowKind::Insert, 1, "a", 0);
+        casing.origin_table = Some("NEWORIENTAL_DATA_RECOMMAND.L_CLASS_STUDENT".to_string());
+        assert!(encoder.encode(&casing).is_ok());
+    }
+
+    #[test]
+    fn test_auto_row_from_unregistered_table_errors() {
+        let mut encoder = CanalClientEncoder::new_auto(auto_config());
+        let err = encoder
+            .encode(&origin_row_of(RowKind::Insert, 1, "a", 0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("neworiental_user.l_class_student"),
+            "error names the table: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stateless_serialize_stamps_origin() {
+        let mut row = row_of(RowKind::Insert, 1, "a", 0);
+        row.origin_table = Some("MyDb.MyTable".to_string());
+        let bytes = serialize(&auto_schema(), &row).unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["dbName"], "mydb");
+        assert_eq!(json["tableName"], "mytable");
     }
 }

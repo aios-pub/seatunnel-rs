@@ -33,3 +33,17 @@ book/
 
 # Leptos frontend build cache (trunk/wasm)
 seatunnel-web/ui/target
+/jobs/
+
+# macOS noise
+.DS_Store
+
+# Bench run artifacts (regenerable outputs of scripts/bench — the
+# generators, configs and BENCH-REPORT.md ARE tracked)
+scripts/bench/__pycache__/
+scripts/bench/*.metrics
+scripts/bench/*.metrics.stderr
+scripts/bench/*_load.csv
+scripts/bench/*.mysql.err
+scripts/bench/bench_schema.json
+scripts/bench/init_bench_schema.sql

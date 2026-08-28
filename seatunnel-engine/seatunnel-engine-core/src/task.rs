@@ -35,6 +35,10 @@ pub struct TaskStatus {
     /// master-backed store.
     pub last_checkpoint_id: u64,
     pub last_checkpoint_size: u64,
+    /// Latest sink-side delivery metrics snapshot (windowed counters,
+    /// delivery latency, in-flight gauge, detailed last error). `None`
+    /// while no sink has reported or the sink keeps no metrics.
+    pub sink_metrics: Option<seatunnel_api::sink::SinkMetricsSnapshot>,
 }
 
 impl TaskStatus {
@@ -49,6 +53,7 @@ impl TaskStatus {
             last_record_at: 0,
             last_checkpoint_id: 0,
             last_checkpoint_size: 0,
+            sink_metrics: None,
         }
     }
 

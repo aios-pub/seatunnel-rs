@@ -8,7 +8,7 @@
 
 env:
   job.name: rabbitmq-to-console
-  checkpoint.interval: 5000
+  checkpoint.interval: 10000
 
 source:
   RabbitMQ:

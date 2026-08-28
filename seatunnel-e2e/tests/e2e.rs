@@ -36,8 +36,8 @@ use seatunnel_engine_comm::{
     generated::master_service_client::MasterServiceClient,
 };
 use seatunnel_engine_server::{
-    ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode,
-    master::MasterInfo, new_worker_registry,
+    ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode, master::MasterInfo,
+    new_worker_registry,
 };
 use tokio::net::TcpStream;
 
@@ -178,8 +178,7 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
         loop {
             tick.tick().await;
             let tasks = hb_worker.heartbeat_tasks().await;
-            let (load_score, lag_ms, mem_permille, can_accept) =
-                hb_worker.admission_fields().await;
+            let (load_score, lag_ms, mem_permille, can_accept) = hb_worker.admission_fields().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
                     worker_id: "e2e-worker".into(),
@@ -216,9 +215,7 @@ fn uuid_like() -> String {
 async fn mysql_cdc_to_kafka_closed_loop() {
     let deps_ok = tokio::join!(wait_for(MYSQL, 5), wait_for(KAFKA, 5));
     if !(deps_ok.0 && deps_ok.1) {
-        eprintln!(
-            "SKIP: kafka/mysql not reachable — start `docker compose up -d kafka mysql`"
-        );
+        eprintln!("SKIP: kafka/mysql not reachable — start `docker compose up -d kafka mysql`");
         return;
     }
     // Fresh topic per run: assertions must see THIS run's data, never a
@@ -241,7 +238,7 @@ async fn mysql_cdc_to_kafka_closed_loop() {
 
     // Submit the job over gRPC (same path as the CLI).
     let config = serde_json::json!({
-        "env": { "job.name": "e2e-cdc-kafka", "parallelism": 1, "checkpoint.interval": 3000 },
+        "env": { "job.name": "e2e-cdc-kafka", "parallelism": 1, "checkpoint.interval": 10000 },
         "source": {
             "MySQL-CDC": {
                 "hostname": MYSQL.0, "port": MYSQL.1,

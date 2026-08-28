@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use seatunnel_engine_client::EngineClient;
-use seatunnel_web::{build_router, spawn_poller, AppState, AuthConfig, Metrics};
+use seatunnel_web::{AppState, AuthConfig, Metrics, build_router, spawn_poller};
 
 #[derive(Parser)]
 #[command(name = "seatunnel-web", about = "SeaTunnel web management console")]
@@ -43,8 +43,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -61,11 +60,7 @@ async fn main() -> anyhow::Result<()> {
             );
             "admin".to_string()
         });
-        AuthConfig::new(
-            args.auth_user.clone(),
-            password,
-            args.auth_ttl_mins * 60,
-        )
+        AuthConfig::new(args.auth_user.clone(), password, args.auth_ttl_mins * 60)
     };
 
     let state = AppState {
@@ -75,7 +70,10 @@ async fn main() -> anyhow::Result<()> {
         auth: Arc::new(auth),
         task_samples: Arc::default(),
     };
-    spawn_poller(state.clone(), Duration::from_secs(args.refresh_interval_secs));
+    spawn_poller(
+        state.clone(),
+        Duration::from_secs(args.refresh_interval_secs),
+    );
 
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
@@ -83,7 +81,11 @@ async fn main() -> anyhow::Result<()> {
         "seatunnel-web listening on http://{} (masters: {}, auth: {})",
         args.listen,
         args.master,
-        if args.auth_disable { "disabled" } else { "enabled" }
+        if args.auth_disable {
+            "disabled"
+        } else {
+            "enabled"
+        }
     );
     axum::serve(listener, app).await?;
     Ok(())

@@ -143,14 +143,97 @@ seatunnel-engine-server --role master  --addr 0.0.0.0:5800 ...
 seatunnel-engine-server --role worker  --master m1:5800,m2:5800,m3:5800 ...
 ```
 
+Helper scripts: `scripts/start-hybrid.sh` (single-node hybrid) and
+`scripts/start-hybrid-cluster.sh` (the 3-node symmetric topology on
+localhost) build, start and wait for leader readiness;
+`config/seatunnel-3node.yaml` is the reference config for a real
+3-machine deployment.
+
+Known limitation (task failover races): when a node dies, its tasks are
+re-claimed through a read-then-`MarkDispatched` sequence that has no
+cross-worker mutual exclusion — concurrent heartbeat claims can both
+dispatch a task (one copy is fenced), and a fenced copy's late reports
+can briefly clobber the survivor's state. Re-election, worker
+re-registration and job submission remain solid; a job that stalls
+after a failover event should be resubmitted (same job id restores from
+the latest checkpoint). A proper fix needs claim arbitration that
+commits liveness with ownership (single-writer `ClaimTask` command
+instead of the local-registry classify + replicated mark).
+
 Scaling rule: master/hybrid (voter) counts go 1 → 3 → 5. **Two voters
 are rejected at startup** — a two-node majority cannot survive either
 node's failure, and silently accepting it would reintroduce the
 dual-master risk this design exists to eliminate (the pre-Raft
 warm-standby setup could run two writable masters; it was documented as
-a known limitation). Voter ids come from the ordered member list
-(position 1..n); node 1 bootstraps the membership, and if it never
-appears, another node retries initialization after 5 s.
+a known limitation). A degraded two-node pair is not a fallback either:
+it tolerates zero failures, which is strictly worse than the single-vote
+hybrid while giving up Raft's fencing. If only two machines exist, run a
+lightweight third voter (a hybrid node without jobs costs almost
+nothing — the control plane is a few KB of JSON log). When two of three
+voters are down, the lone survivor correctly stops electing (no quorum);
+it accumulates harmless term bumps while campaigning into the void, and
+the cluster recovers as soon as a second voter returns. Voter ids come
+from the ordered member list (position 1..n); node 1 bootstraps the
+membership, and if it never appears, another node retries initialization
+after 5 s.
+
+## Election stability (application layer)
+
+openraft 0.9.x has no Pre-Vote, CheckQuorum or leader-priority knobs
+(pre-vote lands behind `Config::enable_pre_vote` in 0.10, which is still
+alpha with a breaking storage/network API). Election thrashing was
+therefore fixed at the application layer, in three parts:
+
+1. **Per-node disjoint election windows** (the core fix). openraft draws
+   the election timeout once per process from
+   `[election_timeout_min, election_timeout_max)` and never re-rolls it,
+   and every follower counts from the leader's last heartbeat — so two
+   survivors that draw close values campaign in lockstep forever: each
+   round bumps the term and nobody wins. This engine gives voter *i*
+   (member-list position, 1-based) the window
+   `[min+(i-1)·skew, max+(i-1)·skew)`. Defaults: min/max = 900/1300 ms,
+   skew = 700 ms (gap between adjacent windows = 300 ms > one openraft
+   tick of 225 ms), heartbeat 150 ms — so voter 1 draws from
+   [900,1300), voter 2 from [1600,2000), voter 3 from [2300,2700). The
+   lowest live voter always fires first and the others grant its vote:
+   one round, term +1, done. Member-list order is the leader priority
+   order (the same order workers already use for failover). Normal
+   followers never reject votes on a lease — only a leader with a
+   committed vote does — so the skew cannot deadlock an election. Knobs
+   (`seatunnel.engine.raft.*`: `election-timeout-min-ms`,
+   `election-timeout-max-ms`, `election-skew-ms` (0 disables),
+   `heartbeat-interval-ms`); a positive skew too small to separate the
+   windows is lifted to window-width + one tick at load, with a warning.
+
+2. **Cached raft RPC connections.** openraft hard-times-out append RPCs
+   at `heartbeat_interval` (150 ms); the transport used to open a fresh
+   TCP+HTTP/2 connection per RPC, and a handshake that misses 150 ms is
+   reported Unreachable — which ages followers and triggers the very
+   elections it mimics. The network layer now keeps one multiplexed
+   tonic `Channel` per target (250 ms connect timeout), invalidated on
+   any RPC failure so a restarted peer is re-dialed.
+
+3. **fsync off the async runtime.** The log store's append/vote writes
+   and the state machine's snapshot writes run inside
+   `spawn_blocking`; a blocking reactor used to delay raft ticks and
+   heartbeats, compounding both problems above.
+
+Client availability during the failover window: mutating RPCs carry the
+leadership gate `"not the leader; retry at <addr>"`, and
+`seatunnel-engine-client` follows that hint (30 s budget, re-walking the
+configured master list if a hinted leader is unreachable), so a submit
+issued mid-election succeeds instead of erroring. A follower's
+`register_worker` now answers with the real leader address instead of
+itself.
+
+Measured on the 3-node pseudo-cluster (`scripts/start-hybrid-cluster.sh`,
+debug build), streaming job running, `kill -9` on the leader: both
+failovers completed with exactly one term increment (1→2, 44→45) and no
+further campaigns — re-election ≈ 2–4 s (window + debug-build tick lag;
+release builds are faster), workers re-registered on the new leader
+within seconds and the job kept running. Term inflation only appears in
+the deliberately quorum-less window (two of three voters dead), where it
+is harmless: nobody grants, nothing commits.
 
 ## Roadmap
 
@@ -168,7 +251,8 @@ appears, another node retries initialization after 5 s.
   (snapshot = the existing `export_state` JSON); the Raft leader term is
   the wire fencing term; `ReplicationService` and the ordered-list
   warm-standby polling are removed; voter counts are validated (1/3/5,
-  two rejected loudly). Fast election (0.8–1.6 s) replaces the Java
+  two rejected loudly). Fast, collision-free election via per-node
+  disjoint windows (0.9–2.7 s across three voters) replaces the Java
   engine's 180 s tolerance — safe because a quorum, not a timeout,
   decides leadership.
 - **Stage 4 (done)** — long-poll dispatch (`wait_ms` + wake signal on
@@ -179,3 +263,10 @@ appears, another node retries initialization after 5 s.
   follow-up work alongside the existing `seatunnel-benchmarks` suite —
   the long-poll path is covered by the cluster integration tests, not
   yet by a latency benchmark.
+- **Follow-up: openraft 0.10 once stable** — enable protocol-level
+  Pre-Vote (`Config::enable_pre_vote`) and the redesigned vote semantics
+  (a split vote no longer forces a new term); revisit whether the
+  per-node window skew can then be shrunk or dropped. Until then the
+  application-layer measures above are the stability mechanism; claim
+  arbitration for task failover (single-writer `ClaimTask`) remains the
+  other open item.

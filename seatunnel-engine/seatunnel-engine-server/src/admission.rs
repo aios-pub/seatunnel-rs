@@ -35,8 +35,8 @@
 //! the master-side dispatch batch limit per heartbeat — a rate fuse for
 //! the 1-3s measurement blind window, not a slot budget.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Admission thresholds (all fields 0 = signal disabled).
@@ -75,7 +75,11 @@ impl AdmissionSignals {
     fn usable_memory_bytes(sys: &sysinfo::System) -> Option<u64> {
         let physical = sys.total_memory();
         let cgroup = Self::read_cgroup_v2_limit();
-        Some(cgroup.filter(|l| *l > 0 && *l < physical).unwrap_or(physical))
+        Some(
+            cgroup
+                .filter(|l| *l > 0 && *l < physical)
+                .unwrap_or(physical),
+        )
     }
 
     fn read_cgroup_v2_limit() -> Option<u64> {
@@ -144,9 +148,7 @@ pub fn evaluate(
         state.consecutive_healthy_secs = state
             .consecutive_healthy_secs
             .saturating_add(healthy_secs_delta);
-        if state.overloaded
-            && state.consecutive_healthy_secs >= config.cooldown_secs
-        {
+        if state.overloaded && state.consecutive_healthy_secs >= config.cooldown_secs {
             state.overloaded = false;
         }
     } else {
@@ -182,7 +184,9 @@ impl SharedSignals {
 
     fn pack(lag: Option<u64>, mem: Option<u32>) -> u64 {
         match (lag, mem) {
-            (Some(l), Some(m)) => ((l.min(u32::MAX as u64) as u64) << 32) | (m.min(1000) as u64 + 1),
+            (Some(l), Some(m)) => {
+                ((l.min(u32::MAX as u64) as u64) << 32) | (m.min(1000) as u64 + 1)
+            }
             (Some(l), None) => ((l.min(u32::MAX as u64) as u64) << 32) | NO_SAMPLE | (1 << 63),
             (None, Some(m)) => ((1 << 31) | NO_SAMPLE) | m as u64 + 1,
             (None, None) => NO_SAMPLE,
@@ -202,19 +206,20 @@ impl SharedSignals {
             None
         } else {
             let m = (raw & 0xffff_ffff).saturating_sub(1);
-            if m > 1000 {
-                None
-            } else {
-                Some(m as u32)
-            }
+            if m > 1000 { None } else { Some(m as u32) }
         };
-        AdmissionSignals { lag_ms: lag, mem_permille: mem }
+        AdmissionSignals {
+            lag_ms: lag,
+            mem_permille: mem,
+        }
     }
 
     /// Publish the latest signals (samplers call this).
     pub fn store(&self, signals: &AdmissionSignals) {
-        self.0
-            .store(Self::pack(signals.lag_ms, signals.mem_permille), Ordering::Relaxed);
+        self.0.store(
+            Self::pack(signals.lag_ms, signals.mem_permille),
+            Ordering::Relaxed,
+        );
     }
 
     /// Read the latest signals.

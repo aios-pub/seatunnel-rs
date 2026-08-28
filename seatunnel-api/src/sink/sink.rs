@@ -69,11 +69,16 @@ pub trait Sink: Send + Sync {
 }
 
 /// Context for sink writer creation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SinkWriterContext {
     pub subtask: usize,
     pub parallelism: usize,
     pub job_id: String,
+    /// Shared metrics handle: writers that produce delivery statistics
+    /// record into it and the task layer snapshots it into task status
+    /// (windowed counters; see [`SinkMetrics`]). A fresh default handle
+    /// is created when absent.
+    pub metrics: Arc<super::metrics::SinkMetrics>,
 }
 
 impl SinkWriterContext {
@@ -82,7 +87,9 @@ impl SinkWriterContext {
             subtask,
             parallelism,
             job_id: job_id.into(),
+            metrics: Arc::new(super::metrics::SinkMetrics::new()),
         }
     }
 }
 use super::{sink_committer::SinkCommitter, sink_writer::SinkWriter};
+use std::sync::Arc;

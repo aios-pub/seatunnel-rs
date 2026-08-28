@@ -7,6 +7,7 @@ authors.workspace = true
 description = "Apache SeaTunnel Rust - Engine Communication: gRPC layer"
 
 [dependencies]
+seatunnel-api = { path = "../../seatunnel-api" }
 seatunnel-engine-core = { path = "../seatunnel-engine-core" }
 tonic = { workspace = true }
 prost = { workspace = true }

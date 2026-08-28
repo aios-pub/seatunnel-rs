@@ -20,6 +20,29 @@ pub struct JobSummaryDto {
     pub end_time_ms: i64,
 }
 
+/// Sink-side delivery metrics of one task (windowed, not lifetime).
+#[derive(Debug, Clone, Serialize)]
+pub struct SinkMetricsDto {
+    /// Sliding window length the counts cover, seconds.
+    pub window_secs: u64,
+    /// Messages enqueued to the transport within the window.
+    pub sent: u64,
+    /// Delivery reports acknowledged OK within the window.
+    pub delivered: u64,
+    /// Delivery reports failed within the window.
+    pub failed: u64,
+    /// Messages currently in flight (enqueued, report pending).
+    pub in_flight: u64,
+    /// EMA of enqueue→report latency, millis.
+    pub latency_ema_ms: f64,
+    /// Max enqueue→report latency within the window, millis.
+    pub latency_max_ms: u64,
+    /// Detailed last delivery error (empty when none).
+    pub last_error: String,
+    /// Epoch-ms of `last_error` (0 = none).
+    pub last_error_at: i64,
+}
+
 /// Per-task execution status inside a job.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskStatusDto {
@@ -38,6 +61,9 @@ pub struct TaskStatusDto {
     /// Milliseconds since the last processed record — the liveness signal
     /// for streaming tasks (-1 when no record was processed yet).
     pub idle_ms: i64,
+    /// Sink delivery metrics (absent when the sink reports nothing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_metrics: Option<SinkMetricsDto>,
 }
 
 /// Full job status for the detail view.

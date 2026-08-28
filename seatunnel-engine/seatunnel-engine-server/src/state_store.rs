@@ -29,6 +29,14 @@ use std::sync::Arc;
 /// Default snapshots kept per task (Java `keep-checkpoint-count`).
 pub const DEFAULT_RETAINED_SNAPSHOTS: usize = 3;
 
+/// Engine-reserved subdirectory names under the store root — never job
+/// state. The hybrid role shares the state dir with the Raft log/vote
+/// store (`<state_dir>/raft`), which the sweeper must not touch: a voter
+/// that has not written yet has an EMPTY raft dir, and an idle cluster's
+/// raft dir can be older than the job TTL — deleting either kills the
+/// Raft core with a store write error.
+const RESERVED_DIRS: &[&str] = &["raft"];
+
 #[derive(Debug, Clone)]
 pub struct LocalStateStore {
     root: PathBuf,
@@ -123,7 +131,8 @@ impl LocalStateStore {
         &self.root
     }
 
-    /// All job directories currently under the store root.
+    /// All job directories currently under the store root. Reserved
+    /// engine directories (`raft`) are excluded — they are not job state.
     pub fn job_dirs(&self) -> Vec<(String, PathBuf)> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();
@@ -131,6 +140,11 @@ impl LocalStateStore {
         entries
             .flatten()
             .filter(|e| e.path().is_dir())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                !RESERVED_DIRS.contains(&name.as_ref())
+            })
             .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
             .collect()
     }
@@ -356,6 +370,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let removed = store.sweep_expired(std::time::Duration::from_secs(3600));
         assert!(removed.contains(&"ghost".to_string()));
+    }
+
+    #[test]
+    fn sweep_never_touches_reserved_dirs() {
+        // Regression: in hybrid mode the Raft store lives at
+        // <state_dir>/raft. A voter that has not written yet keeps that
+        // directory EMPTY, and the startup sweep deleted it as an "empty
+        // job directory", crashing the Raft core on its next store write.
+        let store = tmp_store("reserved");
+        fs::create_dir_all(store.root().join("raft")).unwrap();
+        // ttl 0 would expire everything; the reserved dir must survive.
+        let removed = store.sweep_expired(std::time::Duration::ZERO);
+        assert!(removed.is_empty());
+        assert!(store.root().join("raft").is_dir());
+        // Non-reserved empty dirs are still swept.
+        fs::create_dir_all(store.root().join("ghost")).unwrap();
+        let removed = store.sweep_expired(std::time::Duration::ZERO);
+        assert_eq!(removed, vec!["ghost".to_string()]);
     }
 
     #[test]

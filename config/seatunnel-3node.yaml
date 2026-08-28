@@ -1,0 +1,70 @@
+# SeaTunnel-RS engine server configuration — 3-node symmetric hybrid
+# cluster, the recommended HA topology (Raft elects the coordinator; every
+# node also executes tasks).
+#
+# Copy this SAME file to all three machines and replace the member-list
+# hostnames below with real, mutually reachable addresses on every machine.
+# The ordered member-list IS the Raft voter set (voter id = position);
+# voter counts must be odd (1/3/5) — two voters are rejected at startup.
+# The member-list ORDER is also the leader priority order: each voter's
+# election window is shifted +700ms per position (voter 1: 900-1300ms,
+# voter 2: 1600-2000ms, voter 3: 2300-2700ms), so the lowest live voter
+# always wins the election in one round — no split votes, no term storms.
+# Zero-config: the defaults below are omitted; see docs/en/cluster-ha-design.md
+# ("Election stability") for the tunables (seatunnel.engine.raft.*).
+#
+# Then start each node with its own identity:
+#
+#   seatunnel-engine-server --role hybrid \
+#     --addr 0.0.0.0:5800 --advertise-addr node1.example.com:5800 \
+#     --worker-id hybrid-1 --state-dir /data/seatunnel/state \
+#     -f config/seatunnel-3node.yaml
+#
+# The embedded worker's address is derived from the node port, so no
+# per-machine worker config is needed. To grow a 3-node cluster later,
+# add `--role worker` nodes pointing at these voters instead of growing
+# the voter set — workers are not voters and need no member-list change.
+#
+# For a local one-machine rehearsal of this topology use
+# scripts/start-hybrid-cluster.sh, which generates the config itself.
+
+hazelcast:
+  cluster-name: seatunnel-cluster
+  network:
+    join:
+      tcp-ip:
+        enabled: true
+        member-list:
+          - "node1.example.com:5800"
+          - "node2.example.com:5800"
+          - "node3.example.com:5800"
+    port:
+      # auto-increment is NOT supported — member-list requires
+      # deterministic ports.
+      auto-increment: false
+      port: 5800
+
+seatunnel:
+  engine:
+    # Two-level liveness: a worker silent beyond the soft timeout gets no
+    # new assignments; beyond the hard timeout it is evicted and its tasks
+    # become claimable by the surviving nodes.
+    worker-soft-timeout-ms: 30000
+    worker-timeout-ms: 60000
+    heartbeat-interval-ms: 2000
+
+    checkpoint:
+      interval: 30000
+      keep-checkpoint-count: 3
+      storage:
+        # Cross-node restore (a dead node's tasks re-claimed elsewhere)
+        # requires a SHARED backend:
+        #   - master: checkpoints replicated to the voters via the
+        #     coordinator state snapshot; no external dependency
+        #   - s3: for large checkpoint payloads (MinIO/AWS example in
+        #     config/seatunnel.yaml)
+        # localfile restores only on the same node.
+        type: master
+        auto-clean: true
+        clean-grace-minutes: 10
+        clean-interval-minutes: 60

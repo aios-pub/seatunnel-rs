@@ -21,7 +21,7 @@ use super::ColumnDef;
 ///
 /// Mirrors `org.apache.seatunnel.api.table.catalog.TableSchema` from the Java version.
 /// Contains the complete type-safe schema for a single table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableSchema {
     /// Fully qualified table name (e.g., "database.table" or "schema.table")
     pub table_identifier: String,

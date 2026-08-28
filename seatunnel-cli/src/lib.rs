@@ -932,7 +932,11 @@ async fn print_cluster_info(address: &str) -> Result<()> {
             "  ● {} @ {} [{}] load {}‰ (lag {}ms, mem {}‰), running {} (last hb {})",
             w.worker_id,
             w.address,
-            if w.can_accept { "accepting" } else { "OVERLOADED" },
+            if w.can_accept {
+                "accepting"
+            } else {
+                "OVERLOADED"
+            },
             w.load_score,
             w.lag_ms,
             w.mem_permille,

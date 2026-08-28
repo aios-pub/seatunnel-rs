@@ -5,17 +5,17 @@
 
 //! Login/logout/whoami handlers and the API authentication middleware.
 
+use axum::Json;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::AppState;
 use crate::auth::AuthConfig;
 use crate::dto::ErrorDto;
-use crate::AppState;
 
 /// Request body for `POST /api/v1/login`.
 #[derive(Debug, Deserialize)]
@@ -39,7 +39,10 @@ fn now_ms() -> u64 {
 
 /// `POST /api/v1/login` — verify credentials and set the session cookie.
 pub async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
-    if state.auth.check_credentials(&request.username, &request.password) {
+    if state
+        .auth
+        .check_credentials(&request.username, &request.password)
+    {
         let token = state.auth.issue_token(now_ms());
         tracing::info!(user = %request.username, "console login succeeded");
         return (

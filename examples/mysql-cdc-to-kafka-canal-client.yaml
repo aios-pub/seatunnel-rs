@@ -13,7 +13,7 @@
 env:
   job.name: mysql-cdc-to-kafka-canal-client
   parallelism: 1
-  checkpoint.interval: 3000
+  checkpoint.interval: 10000
 
 source:
   MySQL-CDC:

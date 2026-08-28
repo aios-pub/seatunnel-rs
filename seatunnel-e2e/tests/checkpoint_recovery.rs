@@ -368,7 +368,7 @@ env:
     name: e2e-eos-kafka
   parallelism: 1
   checkpoint:
-    interval: 1000
+    interval: 10000
 pipelines:
   - name: p0
     source:
@@ -403,8 +403,10 @@ pipelines:
             &state_dir,
             &dir.join(format!("run{}.log", round)),
         );
-        // Let the job connect + snapshot drain on the first round.
-        tokio::time::sleep(Duration::from_millis(if round == 1 { 4000 } else { 1500 })).await;
+        // Let the job connect + snapshot drain on the first round. Each
+        // round must span at least one 10s checkpoint interval so the
+        // batch is committed before the kill.
+        tokio::time::sleep(Duration::from_millis(12000)).await;
         insert_rows("e2e_eos", &mut seq, (TOTAL / 4) * round, 1).await;
         runner.kill9().await;
         eprintln!("round {}: killed at seq {}", round, seq);
@@ -421,8 +423,8 @@ pipelines:
     );
     tokio::time::sleep(Duration::from_millis(1500)).await;
     insert_rows("e2e_eos", &mut seq, TOTAL, 1).await;
-    // Give the last rows a checkpoint cycle, then SIGTERM.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Give the last rows a checkpoint cycle (10s interval), then SIGTERM.
+    tokio::time::sleep(Duration::from_millis(12000)).await;
     let status = runner.graceful_stop().await.unwrap();
     assert!(
         status.success(),
@@ -535,7 +537,7 @@ env:
     name: e2e-eos-xa
   parallelism: 1
   checkpoint:
-    interval: 1000
+    interval: 10000
 pipelines:
   - name: p0
     source:
@@ -571,7 +573,10 @@ pipelines:
             &state_dir,
             &dir.join(format!("run{}.log", round)),
         );
-        tokio::time::sleep(Duration::from_millis(if round == 1 { 4000 } else { 1500 })).await;
+        // Each round must span at least one 10s checkpoint interval so
+        // the batch is committed (XA: prepared AND committed) before
+        // the kill.
+        tokio::time::sleep(Duration::from_millis(12000)).await;
         insert_rows("e2e_eos_src", &mut seq, (TOTAL / 4) * round, 1).await;
         runner.kill9().await;
         eprintln!("round {}: killed at seq {}", round, seq);
@@ -587,7 +592,10 @@ pipelines:
     );
     tokio::time::sleep(Duration::from_millis(1500)).await;
     insert_rows("e2e_eos_src", &mut seq, TOTAL, 1).await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Span a full 10s checkpoint interval: the periodic checkpoint
+    // prepares AND commits the final batch (the graceful stop's final
+    // checkpoint only prepares — XA commits land on the NEXT cycle).
+    tokio::time::sleep(Duration::from_millis(12000)).await;
     let status = runner.graceful_stop().await.unwrap();
     assert!(
         status.success(),

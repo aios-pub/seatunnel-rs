@@ -6350,8 +6350,10 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures",
  "parking_lot",
  "rdkafka",
+ "regex 1.13.1",
  "seatunnel-api",
  "seatunnel-connector-common",
  "seatunnel-formats",
@@ -6439,6 +6441,7 @@ dependencies = [
  "chrono",
  "parking_lot",
  "prost 0.13.5",
+ "seatunnel-api",
  "seatunnel-engine-core",
  "serde 1.0.229",
  "tokio",

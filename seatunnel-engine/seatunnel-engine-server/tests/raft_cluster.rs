@@ -32,6 +32,7 @@ use seatunnel_engine_server::raft::{
     LeaderState, LeaderView, Raft, RaftWrite, WritePath, members_from_addresses, start_node,
     validate_voters,
 };
+use seatunnel_engine_server::server_config::RaftTiming;
 
 struct Node {
     #[allow(dead_code)]
@@ -57,10 +58,16 @@ async fn start_test_node(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let coordinator = Arc::new(JobCoordinator::new());
     let dir = state_root.join(format!("node-{}", id));
-    let raft = (*start_node(id, members.clone(), Arc::clone(&coordinator), dir).await?).clone();
-    let handler = seatunnel_engine_server::raft::network::RaftServiceHandler {
-        raft: raft.clone(),
-    };
+    let raft = (*start_node(
+        id,
+        members.clone(),
+        Arc::clone(&coordinator),
+        dir,
+        RaftTiming::default(),
+    )
+    .await?)
+        .clone();
+    let handler = seatunnel_engine_server::raft::network::RaftServiceHandler { raft: raft.clone() };
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(RaftServiceServer::new(handler))
@@ -119,7 +126,8 @@ async fn wait_for_leader(nodes: &[Node], timeout: Duration) -> (usize, u64) {
 }
 
 fn tmp_root(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("st-raft-{}-{}", tag, uuid::Uuid::new_v4().simple()));
+    let dir =
+        std::env::temp_dir().join(format!("st-raft-{}-{}", tag, uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -143,7 +151,10 @@ async fn single_voter_elects_and_applies() {
     assert!(term >= 1, "leader term must be >= 1, got {}", term);
 
     // A write applies on the leader and lands in the state machine.
-    node.writes.propose(submit_command("j-single")).await.unwrap();
+    node.writes
+        .propose(submit_command("j-single"))
+        .await
+        .unwrap();
     // CancelJob of an unknown job is a no-op command; assert it applied by
     // proposing a real SubmitJob and checking the coordinator.
     let job = seatunnel_engine_server::job_coordinator::JobDto {
@@ -213,8 +224,14 @@ async fn three_voters_failover_without_dual_writes() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "replication stalled");
-        if nodes.iter().all(|n| n.coordinator.get_job("jrepl").is_some()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "replication stalled"
+        );
+        if nodes
+            .iter()
+            .all(|n| n.coordinator.get_job("jrepl").is_some())
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -226,12 +243,24 @@ async fn three_voters_failover_without_dual_writes() {
     assert!(!follower.writes.leader_hint().is_empty());
 
     // Kill the leader: a quorum (2 of 3) remains and elects a successor.
+    // To the survivors a graceful shutdown and a kill -9 are the same
+    // thing — silence — so this exercises the kill -9 failover path.
     let dead_leader = nodes.remove(leader_idx);
     let old_term = dead_leader.leader.read().unwrap().term;
     let _ = dead_leader.raft.shutdown().await;
     let survivors: Vec<Node> = nodes;
     let (new_idx, new_term) = wait_for_leader(&survivors, Duration::from_secs(15)).await;
     assert!(new_term > old_term, "term must advance across failover");
+    // Disjoint per-node election windows make the handover clean: the
+    // lowest live voter campaigns first and the others grant, so the
+    // term advances by ~1. A storm of failed campaigns would show up as
+    // rapid term inflation — bounded here.
+    assert!(
+        new_term <= old_term + 3,
+        "term inflated {} -> {} across one failover (election thrashing)",
+        old_term,
+        new_term
+    );
 
     // Writes still work on the successor — this is the availability the
     // quorum buys.

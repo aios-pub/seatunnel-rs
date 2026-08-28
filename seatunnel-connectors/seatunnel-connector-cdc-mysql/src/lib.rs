@@ -798,27 +798,39 @@ impl MySqlCdcReader {
     }
 
     /// Create and prime one schema watcher per captured table.
+    ///
+    /// Every subtask primes watchers and queues an initial-schema event:
+    /// each subtask feeds its own sink writer, and schema-driven sinks
+    /// (e.g. the Kafka canal-client format with automatic column mapping)
+    /// need the column layout before the table's first row. DDL
+    /// observation and interval polling stay owned by subtask 0 with
+    /// schema evolution enabled — other subtasks' watchers are passive
+    /// baselines that never emit change events.
     async fn prime_schema_watchers(&mut self) -> anyhow::Result<()> {
+        let active_ddl = self.config.schema_evolution.enabled && self.config.subtask_index == 0;
+        let mut watcher_config = self.config.schema_evolution.clone();
+        watcher_config.enabled = active_ddl;
         let pool = self.build_pool();
         let mut conn = pool.get_conn().await?;
         let tables = resolve_captured_tables(&mut conn, &self.config).await?;
         for (db, table) in tables {
-            let rows: Vec<(String, u32)> = conn
+            let rows: Vec<(String, u32, String)> = conn
                 .exec(
-                    "SELECT COLUMN_NAME, ORDINAL_POSITION FROM information_schema.columns \
+                    "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_KEY FROM information_schema.columns \
                      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     (&db, &table),
                 )
                 .await?;
             let columns: Vec<seatunnel_api::ColumnDef> = rows
                 .into_iter()
-                .map(|(name, _)| {
+                .map(|(name, _, column_key)| {
                     seatunnel_api::ColumnDef::new(name, seatunnel_api::ColumnType::String)
+                        .with_primary_key(column_key == "PRI")
                 })
                 .collect();
-            let mut watcher =
-                SchemaWatcher::new(format!("{}.{}", db, table), &self.config.schema_evolution);
+            let mut watcher = SchemaWatcher::new(format!("{}.{}", db, table), &watcher_config);
             watcher.prime(columns);
+            watcher.queue_initial();
             self.schema_watchers.push(watcher);
         }
         tracing::info!(
@@ -1201,12 +1213,19 @@ impl MySqlCdcReader {
         }
 
         let mut decoded: VecDeque<BufferedChange> = VecDeque::new();
+        // Every row of this rows event belongs to one table; tag them with
+        // the identity so downstream sinks can route/stamp per-table.
+        let origin = format!("{}.{}", tme.database_name(), tme.table_name());
+        let tag = |mut row: SeatunnelRow| {
+            row.origin_table = Some(origin.clone());
+            row
+        };
         match &rows {
             RowsEventData::WriteRowsEvent(e) => {
                 for pair in e.rows(tme) {
                     if let Ok((_, Some(after))) = pair {
                         decoded.push_back(BufferedChange {
-                            row: binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert),
+                            row: tag(binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert)),
                         });
                     }
                 }
@@ -1215,10 +1234,10 @@ impl MySqlCdcReader {
                 for pair in e.rows(tme) {
                     if let Ok((Some(before), Some(after))) = pair {
                         decoded.push_back(BufferedChange {
-                            row: binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete),
+                            row: tag(binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete)),
                         });
                         decoded.push_back(BufferedChange {
-                            row: binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert),
+                            row: tag(binlog_row_to_seatunnel(&after, num_cols, RowKind::Insert)),
                         });
                     }
                 }
@@ -1227,7 +1246,7 @@ impl MySqlCdcReader {
                 for pair in e.rows(tme) {
                     if let Ok((Some(before), _)) = pair {
                         decoded.push_back(BufferedChange {
-                            row: binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete),
+                            row: tag(binlog_row_to_seatunnel(&before, num_cols, RowKind::Delete)),
                         });
                     }
                 }
@@ -1341,12 +1360,11 @@ impl SourceReader for MySqlCdcReader {
                 _ => {}
             }
 
-            // Schema evolution: subtask 0 owns the binlog stream and the
-            // DDL watcher; snapshot-only subtasks finish too quickly to care.
-            if self.config.schema_evolution.enabled && self.config.subtask_index == 0 {
-                if let Err(e) = self.prime_schema_watchers().await {
-                    tracing::warn!("MySQL CDC: schema watcher priming failed: {}", e);
-                }
+            // Schema watchers are ALWAYS primed (initial-schema events for
+            // schema-driven sinks); DDL watching stays inside, gated on
+            // evolution being enabled (see prime_schema_watchers).
+            if let Err(e) = self.prime_schema_watchers().await {
+                tracing::warn!("MySQL CDC: schema watcher priming failed: {}", e);
             }
 
             // Startup-mode shortcuts.
@@ -1735,11 +1753,14 @@ async fn query_snapshot_batch(
     // `exec` uses the binary protocol so numeric/temporal columns arrive
     // fully typed instead of as raw byte strings.
     let rows: Vec<Row> = conn.exec(sql, ()).await?;
+    let origin = format!("{}.{}", split.database, split.table);
     Ok(rows
         .iter()
         .map(|r| {
             let pk = extract_pk(r, last_pk);
-            (pk, mysql_row_to_seatunnel_row(r))
+            let mut row = mysql_row_to_seatunnel_row(r);
+            row.origin_table = Some(origin.clone());
+            (pk, row)
         })
         .collect())
 }
@@ -2214,6 +2235,46 @@ mod tests {
         assert!(cfg.table_selector.matches("seatunnel", "events_2026"));
         assert!(cfg.table_selector.matches("seatunnel_shard", "events_2026"));
         assert!(!cfg.table_selector.matches("seatunnel", "users"));
+
+        // Official table-names ONLY (no database-names): the qualified
+        // refs carry their own database scope — the legacy default
+        // database must not gate them out (bench/P2-style configs).
+        let cfg = mk(&[(
+            "table-names",
+            "ailearn_okminicourse.ailearn_tag,ailearn-english.english_dictionary_words",
+        )]);
+        assert!(
+            cfg.table_selector
+                .matches("ailearn_okminicourse", "ailearn_tag")
+        );
+        assert!(
+            cfg.table_selector
+                .matches("ailearn-english", "english_dictionary_words")
+        );
+        assert!(!cfg.table_selector.matches("ailearn_okminicourse", "other"));
+        assert!(!cfg.table_selector.matches("seatunnel", "ailearn_tag"));
+
+        // Official table-pattern ONLY (no database-names).
+        let cfg = mk(&[(
+            "table-pattern",
+            "neworiental_data_recommand\\.entity_((question|resource)_lib_\\d|question_used|resource_used)",
+        )]);
+        assert!(
+            cfg.table_selector
+                .matches("neworiental_data_recommand", "entity_question_lib_0")
+        );
+        assert!(
+            cfg.table_selector
+                .matches("neworiental_data_recommand", "entity_resource_used")
+        );
+        assert!(
+            !cfg.table_selector
+                .matches("neworiental_data_recommand", "entity_other")
+        );
+        assert!(
+            !cfg.table_selector
+                .matches("seatunnel", "entity_question_lib_0")
+        );
 
         // table-names-config per-table split column override.
         let cfg = mk(&[(
