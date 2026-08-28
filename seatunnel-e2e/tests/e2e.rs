@@ -17,11 +17,11 @@
 
 //! End-to-end test: MySQL CDC → SeaTunnel cluster → Kafka.
 //!
-//! Requires the docker-compose infrastructure:
+//! Requires the docker-compose infrastructure (KRaft Kafka + MySQL):
 //!
 //! ```bash
-//! docker compose up -d zookeeper kafka mysql
-//! cargo test -p seatunnel-e2e --test e2e -- --ignored --nocapture
+//! docker compose up -d kafka mysql
+//! cargo test -p seatunnel-e2e --test e2e -- --nocapture
 //! ```
 //!
 //! When Kafka/MySQL are unreachable the test SKIPS so plain CI runs without
@@ -32,11 +32,12 @@ use std::time::Duration;
 
 use seatunnel_engine_client::EngineClient;
 use seatunnel_engine_comm::{
-    generated::client_service_client::ClientServiceClient,
-    generated::master_service_client::MasterServiceClient, SubmitJobRequest,
+    SubmitJobRequest, generated::client_service_client::ClientServiceClient,
+    generated::master_service_client::MasterServiceClient,
 };
 use seatunnel_engine_server::{
-    new_worker_registry, ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode,
+    ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode,
+    master::MasterInfo, new_worker_registry,
 };
 use tokio::net::TcpStream;
 
@@ -107,12 +108,22 @@ async fn kafka_consume(topic: &str) -> anyhow::Result<Vec<String>> {
 async fn spawn_master() -> anyhow::Result<String> {
     let coordinator = Arc::new(JobCoordinator::new());
     let registry = new_worker_registry();
-    let handler = MasterHandler::new(coordinator.clone(), registry.clone());
-    let client_handler = ClientHandler::new(coordinator, registry);
 
     // Bind eagerly; serve on the same listener.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
+    let info = MasterInfo {
+        advertise_addr: addr.clone(),
+        role: "master".to_string(),
+    };
+    let handler = MasterHandler::new_direct(
+        coordinator.clone(),
+        registry.clone(),
+        info.clone(),
+        150, // fast heartbeat for the test
+        60_000,
+    );
+    let client_handler = ClientHandler::new_direct(coordinator, registry, info);
     tokio::spawn(async move {
         use seatunnel_engine_comm::{
             generated::client_service_server::ClientServiceServer,
@@ -152,34 +163,41 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
                 resources: Default::default(),
                 heartbeat_interval_ms: 200,
                 running_task_ids: Vec::new(),
+                slots: 0, // deprecated
             },
         ))
         .await?;
 
+    // Production-shaped heartbeat loop: live task metrics (so the master
+    // sees checkpoints/records), admission signals, and term-fenced
+    // application of dispatch/cancel/fences/checkpoint triggers.
     let hb_worker = Arc::clone(&worker);
     let mut hb_client = client;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(150));
         loop {
             tick.tick().await;
+            let tasks = hb_worker.heartbeat_tasks().await;
+            let (load_score, lag_ms, mem_permille, can_accept) =
+                hb_worker.admission_fields().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
                     worker_id: "e2e-worker".into(),
                     address: String::new(),
                     timestamp: seatunnel_engine_core::now_millis(),
-                    tasks: vec![],
+                    tasks,
+                    term: hb_worker.term(),
+                    wait_ms: 0,
+                    load_score,
+                    lag_ms,
+                    mem_permille,
+                    can_accept,
                 })
                 .await
             else {
                 break;
             };
-            let response = resp.into_inner();
-            if !response.cancel_jobs.is_empty() {
-                hb_worker.cancel_jobs(&response.cancel_jobs).await;
-            }
-            for task in response.pending_tasks {
-                hb_worker.assign_task(task).await;
-            }
+            hb_worker.apply_master_response(&resp.into_inner()).await;
         }
     });
     Ok(worker)
@@ -199,10 +217,13 @@ async fn mysql_cdc_to_kafka_closed_loop() {
     let deps_ok = tokio::join!(wait_for(MYSQL, 5), wait_for(KAFKA, 5));
     if !(deps_ok.0 && deps_ok.1) {
         eprintln!(
-            "SKIP: kafka/mysql not reachable — start `docker compose up -d zookeeper kafka mysql`"
+            "SKIP: kafka/mysql not reachable — start `docker compose up -d kafka mysql`"
         );
         return;
     }
+    // Fresh topic per run: assertions must see THIS run's data, never a
+    // previous run's leftovers (auto-creation is enabled in compose).
+    let topic = format!("{}-{}", TOPIC, uuid_like());
 
     let master_addr = spawn_master().await.unwrap();
     let _worker = spawn_worker(&master_addr).await.unwrap();
@@ -231,7 +252,7 @@ async fn mysql_cdc_to_kafka_closed_loop() {
         "sink": {
             "Kafka": {
                 "bootstrap.servers": format!("{}:{}", KAFKA.0, KAFKA.1),
-                "topic": TOPIC, "format": "json", "batch.size": 10
+                "topic": topic, "format": "json", "batch.size": 10
             }
         }
     });
@@ -259,7 +280,7 @@ async fn mysql_cdc_to_kafka_closed_loop() {
             tokio::time::Instant::now() < deadline,
             "snapshot rows never reached Kafka"
         );
-        let messages = kafka_consume(TOPIC).await.unwrap_or_default();
+        let messages = kafka_consume(&topic).await.unwrap_or_default();
         if messages.iter().any(|m| m.contains("alice"))
             && messages.iter().any(|m| m.contains("bob"))
         {
@@ -279,7 +300,7 @@ async fn mysql_cdc_to_kafka_closed_loop() {
             tokio::time::Instant::now() < deadline,
             "incremental insert never reached Kafka"
         );
-        let messages = kafka_consume(TOPIC).await.unwrap_or_default();
+        let messages = kafka_consume(&topic).await.unwrap_or_default();
         if messages.iter().any(|m| m.contains("zoe")) {
             println!("incremental row verified");
             break;
@@ -287,8 +308,27 @@ async fn mysql_cdc_to_kafka_closed_loop() {
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
 
-    // Cancel the streaming job.
+    // Cancel the streaming job and VERIFY it reaches CANCELLED (the exit
+    // checkpoint lands on the cancel path).
     let client = EngineClient::new(&master_addr);
     client.cancel_job(&job_id).await.unwrap();
-    println!("cancelled {}", job_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = client
+            .get_job_status(&job_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+            .unwrap();
+        if status.state == 6 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job {} never reached CANCELLED (state {})",
+            job_id,
+            status.state
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    println!("cancelled {} (exit checkpoint taken)", job_id);
 }
