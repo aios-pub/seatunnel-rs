@@ -769,16 +769,15 @@ async fn print_cluster_info(address: &str) -> Result<()> {
     );
     for w in info.workers {
         println!(
-            "  ● {} @ {} (last hb {}, slots {}, running {})",
+            "  ● {} @ {} [{}] load {}‰ (lag {}ms, mem {}‰), running {} (last hb {})",
             w.worker_id,
             w.address,
-            w.last_heartbeat,
-            if w.slots == 0 {
-                "-".to_string()
-            } else {
-                w.slots.to_string()
-            },
-            w.running_tasks
+            if w.can_accept { "accepting" } else { "OVERLOADED" },
+            w.load_score,
+            w.lag_ms,
+            w.mem_permille,
+            w.running_tasks,
+            w.last_heartbeat
         );
     }
     Ok(())

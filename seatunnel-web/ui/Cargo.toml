@@ -1,0 +1,24 @@
+[package]
+name = "seatunnel-web-ui"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SeaTunnel web console frontend (Leptos CSR, built with trunk)"
+
+# Standalone crate on purpose: it only compiles for wasm32 via trunk and is
+# not part of the host-target workspace build. The empty [workspace] table
+# keeps cargo from walking up to the repository root workspace.
+[workspace]
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+leptos_router = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+# Pinned to match the locally installed wasm-bindgen-cli so trunk does not
+# need to download its own copy from GitHub releases.
+wasm-bindgen = "=0.2.126"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlElement", "NodeList", "Window"] }

@@ -39,5 +39,6 @@ Pseudo-cluster fault-matrix verification: `scripts/e2e-pseudo-cluster.sh`
 - Set `checkpoint.storage.type: s3` with a real S3/MinIO deployment for production (decouples checkpoint durability from master liveness).
 - `worker-timeout-ms` (hard eviction, default 60000) should be ≥ 3× heartbeat interval (`heartbeat-interval-ms`, default 2000); `worker-soft-timeout-ms` (default 30000) should sit between the two. Increase both on lossy networks to avoid premature eviction — the Java engine ships 180s tolerance for exactly this reason (a 27s full-GC stall once split its cluster).
 - Graceful worker shutdown (`UnregisterWorker`) releases the worker's tasks for takeover immediately; only crashed workers wait out the hard timeout.
+- Task admission is dynamic (measured pressure, no slot counts): tune `overload-lag-ms` / `memory-watermark-percent` on lossy or small hosts; both accept `0` to disable a signal (disabled-everything = unlimited concurrency — understand the risk before doing it). Watch the cluster page's overload badges or `seatunnel_worker_overloaded` gauges.
 - `replication-interval-ms` bounds standby staleness; 5000ms default is a good trade-off.
 - Monitor for `Failover: task` and `failing over to` log lines — they indicate infra-level instability.

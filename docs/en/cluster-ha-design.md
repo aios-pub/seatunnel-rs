@@ -102,12 +102,16 @@ semantics, adapted to the pull-based protocol:
   (all parallel subtasks of a pipeline cut together, master-orchestrated
   two-phase commit) — not barriers travelling through data streams.
   (Stage 2.)
-- **Static slot budget** (`slot-num`, default 8) instead of Java's
-  memory-based dynamic slot allocation. Scheduling fairness comes from
-  least-loaded placement (✅ Stage 4: placement picks the worker with the
-  lowest load factor — assigned/budget — and skips saturated workers,
-  falling back to all workers only when every budget is exhausted), not
-  resource accounting.
+- **No slot mechanism at all.** Java allocates memory-sliced slots and
+  blocks JobMasters waiting for them; here "is the worker full" is
+  answered by MEASURED pressure — event-loop lag and a memory watermark
+  (with hysteresis) — reported on every heartbeat. Overloaded workers
+  simply receive nothing new and their pending tasks are stolen by
+  healthy peers; when everyone is over a watermark, tasks queue as
+  SCHEDULED (no blocking waits). Placement orders workers by the measured
+  load score. The verdict and both signals are visible in the web
+  console's cluster page and as Prometheus gauges — the mechanism is
+  meant to be seen, not guessed.
 - **Pull-based dispatch over heartbeat with a long-poll fast path**
   (✅ Stage 4) instead of Hazelcast operation push. Workers ask with a
   `wait_ms` budget; the master parks the request on a wake signal and

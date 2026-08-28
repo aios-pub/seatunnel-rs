@@ -58,7 +58,8 @@ message WorkerRegistration {
   // master marks them Running for this worker so other workers do not
   // take them over while it reconnects).
   repeated string running_task_ids = 6;
-  // Task slot budget advertised by the worker (0 = legacy/unlimited).
+  // DEPRECATED (ignored): static slot budgets are gone; admission is
+  // dynamic, based on measured pressure carried on heartbeats.
   uint32 slots = 7;
 }
 
@@ -89,6 +90,17 @@ message HeartbeatRequest {
   // Long-poll hint (ms): the master may hold the request until dispatchable
   // work appears. 0 = return immediately (legacy behavior).
   int64 wait_ms = 6;
+  // Dynamic admission signals (measured pressure, not a slot count):
+  //   load_score  — overall pressure 0..1000 (per-mille), max of signal ratios
+  //   lag_ms      — event-loop lag EMA (runtime saturation)
+  //   mem_permille— process RSS / usable memory, 0..1000
+  //   can_accept  — false while any signal is over its watermark (with
+  //                 hysteresis); the master stops assigning new tasks and
+  //                 healthy workers may steal this worker's PENDING tasks
+  uint32 load_score = 7;
+  uint32 lag_ms = 8;
+  uint32 mem_permille = 9;
+  bool can_accept = 10;
 }
 
 message HeartbeatResponse {
@@ -293,8 +305,13 @@ message WorkerInfo {
   int64 last_heartbeat = 3;
   map<string, string> resources = 4;
   int32 running_tasks = 5;
-  // Advertised slot budget (0 = legacy/unlimited).
+  // DEPRECATED (ignored): see WorkerRegistration.slots.
   uint32 slots = 6;
+  // Measured admission state (visibility for the console and web UI).
+  uint32 load_score = 7;
+  uint32 lag_ms = 8;
+  uint32 mem_permille = 9;
+  bool can_accept = 10;
 }
 
 // --- Task Assignment ---

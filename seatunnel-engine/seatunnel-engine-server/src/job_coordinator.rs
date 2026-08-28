@@ -330,6 +330,19 @@ pub struct JobCoordinator {
     preempt_outbox: std::sync::Mutex<HashMap<String, Vec<String>>>,
 }
 
+/// Liveness + admission state of a worker, as seen by the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerState {
+    /// Registered and accepting tasks.
+    Healthy,
+    /// Registered but over its pressure watermark: no NEW tasks; its
+    /// PENDING (never-dispatched) tasks may be stolen by healthy workers.
+    Overloaded,
+    /// Not in the live registry (evicted / never registered): orphaned
+    /// Deploying/Running tasks are claimable.
+    Dead,
+}
+
 /// One in-flight coordinated checkpoint for a pipeline.
 #[derive(Debug, Clone)]
 struct PendingCheckpoint {
@@ -520,7 +533,7 @@ impl JobCoordinator {
         job_name: &str,
         config: &serde_json::Value,
         parallelism_override: Option<usize>,
-        workers: &[(String, String, u32)],
+        workers: &[(String, String, u32, bool)],
     ) -> anyhow::Result<(JobDto, Vec<TaskDto>, Vec<TaskDescriptor>)> {
         let (job_dto, dtos, tasks) = self.compile_plan_inner(
             job_id,
@@ -559,7 +572,7 @@ impl JobCoordinator {
         job_name: &str,
         config: &serde_json::Value,
         parallelism_override: Option<usize>,
-        workers: &[(String, String, u32)],
+        workers: &[(String, String, u32, bool)],
     ) -> anyhow::Result<(JobDto, Vec<TaskDto>, Vec<TaskDescriptor>)> {
         let parallelism = parallelism_override
             .unwrap_or_else(|| env_parallelism(config))
@@ -601,28 +614,30 @@ impl JobCoordinator {
         // pipeline's source and the FULL sink list (fan-out happens
         // inside the task).
         let mut load = self.running_counts();
-        // Default budget for workers that did not advertise one (0).
-        const DEFAULT_SLOTS: usize = 8;
         let mut tasks = Vec::new();
         let mut task_no = 0usize;
         for (pipe_idx, pipe) in pipelines.iter().enumerate() {
             for i in 0..pipe.parallelism {
-                // Candidates: workers with free slots; if every advertised
-                // budget is exhausted, fall back to all of them (permissive
-                // admission — a full cluster still runs the job).
+                // Candidates: accepting workers ordered by measured
+                // pressure (load score), least assigned as tie-break. If
+                // NO worker currently accepts, place on the least-loaded
+                // anyway — the tasks stay SCHEDULED and the claim gate +
+                // steal rule move them once pressure clears (natural
+                // queueing, no blocking waits).
                 let pick = workers
                     .iter()
-                    .filter(|(id, _, slots)| {
-                        let budget = (*slots as usize).max(1);
-                        load.get(id).copied().unwrap_or(0) < budget
+                    .filter(|(_, _, _, can_accept)| *can_accept)
+                    .min_by_key(|(id, _, score, _)| {
+                        (*score, load.get(id).copied().unwrap_or(0))
                     })
-                    .min_by_key(|(id, _, slots)| {
-                        let budget = (*slots as usize).max(1);
-                        let assigned = load.get(id).copied().unwrap_or(0);
-                        // Load factor first, absolute count as tie-break.
-                        (assigned * 1000 / budget, assigned)
+                    .or_else(|| {
+                        workers
+                            .iter()
+                            .min_by_key(|(id, _, score, _)| {
+                                (*score, load.get(id).copied().unwrap_or(0))
+                            })
                     });
-                let (worker_id, worker_addr, _) = pick.unwrap_or(&workers[0]);
+                let (worker_id, worker_addr, _, _) = pick.unwrap_or(&workers[0]);
                 *load.entry(worker_id.clone()).or_default() += 1;
                 let sinks_json: Vec<serde_json::Value> = pipe
                     .sinks
@@ -676,18 +691,11 @@ impl JobCoordinator {
                 task_no += 1;
             }
         }
-        if task_no > 0 {
-            let saturated = workers.iter().any(|(id, _, slots)| {
-                let budget = (*slots as usize).max(1);
-                load.get(id).copied().unwrap_or(0) > budget
-            });
-            if saturated {
-                warn!(
-                    "Job {}: some workers are at/over their slot budget; \
-                     placement fell back to all workers",
-                    job_name
-                );
-            }
+        if task_no > 0 && workers.iter().all(|(_, _, _, can_accept)| !can_accept) {
+            warn!(
+                "Job {}: every worker is currently over its admission watermark; tasks queued as SCHEDULED until pressure clears",
+                job_name
+            );
         }
 
         // Register the job + task infos.
@@ -740,7 +748,7 @@ impl JobCoordinator {
         job_name: &str,
         config: &serde_json::Value,
         parallelism_override: Option<usize>,
-        workers: &[(String, String, u32)],
+        workers: &[(String, String, u32, bool)],
     ) -> anyhow::Result<(String, Vec<TaskDescriptor>)> {
         let (job_dto, dtos, _tasks) =
             self.compile_plan_inner(job_id, job_name, config, parallelism_override, workers)?;
@@ -862,17 +870,27 @@ impl JobCoordinator {
     }
 
     /// Read-only claim decision: tasks this heartbeat-coming worker may
-    /// take — pending (Created/Scheduled) tasks assigned to it, plus
-    /// orphaned tasks (Deploying/Running) whose assigned worker is no
-    /// longer in the live registry. Mutations (reassignment + Deploying)
-    /// happen in [`Self::mark_tasks_dispatched`], reached through a Raft
+    /// take. Admission model (no slot counts):
+    /// - its own pending (Created/Scheduled) tasks — only while it is
+    ///   itself Healthy;
+    /// - orphaned Deploying/Running tasks whose owner left the registry;
+    /// - PENDING tasks of an Overloaded owner — load-shedding: a worker
+    ///   past its pressure watermark has its not-yet-dispatched work
+    ///   stolen by healthy peers (RUNNING tasks are never stolen; those
+    ///   go through eviction to protect checkpoint consistency).
+    /// Mutations (reassignment + Deploying) happen in
+    /// [`Self::mark_tasks_dispatched`], reached through a Raft
     /// `Command::MarkDispatched` in consensus mode.
     pub fn claim_tasks_for_worker(
         &self,
         worker_id: &str,
         _worker_addr: &str,
-        live_workers: &dyn Fn(&str) -> bool,
+        worker_state: &dyn Fn(&str) -> WorkerState,
     ) -> Vec<TaskDescriptor> {
+        // An overloaded requester gets nothing new this round.
+        if worker_state(worker_id) != WorkerState::Healthy {
+            return Vec::new();
+        }
         let jobs = self.jobs.read();
         let all = self.all_tasks.read();
         let mut out = Vec::new();
@@ -881,33 +899,37 @@ impl JobCoordinator {
                 continue;
             }
             for info in job.tasks.values() {
+                let owner_state = worker_state(&info.worker_id);
                 let eligible = match info.state {
                     JobState::Created | JobState::Scheduled => {
-                        info.worker_id == worker_id
+                        info.worker_id == worker_id || owner_state == WorkerState::Overloaded
                     }
-                    JobState::Deploying | JobState::Running => !live_workers(&info.worker_id),
+                    JobState::Deploying | JobState::Running => owner_state == WorkerState::Dead,
                     _ => false,
                 };
                 if !eligible {
                     continue;
                 }
                 if let Some(desc) = all.get(&info.task_id) {
-                    if desc
+                    let desc_owner = desc
                         .config
                         .get("worker_id")
-                        .map(|w| w == worker_id)
-                        .unwrap_or(false)
-                        || !live_workers(
-                            desc.config
-                                .get("worker_id")
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                        )
-                    {
-                        if !live_workers(&info.worker_id) && info.worker_id != worker_id {
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let desc_ok = desc_owner == worker_id
+                        || worker_state(desc_owner) == WorkerState::Dead
+                        || worker_state(desc_owner) == WorkerState::Overloaded;
+                    if desc_ok {
+                        if info.worker_id != worker_id {
                             info!(
-                                "Failover: task {} of dead worker '{}' claimable by '{}'",
-                                info.task_id, info.worker_id, worker_id
+                                "Admission: task {} of {} worker '{}' claimable by '{}'",
+                                info.task_id,
+                                match owner_state {
+                                    WorkerState::Dead => "dead",
+                                    _ => "overloaded",
+                                },
+                                info.worker_id,
+                                worker_id
                             );
                         }
                         out.push(desc.clone());
@@ -1978,16 +2000,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn workers(n: usize) -> Vec<(String, String, u32)> {
+    fn workers(n: usize) -> Vec<(String, String, u32, bool)> {
         (0..n)
             .map(|i| {
                 (
                     format!("worker-{}", i),
                     format!("127.0.0.1:{}", 5001 + i),
-                    8u32,
+                    100u32,
+                    true,
                 )
             })
             .collect()
+    }
+
+    fn live<'a>(state_of: &'a [(&'a str, WorkerState)]) -> Box<dyn Fn(&str) -> WorkerState + 'a> {
+        Box::new(move |w: &str| {
+            state_of
+                .iter()
+                .find(|(id, _)| *id == w)
+                .map(|(_, s)| *s)
+                .unwrap_or(WorkerState::Dead)
+        })
     }
 
     #[test]
@@ -2010,8 +2043,11 @@ mod tests {
         // read-only claim returns it (still labeled with the dead owner);
         // the durable reassignment happens in mark_tasks_dispatched.
         let dead = "worker-1";
-        let claimed =
-            coordinator.claim_tasks_for_worker("worker-0", "127.0.0.1:9999", &|w| w != dead);
+        let claimed = coordinator.claim_tasks_for_worker(
+            "worker-0",
+            "127.0.0.1:9999",
+            &live(&[("worker-0", WorkerState::Healthy), (dead, WorkerState::Dead)]),
+        );
         let orphan = claimed.iter().find(|t| t.task_id == ids[1]).expect("orphan claimed");
         assert_eq!(
             orphan.config.get("worker_id").map(String::as_str),
@@ -2030,7 +2066,16 @@ mod tests {
             .find(|t| t["task_id"] == ids[1].as_str())
             .unwrap();
         assert_eq!(reassigned["config"]["worker_id"], "worker-0");
-        let stolen = coordinator.claim_tasks_for_worker("worker-2", "a", &|w| w != dead);
+        let stolen = coordinator.claim_tasks_for_worker(
+            "worker-2",
+            "a",
+            &live(&[
+                ("worker-0", WorkerState::Healthy),
+                ("worker-1", WorkerState::Healthy),
+                ("worker-2", WorkerState::Healthy),
+                (dead, WorkerState::Dead),
+            ]),
+        );
         assert!(stolen.iter().all(|t| t.task_id != ids[1]));
     }
 
@@ -2053,7 +2098,14 @@ mod tests {
         let affected = coordinator.evict_worker("worker-0");
         assert_eq!(affected, vec![ids[0].clone()]);
         // Now claimable by a replacement worker.
-        let claimed = coordinator.claim_tasks_for_worker("worker-1", "a", &|w| w != "worker-0");
+        let claimed = coordinator.claim_tasks_for_worker(
+            "worker-1",
+            "a",
+            &live(&[
+                ("worker-0", WorkerState::Dead),
+                ("worker-1", WorkerState::Healthy),
+            ]),
+        );
         assert!(claimed.iter().any(|t| t.task_id == ids[0]));
     }
 
@@ -2072,7 +2124,14 @@ mod tests {
         coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
         // Failover: reassigned to worker-1.
         coordinator.evict_worker("worker-0");
-        let _ = coordinator.claim_tasks_for_worker("worker-1", "a", &|w| w != "worker-0");
+        let _ = coordinator.claim_tasks_for_worker(
+            "worker-1",
+            "a",
+            &live(&[
+                ("worker-0", WorkerState::Dead),
+                ("worker-1", WorkerState::Healthy),
+            ]),
+        );
         coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-1");
 
         // worker-0 comes back still running the task → must be fenced.
@@ -2114,7 +2173,11 @@ mod tests {
             .unwrap();
         assert_eq!((id, data.as_slice()), (7, b"cp-seven".as_slice()));
         // Imported job schedules tasks.
-        let claimed = standby.claim_tasks_for_worker("worker-0", "a", &|_| true);
+        let claimed = standby.claim_tasks_for_worker(
+            "worker-0",
+            "a",
+            &live(&[("worker-0", WorkerState::Healthy)]),
+        );
         assert!(!claimed.is_empty());
 
         // Local state wins: importing again does not duplicate.
@@ -2172,7 +2235,14 @@ mod tests {
         // The task is Running for worker-0 and NOT claimable by a live peer.
         let job = coordinator.get_job("ja").unwrap();
         assert_eq!(job.tasks[&task_id].state, JobState::Running);
-        let claimed = coordinator.claim_tasks_for_worker("worker-1", "a", &|_| true);
+        let claimed = coordinator.claim_tasks_for_worker(
+            "worker-1",
+            "a",
+            &live(&[
+                ("worker-0", WorkerState::Healthy),
+                ("worker-1", WorkerState::Healthy),
+            ]),
+        );
         assert!(claimed.iter().all(|t| t.task_id != task_id));
     }
 
@@ -2524,49 +2594,6 @@ mod tests {
             .unwrap();
         assert!(coordinator.cancel_job(&job_id));
         assert_eq!(coordinator.cancelled_job_ids(), vec![job_id]);
-    }
-
-    #[test]
-    fn test_least_loaded_placement_avoids_saturated_worker() {
-        let coordinator = JobCoordinator::new();
-        // worker-0 has a 1-slot budget; a first job saturates it.
-        let tight: Vec<(String, String, u32)> = vec![
-            ("worker-0".into(), "127.0.0.1:5001".into(), 1),
-            ("worker-1".into(), "127.0.0.1:5002".into(), 8),
-        ];
-        let config = json!({
-            "env": { "parallelism": 1 },
-            "source": { "Fake": {} },
-            "sink": { "Console": {} }
-        });
-        let (_, first) = coordinator
-            .compile_and_install("sat", "s", &config, None, &tight)
-            .unwrap();
-        coordinator.mark_tasks_dispatched(
-            &[first[0].task_id.clone()],
-            first[0].config.get("worker_id").unwrap(),
-        );
-        for t in coordinator.get_job("sat").unwrap().tasks.values() {
-            coordinator.mark_tasks_dispatched(&[t.task_id.clone()], &t.worker_id);
-        }
-
-        // New job: both subtasks must land on worker-1 (budget 8, empty),
-        // never on the saturated worker-0.
-        let config2 = json!({
-            "env": { "parallelism": 2 },
-            "source": { "Fake": {} },
-            "sink": { "Console": {} }
-        });
-        let (_, tasks) = coordinator
-            .compile_and_install("bal", "b", &config2, None, &tight)
-            .unwrap();
-        for t in &tasks {
-            assert_eq!(
-                t.config.get("worker_id").map(String::as_str),
-                Some("worker-1"),
-                "placement must avoid the saturated worker"
-            );
-        }
     }
 
     #[test]

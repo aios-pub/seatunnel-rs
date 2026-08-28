@@ -45,6 +45,7 @@ use seatunnel_engine_core::state::TaskState;
 use seatunnel_engine_core::task_group::TaskGroup;
 use seatunnel_engine_core::{TaskStatus, now_millis};
 
+use crate::admission::{AdmissionController, AdmissionSignals};
 use crate::state_store::LocalStateStore;
 
 /// Information about a task executing on this worker.
@@ -97,6 +98,10 @@ pub struct WorkerNode {
     checkpoint_report_tx: mpsc::UnboundedSender<TaskToDriver>,
     /// Receiver side, taken once when the forwarder starts.
     checkpoint_rx: Mutex<Option<mpsc::UnboundedReceiver<TaskToDriver>>>,
+    /// Dynamic task admission: measured pressure decides whether this
+    /// worker accepts more tasks. Defaults to a manual (always-accepting)
+    /// controller; `with_admission` attaches the sampling one.
+    admission: Arc<AdmissionController>,
 }
 
 /// Internal handle for a spawned task execution.
@@ -149,7 +154,32 @@ impl WorkerNode {
             checkpoint_gates: Arc::new(Mutex::new(HashMap::new())),
             checkpoint_report_tx,
             checkpoint_rx: Mutex::new(Some(checkpoint_rx)),
+            admission: Arc::new(AdmissionController::new_manual(Default::default())),
         }
+    }
+
+    /// Attach the sampling admission controller (production path).
+    pub fn with_admission(mut self, controller: AdmissionController) -> Self {
+        self.admission = Arc::new(controller);
+        self
+    }
+
+    /// Admission snapshot for heartbeats/registration:
+    /// (load_score_permille, lag_ms, mem_permille, can_accept).
+    pub async fn admission_fields(&self) -> (u32, u32, u32, bool) {
+        let decision = self.admission.decision();
+        let signals = self.admission.signals();
+        (
+            decision.load_score_permille,
+            signals.lag_ms.unwrap_or(0).min(u32::MAX as u64) as u32,
+            signals.mem_permille.unwrap_or(0),
+            decision.can_accept,
+        )
+    }
+
+    /// Test hook: inject admission signals into the manual controller.
+    pub async fn set_admission_signals(&self, signals: AdmissionSignals) {
+        self.admission.set_signals(signals);
     }
 
     /// Attach the checkpoint storage backend (master/s3) for failover.

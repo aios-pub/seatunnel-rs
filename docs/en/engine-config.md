@@ -29,7 +29,11 @@ seatunnel:
 | `seatunnel.engine.worker-soft-timeout-ms` | 30000 | — (two-level, this project) | a worker silent longer than this is suspected: it gets no NEW task assignments (still registered, running tasks untouched) |
 | `seatunnel.engine.worker-timeout-ms` | 60000 | Hazelcast `max.no.heartbeat.seconds` (180s) analogue | hard eviction: silent longer than this → removed from the registry, its tasks become claimable (failover) |
 | `seatunnel.engine.heartbeat-interval-ms` | 2000 | — | worker → master heartbeat period; the master may adjust it per response (`next_interval_ms`) |
-| `seatunnel.engine.slot-num` | 8 | `slot-num` | task slot budget this worker advertises |
+| `seatunnel.engine.slot-num` | — (deprecated) | `slot-num` | IGNORED. Static slot budgets are gone; admission is dynamic (see the four keys below). |
+| `seatunnel.engine.overload-lag-ms` | 500 | — (this project) | a worker whose event-loop lag EMA reaches this stops accepting new tasks (hysteresis applies); 0 disables the signal |
+| `seatunnel.engine.memory-watermark-percent` | 75 | — | a worker whose RSS crosses this percent of usable memory (cgroup v2 limit when present, else physical RAM) stops accepting; 0 disables |
+| `seatunnel.engine.overload-cooldown-secs` | 10 | — | recovery hysteresis: an overloaded worker accepts again only after every signal stayed healthy this long |
+| `seatunnel.engine.dispatch-batch-limit` | 16 | — | rate fuse for the 1-3s admission blind window: max tasks handed to one worker per heartbeat (0 = unlimited). A RATE, not a slot count |
 | `seatunnel.engine.checkpoint-timeout-ms` | 30000 | `checkpoint.timeout` analogue | a coordinated checkpoint that has not collected every task's prepare by then is aborted (workers unwind) |
 | `seatunnel.engine.replication-interval-ms` | 5000 | — | master-to-master state replication period (HA standby sync) |
 | `seatunnel.engine.worker-address` | 127.0.0.1:5001 | — | this worker's advertised address |
@@ -43,9 +47,18 @@ seatunnel:
 
 Dispatch is long-polled: workers send `wait_ms` with every heartbeat and
 the master parks the request until work appears, so task handout does not
-wait out the heartbeat interval. Placement is least-loaded by
-`slot-num` budgets (saturated workers are skipped; when every budget is
-exhausted the job still runs on all workers).
+wait out the heartbeat interval.
+
+**Dynamic admission (no slot counts).** "Is this worker full?" is answered
+by measured pressure, never by a number: a worker accepts new tasks while
+its event-loop lag EMA stays under `overload-lag-ms` and its RSS under
+`memory-watermark-percent` of usable memory. An overloaded worker gets no
+new tasks and its PENDING (never-dispatched) tasks are stolen by healthy
+peers — RUNNING tasks are never stolen (eviction only, protecting
+checkpoint consistency). When every worker is over a watermark,
+submissions still succeed and tasks queue as SCHEDULED until pressure
+clears. The signals and the admission verdict are visible in the web
+console's cluster page and as Prometheus gauges.
 
 Failure-detection defaults are deliberately conservative (soft 30 s /
 hard 60 s): the Java engine ships a 180 s heartbeat tolerance because a

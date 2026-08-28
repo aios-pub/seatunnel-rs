@@ -261,7 +261,8 @@ async fn start_master(
         config.heartbeat_interval_ms,
         config.worker_soft_timeout_ms,
         writes.clone(),
-    );
+    )
+    .with_dispatch_batch_limit(config.dispatch_batch_limit);
     let client_handler = ClientHandler::new(
         coordinator.clone(),
         registry.clone(),
@@ -489,6 +490,11 @@ async fn run_worker(
         });
     let mut worker =
         WorkerNode::new_with_clean(worker_id.to_string(), addr.clone(), state_store, clean);
+    // Dynamic admission: measured pressure (lag + memory watermark), no
+    // slot counts. Samplers run inside the controller.
+    worker = worker.with_admission(seatunnel_engine_server::admission::AdmissionController::new(
+        engine_config.admission_config(),
+    ));
     // Checkpoint storage backend (master/s3 failover support).
     if engine_config.storage_type == "s3" && !engine_config.s3.bucket.is_empty() {
         match seatunnel_engine_server::checkpoint_store::build_object_store(&engine_config.s3) {
@@ -516,14 +522,17 @@ async fn run_worker(
     let worker = Arc::new(worker);
 
     tracing::info!(
-        "Worker '{}' starting at {} → master {} (state dir: {}, retained={}, auto-clean={}, slots={})",
+        "Worker '{}' starting at {} → master {} (state dir: {}, retained={}, auto-clean={}, \\
+         admission: lag<{}ms && mem<{}%, cooldown {}s)",
         worker_id,
         addr,
         master,
         state_dir,
         engine_config.keep_checkpoint_count,
         engine_config.auto_clean,
-        engine_config.slot_num
+        engine_config.overload_lag_ms,
+        engine_config.memory_watermark_percent,
+        engine_config.overload_cooldown_secs
     );
 
     // Background state cleaner (TTL sweep; cancel cleanup rides along).
@@ -560,7 +569,7 @@ async fn run_worker(
             resources: Default::default(),
             heartbeat_interval_ms: engine_config.heartbeat_interval_ms as i64,
             running_task_ids: running,
-            slots: engine_config.slot_num,
+            slots: 0, // deprecated
         });
         match client.register_worker(reg_request).await {
             Ok(resp) => {
@@ -596,7 +605,7 @@ async fn run_worker(
         let addr = addr.clone();
         let masters = master_list.clone();
         let default_interval = engine_config.heartbeat_interval_ms;
-        let slots = engine_config.slot_num;
+        let slots = 0u32; // deprecated field, kept for wire compatibility
         async move {
             let mut failures: u32 = 0;
             let mut master_idx: usize = 0;
@@ -613,6 +622,8 @@ async fn run_worker(
                 }
 
                 let tasks = worker.heartbeat_tasks().await;
+                let (load_score, lag_ms, mem_permille, can_accept) =
+                    worker.admission_fields().await;
                 let hb = HeartbeatRequest {
                     worker_id: worker_id.clone(),
                     address: addr.clone(),
@@ -625,6 +636,11 @@ async fn run_worker(
                     // interval to ~0 while the connection stays
                     // worker-initiated (NAT-friendly).
                     wait_ms: interval_ms as i64,
+                    // Dynamic admission signals (measured pressure).
+                    load_score,
+                    lag_ms,
+                    mem_permille,
+                    can_accept,
                 };
 
                 match client.heartbeat(hb).await {

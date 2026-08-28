@@ -30,16 +30,46 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::job_coordinator::{Command, JobCoordinator, JobState};
+use crate::admission::SharedSignals;
+use crate::job_coordinator::{Command, JobCoordinator, JobState, WorkerState};
 use crate::raft::WritePath;
 
-/// A registered worker's address and liveness.
+/// A registered worker's address, liveness and measured admission state.
 #[derive(Debug, Clone)]
 pub struct WorkerEntry {
     pub address: String,
     pub last_heartbeat_ms: i64,
-    /// Advertised slot budget (0 = legacy/unlimited).
-    pub slots: u32,
+    /// Measured pressure 0..1000 (per-mille) — placement orders by this.
+    pub load_score: u32,
+    /// Event-loop lag EMA (ms) as last reported.
+    pub lag_ms: u32,
+    /// RSS over usable memory (per-mille) as last reported.
+    pub mem_permille: u32,
+    /// False while the worker is over a pressure watermark: no new
+    /// tasks; its PENDING tasks may be stolen by healthy peers.
+    pub can_accept: bool,
+}
+
+impl WorkerEntry {
+    /// Freshly-registered default: unknown signals, accepting.
+    pub fn new(address: String) -> Self {
+        WorkerEntry {
+            address,
+            last_heartbeat_ms: seatunnel_engine_core::now_millis(),
+            load_score: 0,
+            lag_ms: 0,
+            mem_permille: 0,
+            can_accept: true,
+        }
+    }
+
+    fn state(&self) -> WorkerState {
+        if self.can_accept {
+            WorkerState::Healthy
+        } else {
+            WorkerState::Overloaded
+        }
+    }
 }
 
 /// Shared between MasterService (registration/heartbeats) and ClientService
@@ -60,16 +90,23 @@ pub fn registry_snapshot(registry: &WorkerRegistry) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Snapshot of registered workers as `(id, address, slots)` triples —
-/// the placement input for least-loaded scheduling.
-pub fn registry_snapshot_with_slots(
+/// Snapshot of registered workers as `(id, address, load_score,
+/// can_accept)` — the placement input for pressure-ordered scheduling.
+pub fn registry_snapshot_admission(
     registry: &WorkerRegistry,
-) -> Vec<(String, String, u32)> {
+) -> Vec<(String, String, u32, bool)> {
     registry
         .read()
         .unwrap()
         .iter()
-        .map(|(id, e)| (id.clone(), e.address.clone(), e.slots))
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                e.address.clone(),
+                e.load_score,
+                e.can_accept,
+            )
+        })
         .collect()
 }
 
@@ -119,6 +156,9 @@ pub struct MasterHandler {
     /// Soft liveness threshold: a worker silent longer than this gets no
     /// new assignments until it proves liveness again (still registered).
     worker_soft_timeout_ms: u64,
+    /// Max tasks handed to one worker per heartbeat (rate fuse for the
+    /// admission-signal blind window; 0 = unlimited). NOT a slot count.
+    dispatch_batch_limit: u32,
 }
 
 impl MasterHandler {
@@ -139,7 +179,14 @@ impl MasterHandler {
             info,
             heartbeat_interval_ms: heartbeat_interval_ms.clamp(250, 60_000),
             worker_soft_timeout_ms: worker_soft_timeout_ms.max(1_000),
+            dispatch_batch_limit: 16,
         }
+    }
+
+    /// Override the per-heartbeat dispatch batch limit.
+    pub fn with_dispatch_batch_limit(mut self, limit: u32) -> Self {
+        self.dispatch_batch_limit = limit;
+        self
     }
 
     /// Wake every parked long-poll heartbeat (new work may exist).
@@ -169,6 +216,14 @@ impl MasterHandler {
             worker_soft_timeout_ms,
             Arc::new(crate::raft::DirectWrite::new(coordinator)),
         )
+    }
+
+    /// Classify a worker for claim decisions (registry view).
+    fn classify(&self, worker_id: &str) -> WorkerState {
+        match self.workers.read().unwrap().get(worker_id) {
+            None => WorkerState::Dead,
+            Some(entry) => entry.state(),
+        }
     }
 
     pub fn coordinator(&self) -> &Arc<JobCoordinator> {
@@ -213,12 +268,17 @@ impl MasterHandler {
     /// ingested by the first pass).
     async fn recompute_heartbeat(&self, worker_id: &str) -> HeartbeatResponse {
         let pending_tasks = {
-            let live = self.workers.read().unwrap();
-            self.coordinator.claim_tasks_for_worker(
-                worker_id,
-                "",
-                &|w| live.contains_key(w),
-            )
+            let claimed = self
+                .coordinator
+                .claim_tasks_for_worker(worker_id, "", &|w| self.classify(w));
+            if self.dispatch_batch_limit > 0 {
+                claimed
+                    .into_iter()
+                    .take(self.dispatch_batch_limit as usize)
+                    .collect()
+            } else {
+                claimed
+            }
         };
         if !pending_tasks.is_empty() {
             let ids: Vec<String> =
@@ -325,9 +385,10 @@ impl MasterHandler {
             );
         }
 
-        // Refresh liveness; a worker returning from a silence longer than
-        // the soft timeout gets no NEW assignments this round (it may
-        // still be recovering — running tasks are untouched).
+        // Refresh liveness + admission signals; a worker returning from a
+        // silence longer than the soft timeout, or one reporting it is
+        // over a pressure watermark, gets no NEW assignments this round
+        // (running tasks are untouched either way).
         let mut soft_stale = false;
         {
             let mut reg = self.workers.write().unwrap();
@@ -335,38 +396,57 @@ impl MasterHandler {
                 Some(entry) => {
                     soft_stale = now - entry.last_heartbeat_ms > self.worker_soft_timeout_ms as i64;
                     entry.last_heartbeat_ms = now;
+                    entry.load_score = hb.load_score;
+                    entry.lag_ms = hb.lag_ms;
+                    entry.mem_permille = hb.mem_permille;
+                    entry.can_accept = hb.can_accept;
                 }
                 None => {
                     // Heartbeat before registration — accept it anyway so a
                     // restarted worker recovers without a full re-register.
-                    reg.insert(
-                        worker_id.clone(),
-                        WorkerEntry {
-                            address: hb.address.clone(),
-                            last_heartbeat_ms: now,
-                            slots: 0,
-                        },
-                    );
+                    let mut entry = WorkerEntry::new(hb.address.clone());
+                    entry.load_score = hb.load_score;
+                    entry.lag_ms = hb.lag_ms;
+                    entry.mem_permille = hb.mem_permille;
+                    entry.can_accept = hb.can_accept;
+                    reg.insert(worker_id.clone(), entry);
                 }
             }
         }
+        let admission_blocked = !hb.can_accept;
         if soft_stale {
             warn!(
                 "Worker {} silent > {}ms (soft timeout): skipping new assignments this round",
                 worker_id, self.worker_soft_timeout_ms
             );
         }
+        if admission_blocked {
+            warn!(
+                "Worker {} over admission watermark (score {}‰, lag {}ms, mem {}‰): \\
+                 no new assignments; pending tasks may be stolen",
+                worker_id, hb.load_score, hb.lag_ms, hb.mem_permille
+            );
+        }
 
-        // Failover-aware handout: pending tasks assigned to this worker
-        // PLUS orphaned tasks of evicted workers (reassigned here). The
-        // claim decision is read-only; the durable mutation is a
-        // MarkDispatched command (never steals confirmed-RUNNING tasks).
-        let pending_tasks = if soft_stale {
+        // Failover-aware handout: own pending tasks plus orphans of dead
+        // workers plus PENDING tasks of overloaded ones. The claim
+        // decision is read-only; the durable mutation is a MarkDispatched
+        // command (never steals confirmed-RUNNING tasks).
+        let pending_tasks = if soft_stale || admission_blocked {
             Vec::new()
         } else {
-            let live = self.workers.read().unwrap();
-            self.coordinator
-                .claim_tasks_for_worker(&worker_id, &hb.address, &|w| live.contains_key(w))
+            let claimed = self
+                .coordinator
+                .claim_tasks_for_worker(&worker_id, &hb.address, &|w| self.classify(w));
+            // Rate fuse for the admission blind window.
+            if self.dispatch_batch_limit > 0 {
+                claimed
+                    .into_iter()
+                    .take(self.dispatch_batch_limit as usize)
+                    .collect()
+            } else {
+                claimed
+            }
         };
         if !pending_tasks.is_empty() {
             info!(
@@ -457,11 +537,7 @@ impl MasterService for MasterHandler {
             .await;
         self.workers.write().unwrap().insert(
             reg.worker_id.clone(),
-            WorkerEntry {
-                address: reg.address.clone(),
-                last_heartbeat_ms: seatunnel_engine_core::now_millis(),
-                slots: reg.slots,
-            },
+            WorkerEntry::new(reg.address.clone()),
         );
 
         Ok(Response::new(WorkerRegistrationResponse {
@@ -675,14 +751,11 @@ mod tests {
     fn test_registry_roundtrip() {
         let registry = new_worker_registry();
         assert!(registry_snapshot(&registry).is_empty());
-        registry.write().unwrap().insert(
-            "w1".into(),
-            WorkerEntry {
-                address: "127.0.0.1:5001".into(),
-                last_heartbeat_ms: 0,
-                slots: 8,
-            },
-        );
+        registry.write().unwrap().insert("w1".into(), {
+            let mut e = WorkerEntry::new("127.0.0.1:5001".into());
+            e.last_heartbeat_ms = 0;
+            e
+        });
         assert_eq!(
             registry_snapshot(&registry),
             vec![("w1".to_string(), "127.0.0.1:5001".to_string())]

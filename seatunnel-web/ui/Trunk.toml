@@ -1,0 +1,12 @@
+# Trunk build config for the SeaTunnel web console frontend.
+# The build output goes to the default `dist/` directory.
+
+# Development proxy: `trunk serve` forwards API and metrics calls to the
+# locally running seatunnel-web backend.
+[[proxy]]
+rewrite = "/api/"
+backend = "http://127.0.0.1:8080/api/"
+
+[[proxy]]
+rewrite = "/metrics"
+backend = "http://127.0.0.1:8080/metrics"

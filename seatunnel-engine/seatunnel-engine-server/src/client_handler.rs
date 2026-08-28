@@ -21,7 +21,7 @@
 //! and cluster introspection for the CLI and REST clients.
 
 use crate::job_coordinator::{Command, JobCoordinator};
-use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot_with_slots};
+use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot_admission};
 use crate::raft::WritePath;
 use seatunnel_engine_comm::{
     CancelJobRequest, CheckpointEntry, ClusterInfo, Empty, JobCheckpointHistory, JobList, JobLogs,
@@ -102,7 +102,10 @@ impl ClientHandler {
                 address: e.address.clone(),
                 last_heartbeat: e.last_heartbeat_ms,
                 running_tasks: running_per_worker.get(id).copied().unwrap_or(0),
-                slots: e.slots,
+                load_score: e.load_score,
+                lag_ms: e.lag_ms,
+                mem_permille: e.mem_permille,
+                can_accept: e.can_accept,
                 ..Default::default()
             })
             .collect()
@@ -143,7 +146,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 if hint.is_empty() { "another master" } else { &hint }
             )));
         }
-        let workers = registry_snapshot_with_slots(&self.workers);
+        let workers = registry_snapshot_admission(&self.workers);
         let (job, descriptors, _tasks) = self
             .coordinator
             .plan_job(&job_id, &job_name, &config, parallelism_override, &workers)

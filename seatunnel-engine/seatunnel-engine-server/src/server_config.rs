@@ -124,10 +124,28 @@ pub struct EngineSection {
     /// per response (`next_interval_ms`).
     #[serde(default)]
     pub heartbeat_interval_ms: Option<u64>,
-    /// Task slot budget this worker advertises (Java `slot-num` analogue;
-    /// scheduling use lands with least-loaded placement).
+    /// DEPRECATED (ignored): static slot budgets are gone. Admission is
+    /// dynamic — measured event-loop lag and memory watermark.
     #[serde(default)]
     pub slot_num: Option<u32>,
+    /// Overload threshold for the event-loop-lag signal (ms). A worker
+    /// whose lag EMA reaches this stops accepting new tasks (with
+    /// hysteresis). 0 disables the signal.
+    #[serde(default)]
+    pub overload_lag_ms: Option<u64>,
+    /// Memory watermark (percent 0-100): process RSS over usable memory
+    /// (cgroup v2 limit when present, else physical RAM). 0 disables.
+    #[serde(default)]
+    pub memory_watermark_percent: Option<u64>,
+    /// Recovery hysteresis: an overloaded worker accepts again only after
+    /// every signal stayed healthy for this many seconds.
+    #[serde(default)]
+    pub overload_cooldown_secs: Option<u64>,
+    /// Master-side rate fuse for the 1-3s measurement blind window: max
+    /// tasks handed to one worker per heartbeat. 0 = unlimited. This is a
+    /// RATE, not a slot count.
+    #[serde(default)]
+    pub dispatch_batch_limit: Option<u32>,
     /// Coordinated-checkpoint timeout (ms): a triggered checkpoint that
     /// has not collected every participating task's prepare by then is
     /// aborted (Java `checkpoint.timeout` analogue).
@@ -231,8 +249,14 @@ pub struct EngineServerConfig {
     pub worker_timeout_ms: u64,
     /// Worker → master heartbeat period (ms).
     pub heartbeat_interval_ms: u64,
-    /// Task slot budget advertised by this worker.
-    pub slot_num: u32,
+    /// Lag-signal overload threshold (ms; 0 disables).
+    pub overload_lag_ms: u64,
+    /// Memory watermark (percent; 0 disables).
+    pub memory_watermark_percent: u64,
+    /// Recovery hysteresis seconds.
+    pub overload_cooldown_secs: u64,
+    /// Max tasks handed to one worker per heartbeat (0 = unlimited).
+    pub dispatch_batch_limit: u32,
     /// Coordinated-checkpoint abort timeout (ms).
     pub checkpoint_timeout_ms: u64,
     /// Master state replication period (ms).
@@ -279,7 +303,10 @@ impl Default for EngineServerConfig {
             worker_soft_timeout_ms: 30_000,
             worker_timeout_ms: 60_000,
             heartbeat_interval_ms: 2_000,
-            slot_num: 8,
+            overload_lag_ms: 500,
+            memory_watermark_percent: 75,
+            overload_cooldown_secs: 10,
+            dispatch_batch_limit: 16,
             checkpoint_timeout_ms: 30_000,
             replication_interval_ms: 5_000,
             worker_address: "127.0.0.1:5001".to_string(),
@@ -318,6 +345,15 @@ impl EngineServerConfig {
         Ok(config)
     }
 
+    /// The worker's admission thresholds.
+    pub fn admission_config(&self) -> crate::admission::AdmissionConfig {
+        crate::admission::AdmissionConfig {
+            lag_threshold_ms: self.overload_lag_ms,
+            memory_watermark_percent: self.memory_watermark_percent,
+            cooldown_secs: self.overload_cooldown_secs,
+        }
+    }
+
     fn apply_file(&mut self, file: &ServerConfigFile) {
         let engine = &file.seatunnel.engine;
         if let Some(minutes) = engine.history_job_expire_minutes {
@@ -333,8 +369,23 @@ impl EngineServerConfig {
         if let Some(ms) = engine.heartbeat_interval_ms {
             self.heartbeat_interval_ms = ms.clamp(250, 60_000);
         }
-        if let Some(slots) = engine.slot_num {
-            self.slot_num = slots.max(1);
+        if engine.slot_num.is_some() {
+            tracing::warn!(
+                "slot-num is deprecated and ignored: task admission is \
+                 dynamic (event-loop lag + memory watermark)"
+            );
+        }
+        if let Some(ms) = engine.overload_lag_ms {
+            self.overload_lag_ms = ms;
+        }
+        if let Some(percent) = engine.memory_watermark_percent {
+            self.memory_watermark_percent = percent.min(100);
+        }
+        if let Some(secs) = engine.overload_cooldown_secs {
+            self.overload_cooldown_secs = secs;
+        }
+        if let Some(limit) = engine.dispatch_batch_limit {
+            self.dispatch_batch_limit = limit;
         }
         if let Some(ms) = engine.checkpoint_timeout_ms {
             self.checkpoint_timeout_ms = ms.max(1_000);
@@ -434,7 +485,10 @@ mod tests {
         assert_eq!(config.worker_soft_timeout_ms, 30_000);
         assert_eq!(config.worker_timeout_ms, 60_000);
         assert_eq!(config.heartbeat_interval_ms, 2_000);
-        assert_eq!(config.slot_num, 8);
+        assert_eq!(config.overload_lag_ms, 500);
+        assert_eq!(config.memory_watermark_percent, 75);
+        assert_eq!(config.overload_cooldown_secs, 10);
+        assert_eq!(config.dispatch_batch_limit, 16);
     }
 
     #[test]
@@ -445,7 +499,10 @@ seatunnel:
     worker-soft-timeout-ms: 5000
     worker-timeout-ms: 2000
     heartbeat-interval-ms: 500
-    slot-num: 16
+    overload-lag-ms: 900
+    memory-watermark-percent: 60
+    overload-cooldown-secs: 30
+    dispatch-batch-limit: 4
 ";
         let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
         let mut config = EngineServerConfig::default();
@@ -454,7 +511,10 @@ seatunnel:
         // Hard timeout lifted to the soft threshold (2000 < 5000).
         assert_eq!(config.worker_timeout_ms, 5_000);
         assert_eq!(config.heartbeat_interval_ms, 500);
-        assert_eq!(config.slot_num, 16);
+        assert_eq!(config.overload_lag_ms, 900);
+        assert_eq!(config.memory_watermark_percent, 60);
+        assert_eq!(config.overload_cooldown_secs, 30);
+        assert_eq!(config.dispatch_batch_limit, 4);
     }
 
     #[test]

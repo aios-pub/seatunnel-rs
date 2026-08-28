@@ -40,6 +40,7 @@ seatunnel-formats = { path = "../../seatunnel-formats", optional = true }
 
 seatunnel-connector-common = { path = "../../seatunnel-connectors/seatunnel-connector-common" }
 openraft = { version = "0.9", features = ["serde", "storage-v2", "generic-snapshot-data"] }
+sysinfo = "0.39.6"
 
 [features]
 default = ["connectors"]

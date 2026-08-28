@@ -76,6 +76,10 @@ async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
 }
 
 async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
+    spawn_worker_named(master_addr, "it-worker-1").await
+}
+
+async fn spawn_worker_named(master_addr: &str, worker_id: &str) -> anyhow::Result<Arc<WorkerNode>> {
     // Bind an ephemeral port for the worker's advertised address.
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let worker_addr = probe.local_addr()?.to_string();
@@ -84,7 +88,8 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
     let state_dir =
         std::env::temp_dir().join(format!("st-it-worker-{}", uuid::Uuid::new_v4().simple()));
     let state_store = Arc::new(LocalStateStore::new(state_dir));
-    let worker = Arc::new(WorkerNode::new("it-worker-1", &worker_addr, state_store));
+    let worker = Arc::new(WorkerNode::new(worker_id, &worker_addr, state_store));
+    let worker_id = worker_id.to_string();
 
     let mut client =
         seatunnel_engine_comm::generated::master_service_client::MasterServiceClient::connect(
@@ -96,32 +101,39 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
         .register_worker(tonic::Request::new(
             seatunnel_engine_comm::WorkerRegistration {
                 running_task_ids: Vec::new(),
-                worker_id: "it-worker-1".into(),
+                worker_id: worker_id.clone(),
                 address: worker_addr,
                 version: "test".into(),
                 resources: Default::default(),
                 heartbeat_interval_ms: 150,
-                slots: 8,
+                slots: 0,
             },
         ))
         .await?;
 
     // Heartbeat loop (fast interval for tests).
     let hb_worker = Arc::clone(&worker);
+    let hb_worker_id = worker_id.clone();
     let mut hb_client = client;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(150));
         loop {
             tick.tick().await;
             let tasks = hb_worker.heartbeat_tasks().await;
+            let (load_score, lag_ms, mem_permille, can_accept) =
+                hb_worker.admission_fields().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
-                    worker_id: "it-worker-1".into(),
+                    worker_id: hb_worker_id.clone(),
                     address: String::new(),
                     timestamp: seatunnel_engine_core::now_millis(),
                     tasks,
                     term: hb_worker.term(),
                     wait_ms: 0,
+                    load_score,
+                    lag_ms,
+                    mem_permille,
+                    can_accept,
                 })
                 .await
             else {
@@ -316,6 +328,79 @@ async fn coordinated_checkpoints_complete_through_cluster() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    let _ = client.cancel_job(&job_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
+    let (master_addr, _coordinator) = spawn_master().await.unwrap();
+    let worker_a = spawn_worker_named(&master_addr, "it-worker-a").await.unwrap();
+    let worker_b = spawn_worker_named(&master_addr, "it-worker-b").await.unwrap();
+
+    // Both workers over their lag watermark BEFORE submission: placement
+    // picks a worker but the claim gate keeps the task PENDING — nobody
+    // dispatches while everyone is overloaded (natural queue, no blocks).
+    let overloaded = seatunnel_engine_server::admission::AdmissionSignals {
+        lag_ms: Some(900),
+        mem_permille: Some(100),
+    };
+    worker_a.set_admission_signals(overloaded).await;
+    worker_b.set_admission_signals(overloaded).await;
+
+    let client = EngineClient::new(&master_addr);
+    let config = serde_json::json!({
+        "env": { "job.name": "it-steal", "parallelism": 1 },
+        // Kafka against a closed port streams forever (no EOF, no records).
+        "source": { "Kafka": { "bootstrap.servers": "127.0.0.1:19092", "topic": "never" } },
+        "sink": { "Console": {} }
+    });
+    let mut grpc =
+        seatunnel_engine_comm::generated::client_service_client::ClientServiceClient::connect(
+            format!("http://{}", master_addr),
+        )
+        .await
+        .unwrap();
+    let resp = grpc
+        .submit_job(tonic::Request::new(submit_request("it-steal", config)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success, "submit failed: {}", resp.message);
+    let job_id = resp.job_id;
+
+    // Nobody may run it while both are over the watermark.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let s = client.get_job_status(&job_id).await.unwrap();
+    assert_ne!(s.state, 3, "task must stay queued while all workers are overloaded");
+
+    // Worker B recovers (heartbeats tick the hysteresis every 150ms, so
+    // the cooldown clears after ~10 beats) and steals A's PENDING task.
+    worker_b
+        .set_admission_signals(seatunnel_engine_server::admission::AdmissionSignals {
+            lag_ms: Some(10),
+            mem_permille: Some(100),
+        })
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stolen task never started running"
+        );
+        let s = client.get_job_status(&job_id).await.unwrap();
+        if s.state == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    // And it runs on B (the only accepting worker).
+    let s = client.get_job_status(&job_id).await.unwrap();
+    assert!(s
+        .tasks
+        .iter()
+        .all(|t| t.worker_id == "it-worker-b" || t.worker_id.is_empty()));
 
     let _ = client.cancel_job(&job_id).await;
 }

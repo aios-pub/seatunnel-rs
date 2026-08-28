@@ -8,6 +8,7 @@
 //! - Master: worker registry, job scheduling, heartbeat-driven task dispatch
 //! - Worker: connector execution, checkpointing, status reporting
 
+pub mod admission;
 pub mod checkpoint_store;
 pub mod client_handler;
 pub mod raft;

@@ -177,3 +177,23 @@ cargo install trunk
 - In the default cluster checkpoint mode the payload bytes stay on the
   workers, so the history panel shows the interval and completed counter;
   per-task entries list when the master-backed checkpoint store is used.
+
+## Cluster page — dynamic admission visibility
+
+The workers table shows each worker's measured admission state (no slot
+counts exist to show):
+
+- **Status** — `accepting`, or `OVERLOADED` while the worker is past a
+  pressure watermark (it then receives no new tasks and its pending
+  tasks may be stolen by healthy peers)
+- **Load** — measured pressure 0-100% (the max of the signal ratios);
+  a color-graded bar (blue → amber → red)
+- **Lag (ms)** — event-loop lag EMA, the runtime saturation signal
+- **Memory** — process RSS as a percentage of usable memory
+- **Running tasks** — tasks currently executing on the worker
+
+The header card "Overloaded workers" counts non-accepting workers, and
+the leader line shows the fencing term and node role. The same signals
+are exported as Prometheus gauges (`seatunnel_worker_load_score`,
+`seatunnel_worker_overloaded`, `seatunnel_worker_lag_ms`,
+`seatunnel_worker_mem_ratio`).
