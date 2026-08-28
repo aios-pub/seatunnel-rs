@@ -26,7 +26,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 object_store = { workspace = true }
 seatunnel-api = { path = "../../seatunnel-api" }
-async-trait = { workspace = true }
+async-trait.workspace = true
 
 pin-project = "1"
 uuid = { workspace = true }
@@ -39,6 +39,7 @@ seatunnel-connector-kafka = { path = "../../seatunnel-connectors/seatunnel-conne
 seatunnel-formats = { path = "../../seatunnel-formats", optional = true }
 
 seatunnel-connector-common = { path = "../../seatunnel-connectors/seatunnel-connector-common" }
+openraft = { version = "0.9", features = ["serde", "storage-v2", "generic-snapshot-data"] }
 
 [features]
 default = ["connectors"]

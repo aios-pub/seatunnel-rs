@@ -10,6 +10,7 @@
 
 pub mod checkpoint_store;
 pub mod client_handler;
+pub mod raft;
 pub mod job_coordinator;
 pub mod master;
 pub mod server_config;

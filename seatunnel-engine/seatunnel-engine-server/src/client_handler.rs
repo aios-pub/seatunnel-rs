@@ -20,8 +20,9 @@
 //! Implements `ClientService`: job submission, cancellation, status queries
 //! and cluster introspection for the CLI and REST clients.
 
-use crate::job_coordinator::JobCoordinator;
+use crate::job_coordinator::{Command, JobCoordinator};
 use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot};
+use crate::raft::WritePath;
 use seatunnel_engine_comm::{
     CancelJobRequest, CheckpointEntry, ClusterInfo, Empty, JobCheckpointHistory, JobList, JobLogs,
     JobStatus, JobStatusRequest, JobSummary, SubmitJobRequest, SubmitJobResponse,
@@ -37,6 +38,7 @@ pub struct ClientHandler {
     coordinator: Arc<JobCoordinator>,
     workers: WorkerRegistry,
     info: MasterInfo,
+    writes: Arc<dyn WritePath>,
 }
 
 impl ClientHandler {
@@ -44,12 +46,28 @@ impl ClientHandler {
         coordinator: Arc<JobCoordinator>,
         workers: WorkerRegistry,
         info: MasterInfo,
+        writes: Arc<dyn WritePath>,
     ) -> Self {
         ClientHandler {
             coordinator,
             workers,
             info,
+            writes,
         }
+    }
+
+    /// Convenience constructor for tests / embedded setups.
+    pub fn new_direct(
+        coordinator: Arc<JobCoordinator>,
+        workers: WorkerRegistry,
+        info: MasterInfo,
+    ) -> Self {
+        Self::new(
+            coordinator.clone(),
+            workers,
+            info,
+            Arc::new(crate::raft::DirectWrite::new(coordinator)),
+        )
     }
 
     pub fn coordinator(&self) -> &Arc<JobCoordinator> {
@@ -111,26 +129,45 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             tracing::error!("Invalid job config: {}", e);
             Status::invalid_argument(format!("invalid job config: {}", e))
         })?;
+        // Leadership gate: only the leader accepts submissions.
+        if !self.writes.is_leader() {
+            let hint = self.writes.leader_hint();
+            return Err(Status::failed_precondition(format!(
+                "not the leader; retry at {}",
+                if hint.is_empty() { "another master" } else { &hint }
+            )));
+        }
         let workers = registry_snapshot(&self.workers);
-        let (scheduled_id, tasks) = self
+        let (job, descriptors, _tasks) = self
             .coordinator
-            .compile_and_schedule(&job_id, &job_name, &config, parallelism_override, &workers)
+            .plan_job(&job_id, &job_name, &config, parallelism_override, &workers)
             .map_err(|e| {
                 tracing::error!("Job {} rejected: {}", job_id, e);
                 Status::failed_precondition(e.to_string())
             })?;
+        let task_count = descriptors.len();
+        let scheduled_id = job.job_id.clone();
+        let cmd = Command::SubmitJob {
+            job,
+            descriptors,
+        };
+        self.writes
+            .propose(cmd)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
+        let tasks = task_count;
 
         tracing::info!(
             "Job {} scheduled: {} chained task(s) across {} worker(s)",
             scheduled_id,
-            tasks.len(),
+            tasks,
             workers.len()
         );
 
         Ok(Response::new(SubmitJobResponse {
             success: true,
             job_id: scheduled_id,
-            message: format!("job '{}' scheduled with {} task(s)", job_name, tasks.len()),
+            message: format!("job '{}' scheduled with {} task(s)", job_name, tasks),
         }))
     }
 
@@ -142,12 +179,25 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         let job_id = req.job_id;
         tracing::info!("Cancelling job {}", job_id);
 
-        if !self.coordinator.cancel_job(&job_id) {
+        let cancelled = self
+            .coordinator
+            .get_job(&job_id)
+            .map(|j| !j.state.is_terminal())
+            .unwrap_or(false);
+        if !cancelled {
             return Err(Status::not_found(format!(
                 "job {} not found or already terminal",
                 job_id
             )));
         }
+        let cmd = Command::CancelJob {
+            job_id: job_id.clone(),
+            at_ms: seatunnel_engine_core::now_millis(),
+        };
+        self.writes
+            .propose(cmd)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
         Ok(Response::new(Empty {}))
     }
 

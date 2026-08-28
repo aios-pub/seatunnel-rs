@@ -30,7 +30,8 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::job_coordinator::{JobCoordinator, JobState};
+use crate::job_coordinator::{Command, JobCoordinator, JobState};
+use crate::raft::WritePath;
 
 /// A registered worker's address and liveness.
 #[derive(Debug, Clone)]
@@ -93,8 +94,8 @@ pub struct MasterHandler {
     state: Mutex<MasterState>,
     coordinator: Arc<JobCoordinator>,
     workers: WorkerRegistry,
-    /// worker_id → task ids to preempt on its next heartbeat (fencing).
-    pending_preemptions: Mutex<HashMap<String, Vec<String>>>,
+    /// Durable mutations (Direct: in-place; Raft: consensus).
+    writes: Arc<dyn WritePath>,
     info: MasterInfo,
     /// Configured worker heartbeat period, echoed via `next_interval_ms`.
     heartbeat_interval_ms: u64,
@@ -110,16 +111,36 @@ impl MasterHandler {
         info: MasterInfo,
         heartbeat_interval_ms: u64,
         worker_soft_timeout_ms: u64,
+        writes: Arc<dyn WritePath>,
     ) -> Self {
         MasterHandler {
             state: Mutex::new(MasterState::default()),
             coordinator,
             workers,
-            pending_preemptions: Mutex::new(HashMap::new()),
+            writes,
             info,
             heartbeat_interval_ms: heartbeat_interval_ms.clamp(250, 60_000),
             worker_soft_timeout_ms: worker_soft_timeout_ms.max(1_000),
         }
+    }
+
+    /// Convenience constructor for tests / embedded setups: direct
+    /// in-process write path.
+    pub fn new_direct(
+        coordinator: Arc<JobCoordinator>,
+        workers: WorkerRegistry,
+        info: MasterInfo,
+        heartbeat_interval_ms: u64,
+        worker_soft_timeout_ms: u64,
+    ) -> Self {
+        Self::new(
+            coordinator.clone(),
+            workers,
+            info,
+            heartbeat_interval_ms,
+            worker_soft_timeout_ms,
+            Arc::new(crate::raft::DirectWrite::new(coordinator)),
+        )
     }
 
     pub fn coordinator(&self) -> &Arc<JobCoordinator> {
@@ -132,6 +153,30 @@ impl MasterHandler {
 
     pub fn info(&self) -> &MasterInfo {
         &self.info
+    }
+}
+
+
+impl MasterHandler {
+    /// Classify a (re)registering worker's running tasks: adopt the
+    /// still-assigned ones (through the write path), fence the rest.
+    async fn reattach_tasks(&self, worker_id: &str, running: Vec<String>) {
+        if running.is_empty() {
+            return;
+        }
+        let (adopt, preempted) = self.coordinator.classify_running_tasks(worker_id, &running);
+        if !adopt.is_empty() {
+            let cmd = Command::AdoptTasks {
+                worker_id: worker_id.to_string(),
+                task_ids: adopt,
+            };
+            if let Err(e) = self.writes.propose(cmd).await {
+                warn!("AdoptTasks proposal failed: {}", e);
+            }
+        }
+        for task_id in preempted {
+            self.coordinator.queue_preemption(worker_id, &task_id);
+        }
     }
 }
 
@@ -151,24 +196,8 @@ impl MasterService for MasterHandler {
         );
         // Adopt-first: tasks still assigned to this worker are re-marked
         // Running for it (re-attach); only reassigned tasks get fenced.
-        if !reg.running_task_ids.is_empty() {
-            let preempted = self
-                .coordinator
-                .register_running_tasks(&reg.worker_id, &reg.running_task_ids);
-            if !preempted.is_empty() {
-                warn!(
-                    "Worker {} returned with {} reassigned task(s); fencing",
-                    reg.worker_id,
-                    preempted.len()
-                );
-                self.pending_preemptions
-                    .lock()
-                    .await
-                    .entry(reg.worker_id.clone())
-                    .or_default()
-                    .extend(preempted);
-            }
-        }
+        self.reattach_tasks(&reg.worker_id, reg.running_task_ids.clone())
+            .await;
         self.workers.write().unwrap().insert(
             reg.worker_id.clone(),
             WorkerEntry {
@@ -196,9 +225,7 @@ impl MasterService for MasterHandler {
         let my_term = self.coordinator.term();
 
         // Fencing: a worker operating under a HIGHER term means a
-        // successor master exists — ratchet our term so the successor's
-        // state wins on merge, and stop dispatching until we are sure we
-        // are current (empty instruction set this round).
+        // successor master exists — ratchet our term and stand down.
         if hb.term > my_term {
             warn!(
                 "Worker {} reports term {} > ours {} — possible stale master; standing down \
@@ -218,6 +245,21 @@ impl MasterService for MasterHandler {
                 checkpoint_resolutions: Vec::new(),
             }));
         }
+        // Leadership gate (consensus mode): a follower master serves no
+        // instructions; point the worker at the leader.
+        if !self.writes.is_leader() {
+            return Ok(Response::new(HeartbeatResponse {
+                worker_id,
+                next_interval_ms: self.heartbeat_interval_ms as i64,
+                pending_tasks: Vec::new(),
+                cancel_jobs: Vec::new(),
+                preempted_task_ids: Vec::new(),
+                term: self.coordinator.term(),
+                leader_hint: self.writes.leader_hint(),
+                checkpoint_triggers: Vec::new(),
+                checkpoint_resolutions: Vec::new(),
+            }));
+        }
 
         // A worker evicted by TTL that comes back (SIGSTOP/network
         // glitch) may still run tasks that were reassigned in its
@@ -229,22 +271,12 @@ impl MasterService for MasterHandler {
             };
             if !known && !hb.tasks.is_empty() {
                 let running: Vec<String> = hb.tasks.iter().map(|t| t.task_id.clone()).collect();
-                let preempted = self
-                    .coordinator
-                    .register_running_tasks(&worker_id, &running);
-                if !preempted.is_empty() {
-                    warn!(
-                        "Worker {} returned with {} reassigned task(s); fencing via heartbeat",
-                        worker_id,
-                        preempted.len()
-                    );
-                    self.pending_preemptions
-                        .lock()
-                        .await
-                        .entry(worker_id.clone())
-                        .or_default()
-                        .extend(preempted);
-                }
+                warn!(
+                    "Worker {} heartbeating before registration; re-attaching {} task(s)",
+                    worker_id,
+                    running.len()
+                );
+                self.reattach_tasks(&worker_id, running).await;
             }
         }
 
@@ -295,7 +327,9 @@ impl MasterService for MasterHandler {
         }
 
         // Failover-aware handout: pending tasks assigned to this worker
-        // PLUS orphaned tasks of evicted workers (reassigned here).
+        // PLUS orphaned tasks of evicted workers (reassigned here). The
+        // claim decision is read-only; the durable mutation is a
+        // MarkDispatched command (never steals confirmed-RUNNING tasks).
         let pending_tasks = if soft_stale {
             Vec::new()
         } else {
@@ -310,20 +344,34 @@ impl MasterService for MasterHandler {
                 worker_id
             );
             let ids: Vec<String> = pending_tasks.iter().map(|t| t.task_id.clone()).collect();
-            self.coordinator.mark_tasks_dispatched(&ids, &worker_id);
-            let mut state = self.state.lock().await;
-            for id in &ids {
-                state.task_assignments.insert(id.clone(), worker_id.clone());
+            let cmd = Command::MarkDispatched {
+                task_ids: ids,
+                worker_id: worker_id.clone(),
+            };
+            if let Err(e) = self.writes.propose(cmd).await {
+                warn!("MarkDispatched proposal failed: {}", e);
             }
         }
 
-        // Coordinated checkpoints: fire due triggers on this worker's
-        // tasks (the master is the checkpoint driver) and deliver
-        // resolutions queued for it.
+        // Coordinated checkpoints: propose due triggers (the master is the
+        // checkpoint driver), then deliver on this worker's heartbeat.
+        if !soft_stale {
+            let now = seatunnel_engine_core::now_millis();
+            for (job_id, stage_id) in self.coordinator.due_checkpoint_stages() {
+                let cmd = Command::CheckpointTriggered {
+                    job_id,
+                    stage_id,
+                    at_ms: now,
+                };
+                if let Err(e) = self.writes.propose(cmd).await {
+                    warn!("CheckpointTriggered proposal failed: {}", e);
+                }
+            }
+        }
         let checkpoint_triggers = if soft_stale {
             Vec::new()
         } else {
-            self.coordinator.due_checkpoint_triggers(&worker_id)
+            self.coordinator.deliver_checkpoint_triggers(&worker_id)
         };
         let checkpoint_resolutions = self.coordinator.drain_checkpoint_resolutions(&worker_id);
 
@@ -331,12 +379,7 @@ impl MasterService for MasterHandler {
         let cancel_jobs = self.coordinator.cancelled_job_ids();
 
         // Preemption fence: tasks reassigned away from this worker.
-        let preempted_task_ids = self
-            .pending_preemptions
-            .lock()
-            .await
-            .remove(&worker_id)
-            .unwrap_or_default();
+        let preempted_task_ids = self.coordinator.drain_preemptions(&worker_id);
 
         Ok(Response::new(HeartbeatResponse {
             worker_id,
@@ -375,17 +418,21 @@ impl MasterService for MasterHandler {
             JobState::from(state_str).to_wire(),
             report.processed_records
         );
-        self.coordinator.report_task_status(
-            &report.job_id,
-            &report.task_id,
-            state_str,
-            report.processed_records.max(0) as u64,
-            if report.error_message.is_empty() {
+        let cmd = Command::TaskStatus {
+            job_id: report.job_id.clone(),
+            task_id: report.task_id.clone(),
+            worker_id: report.worker_id.clone(),
+            state: state_str.to_string(),
+            records: report.processed_records.max(0) as u64,
+            error: if report.error_message.is_empty() {
                 None
             } else {
                 Some(report.error_message)
             },
-        );
+        };
+        if let Err(e) = self.writes.propose(cmd).await {
+            warn!("TaskStatus proposal failed: {}", e);
+        }
 
         Ok(Response::new(Empty {}))
     }
@@ -424,12 +471,23 @@ impl MasterService for MasterHandler {
         if !is_final
             && report.phase == seatunnel_engine_comm::CheckpointPhase::CheckpointPrepare as i32
         {
-            self.coordinator.handle_checkpoint_prepare(
+            if let Some((stage_id, completed, participants)) = self.coordinator.note_checkpoint_prepare(
                 &report.job_id,
                 &report.task_id,
                 report.checkpoint_id.max(0) as u64,
                 report.success,
-            );
+            ) {
+                let cmd = Command::CheckpointResolved {
+                    job_id: report.job_id.clone(),
+                    stage_id,
+                    checkpoint_id: report.checkpoint_id.max(0) as u64,
+                    completed,
+                    participants,
+                };
+                if let Err(e) = self.writes.propose(cmd).await {
+                    warn!("CheckpointResolved proposal failed: {}", e);
+                }
+            }
         } else if !is_final {
             // Legacy interval-path report (pre-coordination senders):
             // count it so dashboards keep working.
@@ -474,7 +532,13 @@ impl MasterService for MasterHandler {
         // Graceful shutdown must actually RELEASE the worker's tasks for
         // failover — without this a clean restart waits for the hard
         // eviction timeout before another worker can take over.
-        let affected = self.coordinator.evict_worker(&req.worker_id);
+        let cmd = Command::EvictWorker {
+            worker_id: req.worker_id.clone(),
+        };
+        if let Err(e) = self.writes.propose(cmd).await {
+            warn!("EvictWorker proposal failed: {}", e);
+        }
+        let affected: Vec<String> = Vec::new();
         if !affected.is_empty() {
             info!(
                 "Worker {} unregistered: {} task(s) released for takeover",
@@ -483,35 +547,6 @@ impl MasterService for MasterHandler {
             );
         }
         Ok(Response::new(Empty {}))
-    }
-}
-
-/// Master-to-master state replication endpoint (HA standby sync).
-pub struct ReplicationHandler {
-    coordinator: Arc<JobCoordinator>,
-}
-
-impl ReplicationHandler {
-    pub fn new(coordinator: Arc<JobCoordinator>) -> Self {
-        ReplicationHandler { coordinator }
-    }
-}
-
-#[tonic::async_trait]
-impl seatunnel_engine_comm::ReplicationService for ReplicationHandler {
-    async fn pull_state(
-        &self,
-        request: Request<seatunnel_engine_comm::PullStateRequest>,
-    ) -> Result<Response<seatunnel_engine_comm::StateSnapshot>, Status> {
-        let req = request.into_inner();
-        tracing::debug!("Replication: state pulled by {}", req.requester_id);
-        let state = self.coordinator.export_state().await;
-        let snapshot = seatunnel_engine_comm::StateSnapshot {
-            state_json: serde_json::to_string(&state)
-                .map_err(|e| Status::internal(format!("serialize state: {}", e)))?,
-            exported_at_ms: seatunnel_engine_core::now_millis(),
-        };
-        Ok(Response::new(snapshot))
     }
 }
 

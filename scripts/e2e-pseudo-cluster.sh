@@ -2,7 +2,8 @@
 # Pseudo-cluster production verification (fault matrix A–K).
 #
 # Topology (all on localhost, S3 checkpoints via MinIO):
-#   master-1 (5800, primary) + master-2 (5810, standby)
+#   master-1 (5800) + master-2 (5810) + master-3 (5820) — 3 raft voters
+#   (odd voter counts are required; 2 voters can never reach majority)
 #   worker-1 (5001) worker-2 (5002) worker-3 (5003)
 #   MinIO (9000) bucket seatunnel-checkpoints
 #
@@ -38,7 +39,7 @@ start_master() { # idx port
 }
 start_worker() { # idx addr
   SEATUNNEL_STATE_DIR="$STATE_BASE/w$1" RUST_LOG=info \
-    $BIN_DIR/seatunnel-engine-server --role worker --master 127.0.0.1:5800,127.0.0.1:5810 \
+    $BIN_DIR/seatunnel-engine-server --role worker --master 127.0.0.1:5800,127.0.0.1:5810,127.0.0.1:5820 \
     --worker-id pc-worker-$1 --addr $2 \
     --config "$RUN_DIR/engine.yaml" >"$RUN_DIR/worker-$1.log" 2>&1 &
   PIDS+=($!); sleep 1
@@ -87,7 +88,7 @@ hazelcast:
     join:
       tcp-ip:
         enabled: true
-        member-list: ["127.0.0.1:5800", "127.0.0.1:5810"]
+        member-list: ["127.0.0.1:5800", "127.0.0.1:5810", "127.0.0.1:5820"]
     port:
       port: 5800
 EOF
@@ -124,18 +125,19 @@ mysql_exec "CREATE DATABASE IF NOT EXISTS seatunnel; DROP TABLE IF EXISTS seatun
 seed
 start_master 1 5800
 start_master 2 5810
+start_master 3 5820
 start_worker 1 127.0.0.1:5001
 start_worker 2 127.0.0.1:5002
 start_worker 3 127.0.0.1:5003
 sleep 5
 
 # --- A: normal topology ----------------------------------------------------
-log A "3 workers registered on master-1; master-2 standby-synced"
+log A "3 workers registered on master-1; master-2 fellow-voter-synced"
 REG=$(grep -c "Worker pc-worker" "$RUN_DIR/master-1.log" || true)
 [[ "$REG" -ge 3 ]] || fail A "registration count=$REG"
-grep -q "standby — syncing" "$RUN_DIR/master-2.log" || fail A "master-2 not syncing"
+grep -q "fellow-voter — syncing" "$RUN_DIR/master-2.log" || fail A "master-2 not syncing"
 
-JOB=$($BIN_DIR/seatunnel job submit -c "$RUN_DIR/job.yaml" -a 127.0.0.1:5800,127.0.0.1:5810 | awk '{print $3}')
+JOB=$($BIN_DIR/seatunnel job submit -c "$RUN_DIR/job.yaml" -a 127.0.0.1:5800,127.0.0.1:5810,127.0.0.1:5820 | awk '{print $3}')
 log A "job=$JOB"
 for _ in $(seq 1 20); do
   mysql_exec "SELECT COUNT(*) FROM seatunnel.users_pc_sink" 2>/dev/null | tail -1 | grep -q 2 && break; sleep 1
@@ -166,7 +168,7 @@ grep -q "Failover: task" "$RUN_DIR/master-1.log" || fail B "no failover reassign
 grep -qE "restored checkpoint cp-[0-9]+ from s3" "$RUN_DIR"/worker-*.log || fail B "no S3 resume log"
 log B "data continuous ($B_COUNT rows), S3 resume verified"
 
-# --- C: master kill -9 → standby takeover ----------------------------------
+# --- C: master kill -9 → fellow-voter takeover ----------------------------------
 log C "kill master-1 (kill -9)"
 mysql_exec "USE seatunnel; INSERT INTO users_pc(name, score) VALUES ('c-during', 20);"
 kill -9 "${PIDS[0]}" 2>/dev/null || true
@@ -231,9 +233,9 @@ sleep 8
 F_COUNT=$(mysql_exec "SELECT COUNT(*) FROM seatunnel.users_pc_sink" | tail -1)
 log F "rows=$F_COUNT (expected ~12, duplicates tolerated)"
 
-# --- H: cancel on standby ---------------------------------------------------
+# --- H: cancel on fellow-voter ---------------------------------------------------
 log H "cancel job via master-2"
-$BIN_DIR/seatunnel job cancel --job-id "$JOB" -a 127.0.0.1:5810 >/dev/null 2>&1 || fail H "cancel on standby failed"
+$BIN_DIR/seatunnel job cancel --job-id "$JOB" -a 127.0.0.1:5810 >/dev/null 2>&1 || fail H "cancel on fellow-voter failed"
 sleep 5
 log H "cancelled"
 
@@ -250,9 +252,9 @@ if [[ -f "$RUN_DIR/failures.txt" ]]; then
   echo "MATRIX RESULT: FAILURES DETECTED"; cat "$RUN_DIR/failures.txt"; exit 1
 fi
 echo "MATRIX RESULT: ALL CASES PASSED"
-echo "  topology:  master-1(5800) + master-2(5810) + worker×3 + MinIO(s3)"
+echo "  topology:  masters(5800,5810,5820 raft voters) + worker×3 + MinIO(s3)"
 echo "  cases:     A topology/assignment/s3-bounded, B worker kill -9 + s3 resume,"
 echo "             C master kill -9 takeover, D master restart no split-brain,"
-echo "             E worker restart, F SIGSTOP/CONT preemption fence, H cancel on standby,"
+echo "             E worker restart, F SIGSTOP/CONT preemption fence, H cancel on fellow-voter,"
 echo "             K s3+local cleanup"
 echo "  logs: $RUN_DIR"

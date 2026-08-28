@@ -52,15 +52,15 @@ the split and replaces the mitigation with mechanism.
 
 | Dimension | Java Zeta (source facts) | This engine | Status |
 |---|---|---|---|
-| Leader election | Oldest-member, no quorum, 100 ms polling | openraft majority-quorum election (~1 s); dual masters are impossible by construction, not by timeout | 📋 Stage 3 |
-| Split-brain protection | None anywhere in the engine | Raft quorum for all durable state; minority side cannot commit | 📋 Stage 3 |
+| Leader election | Oldest-member, no quorum, 100 ms polling | openraft majority-quorum election (~1 s); dual masters are impossible by construction, not by timeout | ✅ Stage 3 |
+| Split-brain protection | None anywhere in the engine | Raft quorum for all durable state; minority side cannot commit | ✅ Stage 3 |
 | Stale-master fencing | None (only a node-local scheduler epoch) | Monotonic `term` carried on every master↔worker message; workers reject dispatch/cancel/preempt from a lower term (a deposed master cannot disturb tasks) | ✅ Stage 1 (wire protocol + worker-side rejection; term source becomes the Raft leader term in Stage 3) |
-| Failover speed vs. false positives | 180 s tolerance chosen to avoid false splits (slow by design) | Quorum makes fast failover safe (~1 s election); worker liveness uses separate soft/hard timeouts (soft: no new assignments; hard: eviction) | ✅ Stage 1 (timeouts); 📋 Stage 3 (election) |
-| State healing after a partition | Hazelcast IMap last-write-wins merge, no engine callback — divergent state can silently win or lose | Single replicated log (Raft); no divergent branches exist to merge | 📋 Stage 3 |
+| Failover speed vs. false positives | 180 s tolerance chosen to avoid false splits (slow by design) | Quorum makes fast failover safe (~1 s election); worker liveness uses separate soft/hard timeouts (soft: no new assignments; hard: eviction) | ✅ Stage 3 |
+| State healing after a partition | Hazelcast IMap last-write-wins merge, no engine callback — divergent state can silently win or lose | Single replicated log (Raft); no divergent branches exist to merge | ✅ Stage 3 |
 | Checkpoint after a master switch | In-memory `latestCompletedCheckpoint` is null until the next checkpoint completes; a pipeline restarting in that window starts from empty state | Checkpoint state lives in the durable stores at prepare time; the master only decides ids and resolution — no empty-state window after any switch | ✅ Stage 2 |
 | Checkpoint ID uniqueness across failover | Persisted IMap counter, `setCount(id + 1)` on restore (good design) | Same semantics: per-job counter exported with the HA snapshot, `max()` on import so ids never rewind | ✅ Stage 2 |
 | Cluster-mode checkpoint semantics | Per-pipeline CheckpointCoordinator with barrier injection through real DAG edges | Master-driven coordinated checkpoints reusing the exact local-mode 2PC (prepare → master persists/collects → complete → sink commit); no data-plane barriers because tasks are fully chained | ✅ Stage 2 |
-| Single-machine deployment | Hazelcast cluster semantics and role config even for one node | Three tiers: `seatunnel run -m local` (zero server), single-voter Raft (local commit, no network), `--role hybrid` (one process = full cluster) | ✅ Stage 1 (`--role hybrid`); 📋 Stage 3 (single-voter Raft) |
+| Single-machine deployment | Hazelcast cluster semantics and role config even for one node | Three tiers: `seatunnel run -m local` (zero server), single-voter Raft (local commit, no network), `--role hybrid` (one process = full cluster) | ✅ Stage 3 |
 | Operational identity | `ClusterInfo` leader is effectively hardcoded | Real advertise address, role, and term in `ClusterInfo`; masters never guess `127.0.0.1` for HA sync | ✅ Stage 1 |
 
 ## Where this engine is at parity (borrowed Java designs)
@@ -134,10 +134,13 @@ seatunnel-engine-server --role worker  --master m1:5800,m2:5800,m3:5800 ...
 ```
 
 Scaling rule: master/hybrid (voter) counts go 1 → 3 → 5. **Two voters
-are rejected** — a two-node majority cannot survive either node's
-failure, and silently accepting it would reintroduce the dual-master risk
-this design exists to eliminate (the old warm-standby setup could run
-two writable masters; it was documented as a known limitation).
+are rejected at startup** — a two-node majority cannot survive either
+node's failure, and silently accepting it would reintroduce the
+dual-master risk this design exists to eliminate (the pre-Raft
+warm-standby setup could run two writable masters; it was documented as
+a known limitation). Voter ids come from the ordered member list
+(position 1..n); node 1 bootstraps the membership, and if it never
+appears, another node retries initialization after 5 s.
 
 ## Roadmap
 
@@ -150,10 +153,14 @@ two writable masters; it was documented as a known limitation).
   commit with master-assigned monotonic IDs; triggers and resolutions
   ride heartbeats; abort on failure/timeout (`checkpoint-timeout-ms`);
   exit barriers now persist resumable state in cluster mode too.
-- **Stage 3** — openraft takes over HA: coordinator state becomes a Raft
-  state machine (snapshot = the existing `export_state` JSON); the Raft
-  leader term becomes the wire fencing term; snapshot-polling
-  replication and `ReplicationService` are removed.
+- **Stage 3 (done)** — openraft takes over HA: the coordinator's durable
+  mutations are a `Command` log applied deterministically on every node
+  (snapshot = the existing `export_state` JSON); the Raft leader term is
+  the wire fencing term; `ReplicationService` and the ordered-list
+  warm-standby polling are removed; voter counts are validated (1/3/5,
+  two rejected loudly). Fast election (0.8–1.6 s) replaces the Java
+  engine's 180 s tolerance — safe because a quorum, not a timeout,
+  decides leadership.
 - **Stage 4** — long-poll dispatch; least-loaded slot placement;
   term/leader/Raft observability; benchmarks and this document's final
   revision with measured numbers.

@@ -27,13 +27,13 @@ pub use generated::client_service_client::ClientServiceClient;
 pub use generated::client_service_server::ClientService;
 pub use generated::master_service_client::MasterServiceClient;
 pub use generated::master_service_server::MasterService;
-pub use generated::replication_service_client::ReplicationServiceClient;
-pub use generated::replication_service_server::{ReplicationService, ReplicationServiceServer};
+pub use generated::raft_service_client::RaftServiceClient;
+pub use generated::raft_service_server::{RaftService, RaftServiceServer};
 pub use generated::{
     CancelJobRequest, CheckpointEntry, CheckpointPhase, CheckpointReport, CheckpointResolution,
     CheckpointTrigger, ClusterInfo, Empty, FetchCheckpointRequest, FetchCheckpointResponse,
     HeartbeatRequest, HeartbeatResponse, JobCheckpointHistory, JobList, JobLogs, JobStatus,
-    JobStatusRequest, JobSummary, PullStateRequest, StateSnapshot, SubmitJobRequest,
+    JobStatusRequest, JobSummary, SubmitJobRequest,
     SubmitJobResponse, TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs,
     TaskStatusInfo, TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
     WorkerRegistrationResponse,

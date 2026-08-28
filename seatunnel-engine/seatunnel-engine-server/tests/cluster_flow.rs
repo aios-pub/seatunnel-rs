@@ -56,14 +56,14 @@ async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
         advertise_addr: addr.to_string(),
         role: "master".to_string(),
     };
-    let handler = MasterHandler::new(
+    let handler = MasterHandler::new_direct(
         coordinator.clone(),
         registry.clone(),
         info.clone(),
         150,  // fast heartbeat for tests
         60_000,
     );
-    let client = ClientHandler::new(coordinator.clone(), registry, info);
+    let client = ClientHandler::new_direct(coordinator.clone(), registry, info);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(MasterServiceServer::new(handler))

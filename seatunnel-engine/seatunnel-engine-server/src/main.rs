@@ -42,7 +42,12 @@ use tracing_subscriber::{EnvFilter, fmt::Layer, prelude::*};
 
 use seatunnel_engine_comm::generated::client_service_server::ClientServiceServer;
 use seatunnel_engine_comm::generated::master_service_server::MasterServiceServer;
+use seatunnel_engine_comm::generated::raft_service_server::RaftServiceServer;
 use seatunnel_engine_server::master::MasterInfo;
+use seatunnel_engine_server::raft::{
+    LeaderState, LeaderView, RaftWrite, WritePath, members_from_addresses, spawn_leader_watcher,
+    start_node, validate_voters,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -181,9 +186,26 @@ struct MasterServing {
     local_addr: std::net::SocketAddr,
 }
 
-/// Bind the listener and spawn the master-side background loops. Returns
-/// the bound address plus the server future — callers decide how to
-/// combine it with other roles (hybrid) or shutdown policies.
+/// Resolve this node's raft voter id: the position of its advertise
+/// address (or matching port) in the member list.
+fn my_voter_id(advertise: &str, members: &[String]) -> Option<u64> {
+    let my_port = advertise.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+    for (idx, member) in members.iter().enumerate() {
+        if member == advertise {
+            return Some(idx as u64 + 1);
+        }
+        if let (Some(port), Some(mport)) = (my_port, member.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok())) {
+            if port == mport && member.starts_with("127.0.0.1") {
+                return Some(idx as u64 + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Bind the listener and spawn the master-side loops. HA is openraft:
+/// the member list doubles as the voter set (validated odd), the leader
+/// term feeds the wire fencing, and writes go through the Raft log.
 async fn start_master(
     bind_addr: &str,
     advertise: &Option<String>,
@@ -199,25 +221,51 @@ async fn start_master(
         advertise_addr: advertise_addr.clone(),
         role: role.to_string(),
     };
+
+    // --- Consensus bootstrap -------------------------------------------
+    validate_voters(config.member_list.len())?;
+    let node_id = my_voter_id(&advertise_addr, &config.member_list).ok_or_else(|| {
+        anyhow::anyhow!(
+            "advertise address {} not found in the member list {:?} — \
+             every master/hybrid node must list itself",
+            advertise_addr,
+            config.member_list
+        )
+    })?;
+    let members = members_from_addresses(&config.member_list);
+    let raft_dir = std::path::Path::new(&config.state_dir).join("raft");
+    let raft = (*start_node(node_id, members.clone(), Arc::clone(&coordinator), raft_dir).await?).clone();
+    let leader: LeaderView = Arc::new(std::sync::RwLock::new(LeaderState::default()));
+    spawn_leader_watcher(
+        raft.clone(),
+        node_id,
+        Arc::clone(&leader),
+        Arc::clone(&coordinator),
+    );
+    let writes: Arc<dyn WritePath> =
+        Arc::new(RaftWrite::new(raft.clone(), node_id, members.clone(), Arc::clone(&leader)));
+    tracing::info!(
+        "Master({}) listening on {} advertise={} raft-id={} voters={} (cluster='{}')",
+        role,
+        local_addr,
+        advertise_addr,
+        node_id,
+        config.member_list.len(),
+        config.cluster_name
+    );
+
     let master_handler = MasterHandler::new(
         coordinator.clone(),
         registry.clone(),
         info.clone(),
         config.heartbeat_interval_ms,
         config.worker_soft_timeout_ms,
+        writes.clone(),
     );
-    let client_handler = ClientHandler::new(coordinator.clone(), registry.clone(), info);
-    let replication_handler =
-        seatunnel_engine_server::master::ReplicationHandler::new(coordinator.clone());
-
-    tracing::info!(
-        "Master({}) listening on {} advertise={} (cluster='{}', members={:?})",
-        role,
-        local_addr,
-        advertise_addr,
-        config.cluster_name,
-        config.member_list
-    );
+    let client_handler = ClientHandler::new(coordinator.clone(), registry.clone(), info, writes.clone());
+    let raft_handler = seatunnel_engine_server::raft::network::RaftServiceHandler {
+        raft: raft.clone(),
+    };
 
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
@@ -232,6 +280,7 @@ async fn start_master(
     {
         let registry = Arc::clone(&registry);
         let coordinator = Arc::clone(&coordinator);
+        let writes = writes.clone();
         let timeout_ms = config.worker_timeout_ms.max(config.worker_soft_timeout_ms).max(1000);
         let cp_timeout_ms = config.checkpoint_timeout_ms.max(1000);
         let cancel = shutdown.clone();
@@ -259,94 +308,18 @@ async fn start_master(
                         };
                         for worker_id in stale {
                             registry.write().unwrap().remove(&worker_id);
-                            let affected = coordinator.evict_worker(&worker_id);
-                            if !affected.is_empty() {
-                                tracing::warn!(
-                                    "Worker {} evicted (heartbeat timeout > {}ms); {} task(s) reclaimable",
-                                    worker_id,
-                                    timeout_ms,
-                                    affected.len()
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "Worker {} evicted (heartbeat timeout > {}ms)",
-                                    worker_id,
-                                    timeout_ms
-                                );
+                            // Durable release of the dead worker's tasks.
+                            let cmd = seatunnel_engine_server::job_coordinator::Command::EvictWorker {
+                                worker_id: worker_id.clone(),
+                            };
+                            if let Err(e) = writes.propose(cmd).await {
+                                tracing::warn!("EvictWorker proposal failed: {}", e);
                             }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // HA: standby sync — pull coordinator state from earlier members in
-    // the ordered member list. The first member (primary) pulls from
-    // nobody; a restarted primary recovers once from any later member
-    // that still has state.
-    {
-        let coordinator = Arc::clone(&coordinator);
-        let my_addr = advertise_addr;
-        let members = config.member_list.clone();
-        let interval_ms = config.replication_interval_ms.max(500);
-        let cancel = shutdown.clone();
-        tokio::spawn(async move {
-            // Members earlier than us (we are a standby for them).
-            let mut earlier: Vec<String> = Vec::new();
-            let mut my_pos = members.len();
-            for (idx, member) in members.iter().enumerate() {
-                if member == &my_addr
-                    || member.ends_with(&format!(":{}", local_addr_port(&my_addr)))
-                {
-                    my_pos = idx;
-                    break;
-                }
-            }
-            for member in members.iter().take(my_pos) {
-                earlier.push(member.clone());
-            }
-            if earlier.is_empty() {
-                tracing::info!("HA: primary master (no earlier member to sync from)");
-            } else {
-                tracing::info!("HA: standby — syncing from {:?}", earlier);
-            }
-            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-            let mut recovered_once = earlier.is_empty();
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = ticker.tick() => {
-                        if earlier.is_empty() && recovered_once {
-                            continue; // primary: nothing to pull
-                        }
-                        let mut pulled = false;
-                        for member in &earlier {
-                            match pull_state_from(member).await {
-                                Ok(Some(snapshot_json)) => {
-                                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&snapshot_json) {
-                                        coordinator.import_state(&value).await;
-                                        pulled = true;
-                                    }
-                                    break;
-                                }
-                                Ok(None) => continue,
-                                Err(_) => continue,
-                            }
-                        }
-                        // Restarted primary: one-shot recovery from any
-                        // later member that still holds state.
-                        if !pulled && earlier.is_empty() && !recovered_once {
-                            for member in members.iter().skip(my_pos + 1) {
-                                if let Ok(Some(snapshot_json)) = pull_state_from(member).await {
-                                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&snapshot_json) {
-                                        coordinator.import_state(&value).await;
-                                        tracing::info!("HA: recovered state from {}", member);
-                                    }
-                                    break;
-                                }
-                            }
-                            recovered_once = true;
+                            tracing::warn!(
+                                "Worker {} evicted (heartbeat timeout > {}ms)",
+                                worker_id,
+                                timeout_ms
+                            );
                         }
                     }
                 }
@@ -395,9 +368,7 @@ async fn start_master(
         let _ = tonic::transport::Server::builder()
             .add_service(MasterServiceServer::new(master_handler))
             .add_service(ClientServiceServer::new(client_handler))
-            .add_service(seatunnel_engine_comm::ReplicationServiceServer::new(
-                replication_handler,
-            ))
+            .add_service(RaftServiceServer::new(raft_handler))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;
     };
@@ -475,35 +446,6 @@ async fn run_hybrid(
         }
     }
     Ok(())
-}
-
-fn local_addr_port(addr: &str) -> u16 {
-    addr.rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(5800)
-}
-
-async fn pull_state_from(member: &str) -> anyhow::Result<Option<String>> {
-    use seatunnel_engine_comm::ReplicationServiceClient;
-    let url = format!("http://{}", member);
-    let mut client = match ReplicationServiceClient::connect(url).await {
-        Ok(c) => c,
-        Err(_) => return Ok(None),
-    };
-    let request = tonic::Request::new(seatunnel_engine_comm::PullStateRequest {
-        requester_id: "standby".to_string(),
-    });
-    match client.pull_state(request).await {
-        Ok(resp) => {
-            let snapshot = resp.into_inner();
-            if snapshot.state_json.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(snapshot.state_json))
-            }
-        }
-        Err(_) => Ok(None),
-    }
 }
 
 async fn run_worker(

@@ -15,12 +15,23 @@ service MasterService {
   rpc FetchCheckpoint(FetchCheckpointRequest) returns (FetchCheckpointResponse);
 }
 
-// Master-to-master state replication (HA standby sync).
-service ReplicationService {
-  // Full coordinator state snapshot (jobs, tasks, assignments and the
-  // master-backed checkpoint store) for standby import.
-  rpc PullState(PullStateRequest) returns (StateSnapshot);
+// Raft consensus transport between master/hybrid nodes (Stage-3 HA:
+// the coordinator state machine is replicated through this service).
+service RaftService {
+  rpc Vote(RaftVoteRequest) returns (RaftVoteResponse);
+  rpc AppendEntries(RaftAppendRequest) returns (RaftAppendResponse);
+  // One-shot full snapshot install (snapshots are small JSON).
+  rpc InstallSnapshot(RaftSnapshotRequest) returns (RaftSnapshotResponse);
 }
+
+// Raft RPC payloads are serialized openraft messages (JSON in bytes
+// fields); the transport stays versioned by proto, the payloads by serde.
+message RaftVoteRequest { bytes payload = 1; }
+message RaftVoteResponse { bytes payload = 1; }
+message RaftAppendRequest { bytes payload = 1; }
+message RaftAppendResponse { bytes payload = 1; }
+message RaftSnapshotRequest { bytes payload = 1; }
+message RaftSnapshotResponse { bytes payload = 1; }
 
 service ClientService {
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
@@ -330,12 +341,3 @@ message FetchCheckpointResponse {
   bytes checkpoint_data = 2;
 }
 
-message PullStateRequest {
-  string requester_id = 1;
-}
-
-message StateSnapshot {
-  // Serialized coordinator state (jobs + tasks + checkpoint store).
-  string state_json = 1;
-  int64 exported_at_ms = 2;
-}
