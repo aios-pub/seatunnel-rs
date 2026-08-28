@@ -57,7 +57,14 @@ prost-build = "0.13"
 
 # HTTP / REST
 axum = { version = "0.8", features = ["macros"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+# rustls everywhere: default-tls (native-tls) would drag OpenSSL back in —
+# the tree must stay OpenSSL-free (see rdkafka note below).
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
+    "http2",
+    "json",
+    "rustls-tls-native-roots",
+] }
 rust-embed = "8"
 
 # CLI
@@ -89,8 +96,14 @@ lapin = "4"
 clickhouse = { version = "0.15", features = ["rustls-tls-ring", "rustls-tls-webpki-roots"] }
 
 # TiDB / TiKV
-tikv-client = "0.4"
-rdkafka = { version = "0.36", features = ["cmake-build", "libz-static", "ssl", "sasl"] }
+# default-features drops tikv-client's prometheus/push, whose reqwest
+# requirement (blocking + default-tls) is the last native-tls/OpenSSL path.
+tikv-client = { version = "0.4", default-features = false }
+# NOTE: no "ssl"/"sasl" features — librdkafka's TLS/SASL stack is OpenSSL-only
+# (no rustls backend), so building them in makes every build depend on the
+# system OpenSSL version. The connector runs plaintext brokers only; if TLS
+# is ever needed, re-add "ssl-vendored" (static OpenSSL, no system dep).
+rdkafka = { version = "0.36", features = ["cmake-build", "libz-static"] }
 
 # Storage
 rust-rocksdb = "0.52"
