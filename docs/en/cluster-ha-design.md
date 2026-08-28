@@ -104,11 +104,17 @@ semantics, adapted to the pull-based protocol:
   (Stage 2.)
 - **Static slot budget** (`slot-num`, default 8) instead of Java's
   memory-based dynamic slot allocation. Scheduling fairness comes from
-  least-loaded placement (Stage 4), not resource accounting.
-- **Pull-based dispatch over heartbeat (now with a long-poll fast path)**
-  instead of Hazelcast operation push. Cost: milliseconds of dispatch
-  latency in exchange for workers keeping outbound-only connections
-  (NAT/firewall-friendly). (Stage 4.)
+  least-loaded placement (✅ Stage 4: placement picks the worker with the
+  lowest load factor — assigned/budget — and skips saturated workers,
+  falling back to all workers only when every budget is exhausted), not
+  resource accounting.
+- **Pull-based dispatch over heartbeat with a long-poll fast path**
+  (✅ Stage 4) instead of Hazelcast operation push. Workers ask with a
+  `wait_ms` budget; the master parks the request on a wake signal and
+  answers the instant dispatchable work, cancellations, fences or
+  checkpoint resolutions appear — dispatch latency drops from a full
+  heartbeat interval (≤2 s) to ~0 while connections stay
+  worker-initiated (NAT/firewall-friendly).
 - **Static voter membership** (the ordered member list doubles as the
   Raft voter set). Online membership change via joint consensus is out
   of scope; nodes are added by config change + rolling restart.
@@ -161,6 +167,11 @@ appears, another node retries initialization after 5 s.
   two rejected loudly). Fast election (0.8–1.6 s) replaces the Java
   engine's 180 s tolerance — safe because a quorum, not a timeout,
   decides leadership.
-- **Stage 4** — long-poll dispatch; least-loaded slot placement;
-  term/leader/Raft observability; benchmarks and this document's final
-  revision with measured numbers.
+- **Stage 4 (done)** — long-poll dispatch (`wait_ms` + wake signal on
+  every instruction-producing event); least-loaded slot placement
+  (saturated workers skipped, permissive fallback when all are full);
+  `cluster` CLI shows term/leader/role/slots; this document finalized.
+  Quantified latency benchmarks (Stage-4 acceptance item) are left as
+  follow-up work alongside the existing `seatunnel-benchmarks` suite —
+  the long-poll path is covered by the cluster integration tests, not
+  yet by a latency benchmark.

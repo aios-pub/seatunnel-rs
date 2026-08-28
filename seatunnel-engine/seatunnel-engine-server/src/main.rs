@@ -262,7 +262,13 @@ async fn start_master(
         config.worker_soft_timeout_ms,
         writes.clone(),
     );
-    let client_handler = ClientHandler::new(coordinator.clone(), registry.clone(), info, writes.clone());
+    let client_handler = ClientHandler::new(
+        coordinator.clone(),
+        registry.clone(),
+        info,
+        writes.clone(),
+        master_handler.wake_signal(),
+    );
     let raft_handler = seatunnel_engine_server::raft::network::RaftServiceHandler {
         raft: raft.clone(),
     };
@@ -281,6 +287,7 @@ async fn start_master(
         let registry = Arc::clone(&registry);
         let coordinator = Arc::clone(&coordinator);
         let writes = writes.clone();
+        let wake = master_handler.wake_signal();
         let timeout_ms = config.worker_timeout_ms.max(config.worker_soft_timeout_ms).max(1000);
         let cp_timeout_ms = config.checkpoint_timeout_ms.max(1000);
         let cancel = shutdown.clone();
@@ -315,6 +322,9 @@ async fn start_master(
                             if let Err(e) = writes.propose(cmd).await {
                                 tracing::warn!("EvictWorker proposal failed: {}", e);
                             }
+                            // Released tasks are claimable — wake parked
+                            // long-poll heartbeats.
+                            wake.notify_waiters();
                             tracing::warn!(
                                 "Worker {} evicted (heartbeat timeout > {}ms)",
                                 worker_id,
@@ -594,7 +604,12 @@ async fn run_worker(
             loop {
                 tokio::select! {
                     _ = shutdown_signal.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(
+                        // With long-polling the SERVER paces the cadence
+                        // (parking up to `interval` server-side); the
+                        // client-side gap only catches transport errors.
+                        100.min(interval_ms)
+                    )) => {}
                 }
 
                 let tasks = worker.heartbeat_tasks().await;
@@ -604,9 +619,12 @@ async fn run_worker(
                     timestamp: seatunnel_engine_core::now_millis(),
                     tasks,
                     term: worker.term(),
-                    // Long-poll dispatch lands in a later stage; 0 keeps
-                    // the request-return-immediately behavior.
-                    wait_ms: 0,
+                    // Long-poll: the master parks this request until
+                    // dispatchable work appears (or the budget expires),
+                    // so task handout latency drops from a full heartbeat
+                    // interval to ~0 while the connection stays
+                    // worker-initiated (NAT-friendly).
+                    wait_ms: interval_ms as i64,
                 };
 
                 match client.heartbeat(hb).await {

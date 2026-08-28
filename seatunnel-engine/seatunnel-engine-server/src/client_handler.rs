@@ -21,7 +21,7 @@
 //! and cluster introspection for the CLI and REST clients.
 
 use crate::job_coordinator::{Command, JobCoordinator};
-use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot};
+use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot_with_slots};
 use crate::raft::WritePath;
 use seatunnel_engine_comm::{
     CancelJobRequest, CheckpointEntry, ClusterInfo, Empty, JobCheckpointHistory, JobList, JobLogs,
@@ -39,6 +39,9 @@ pub struct ClientHandler {
     workers: WorkerRegistry,
     info: MasterInfo,
     writes: Arc<dyn WritePath>,
+    /// Long-poll wake signal (shared with the master handler): a fresh
+    /// submission must unpause parked worker heartbeats immediately.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl ClientHandler {
@@ -47,12 +50,14 @@ impl ClientHandler {
         workers: WorkerRegistry,
         info: MasterInfo,
         writes: Arc<dyn WritePath>,
+        wake: Arc<tokio::sync::Notify>,
     ) -> Self {
         ClientHandler {
             coordinator,
             workers,
             info,
             writes,
+            wake,
         }
     }
 
@@ -67,6 +72,7 @@ impl ClientHandler {
             workers,
             info,
             Arc::new(crate::raft::DirectWrite::new(coordinator)),
+            Arc::new(tokio::sync::Notify::new()),
         )
     }
 
@@ -137,7 +143,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 if hint.is_empty() { "another master" } else { &hint }
             )));
         }
-        let workers = registry_snapshot(&self.workers);
+        let workers = registry_snapshot_with_slots(&self.workers);
         let (job, descriptors, _tasks) = self
             .coordinator
             .plan_job(&job_id, &job_name, &config, parallelism_override, &workers)
@@ -155,6 +161,8 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             .propose(cmd)
             .await
             .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
+        // New tasks exist: parked long-poll heartbeats must wake now.
+        self.wake.notify_waiters();
         let tasks = task_count;
 
         tracing::info!(
@@ -198,6 +206,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             .propose(cmd)
             .await
             .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
+        self.wake.notify_waiters();
         Ok(Response::new(Empty {}))
     }
 

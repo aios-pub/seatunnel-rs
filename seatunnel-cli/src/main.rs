@@ -10,7 +10,7 @@ use seatunnel_cli::Cli;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Same format as the engine servers: local time YYYY-MM-DD HH:mm:ss.
-    use tracing_subscriber::{fmt::Layer, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt::Layer, prelude::*};
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(

@@ -5,7 +5,7 @@
 
 //! SeaTunnel CLI: local execution, cluster job submission and management.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -174,7 +174,7 @@ async fn run_local(
         create_sink_pipeline, create_source, create_transforms, json_to_config_map,
     };
     use seatunnel_engine_core::local_checkpoint::{
-        LocalCheckpointPlan, TaskRegistration, DEFAULT_CHECKPOINT_INTERVAL_MS,
+        DEFAULT_CHECKPOINT_INTERVAL_MS, LocalCheckpointPlan, TaskRegistration,
     };
     use seatunnel_engine_core::task_group::{TaskContext, TaskGroup};
 
@@ -320,7 +320,13 @@ async fn run_local(
         "  Pipelines: {}",
         pipelines
             .iter()
-            .map(|p| format!("{}[{}: {} → {} sink(s)]", p.name, p.parallelism, p.source_plugin, p.sinks.len()))
+            .map(|p| format!(
+                "{}[{}: {} → {} sink(s)]",
+                p.name,
+                p.parallelism,
+                p.source_plugin,
+                p.sinks.len()
+            ))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -339,7 +345,11 @@ async fn run_local(
                 "  Restore: job {} from checkpoint {} ({})",
                 job_id,
                 envelope.checkpoint_id,
-                if envelope.is_final { "final" } else { "interval" }
+                if envelope.is_final {
+                    "final"
+                } else {
+                    "interval"
+                }
             );
         }
         plan
@@ -738,13 +748,37 @@ async fn print_cluster_info(address: &str) -> Result<()> {
         .get_cluster_info()
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    println!("Cluster leader   : {}", info.leader_id);
+    println!(
+        "Cluster leader   : {} (term {}, node role: {})",
+        if info.leader_id.is_empty() {
+            "-"
+        } else {
+            &info.leader_id
+        },
+        info.term,
+        if info.role.is_empty() {
+            "-"
+        } else {
+            &info.role
+        }
+    );
     println!("Workers          : {}", info.available_workers);
-    println!("Total tasks      : {}", info.total_tasks);
+    println!(
+        "Total tasks      : {} (running {})",
+        info.total_tasks, info.running_tasks
+    );
     for w in info.workers {
         println!(
-            "  ● {} @ {} (last hb {})",
-            w.worker_id, w.address, w.last_heartbeat
+            "  ● {} @ {} (last hb {}, slots {}, running {})",
+            w.worker_id,
+            w.address,
+            w.last_heartbeat,
+            if w.slots == 0 {
+                "-".to_string()
+            } else {
+                w.slots.to_string()
+            },
+            w.running_tasks
         );
     }
     Ok(())

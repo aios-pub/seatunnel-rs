@@ -60,6 +60,19 @@ pub fn registry_snapshot(registry: &WorkerRegistry) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Snapshot of registered workers as `(id, address, slots)` triples —
+/// the placement input for least-loaded scheduling.
+pub fn registry_snapshot_with_slots(
+    registry: &WorkerRegistry,
+) -> Vec<(String, String, u32)> {
+    registry
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(id, e)| (id.clone(), e.address.clone(), e.slots))
+        .collect()
+}
+
 /// Identity of this master node, shared by Master/Client handlers so the
 /// wire protocol can carry a real leader address and role.
 #[derive(Debug, Clone)]
@@ -96,6 +109,10 @@ pub struct MasterHandler {
     workers: WorkerRegistry,
     /// Durable mutations (Direct: in-place; Raft: consensus).
     writes: Arc<dyn WritePath>,
+    /// Long-poll wake signal: any event that could give SOME worker new
+    /// instructions (submission, cancel, fence, checkpoint resolution)
+    /// fires this so parked heartbeats recompute immediately.
+    wake: Arc<tokio::sync::Notify>,
     info: MasterInfo,
     /// Configured worker heartbeat period, echoed via `next_interval_ms`.
     heartbeat_interval_ms: u64,
@@ -118,10 +135,21 @@ impl MasterHandler {
             coordinator,
             workers,
             writes,
+            wake: Arc::new(tokio::sync::Notify::new()),
             info,
             heartbeat_interval_ms: heartbeat_interval_ms.clamp(250, 60_000),
             worker_soft_timeout_ms: worker_soft_timeout_ms.max(1_000),
         }
+    }
+
+    /// Wake every parked long-poll heartbeat (new work may exist).
+    pub fn wake_heartbeats(&self) {
+        self.wake.notify_waiters();
+    }
+
+    /// Shared wake signal (for sibling handlers and background loops).
+    pub fn wake_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.wake)
     }
 
     /// Convenience constructor for tests / embedded setups: direct
@@ -177,49 +205,52 @@ impl MasterHandler {
         for task_id in preempted {
             self.coordinator.queue_preemption(worker_id, &task_id);
         }
+        self.wake_heartbeats();
     }
-}
 
-#[tonic::async_trait]
-impl MasterService for MasterHandler {
-    async fn register_worker(
-        &self,
-        request: Request<WorkerRegistration>,
-    ) -> Result<Response<WorkerRegistrationResponse>, Status> {
-        let reg = request.into_inner();
-        info!(
-            "Worker {} registering at {} ({} running task(s), slots={})",
-            reg.worker_id,
-            reg.address,
-            reg.running_task_ids.len(),
-            reg.slots
-        );
-        // Adopt-first: tasks still assigned to this worker are re-marked
-        // Running for it (re-attach); only reassigned tasks get fenced.
-        self.reattach_tasks(&reg.worker_id, reg.running_task_ids.clone())
-            .await;
-        self.workers.write().unwrap().insert(
-            reg.worker_id.clone(),
-            WorkerEntry {
-                address: reg.address.clone(),
-                last_heartbeat_ms: seatunnel_engine_core::now_millis(),
-                slots: reg.slots,
-            },
-        );
-
-        Ok(Response::new(WorkerRegistrationResponse {
-            success: true,
-            message: "registered".to_string(),
-            leader_address: self.info.advertise_addr.clone(),
+    /// Cheap recompute for a parked heartbeat that was woken: identical
+    /// decisions, empty task list carried in (task metrics already
+    /// ingested by the first pass).
+    async fn recompute_heartbeat(&self, worker_id: &str) -> HeartbeatResponse {
+        let pending_tasks = {
+            let live = self.workers.read().unwrap();
+            self.coordinator.claim_tasks_for_worker(
+                worker_id,
+                "",
+                &|w| live.contains_key(w),
+            )
+        };
+        if !pending_tasks.is_empty() {
+            let ids: Vec<String> =
+                pending_tasks.iter().map(|t| t.task_id.clone()).collect();
+            let cmd = Command::MarkDispatched {
+                task_ids: ids,
+                worker_id: worker_id.to_string(),
+            };
+            if let Err(e) = self.writes.propose(cmd).await {
+                warn!("MarkDispatched proposal failed: {}", e);
+            }
+        }
+        let checkpoint_triggers = self.coordinator.deliver_checkpoint_triggers(worker_id);
+        HeartbeatResponse {
+            worker_id: worker_id.to_string(),
+            next_interval_ms: self.heartbeat_interval_ms as i64,
+            pending_tasks,
+            cancel_jobs: self.coordinator.cancelled_job_ids(),
+            preempted_task_ids: self.coordinator.drain_preemptions(worker_id),
             term: self.coordinator.term(),
-        }))
+            leader_hint: String::new(),
+            checkpoint_triggers,
+            checkpoint_resolutions: self
+                .coordinator
+                .drain_checkpoint_resolutions(worker_id),
+        }
     }
 
-    async fn heartbeat(
+    async fn compute_heartbeat(
         &self,
-        request: Request<HeartbeatRequest>,
+        hb: HeartbeatRequest,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let hb = request.into_inner();
         let worker_id = hb.worker_id.clone();
         let now = seatunnel_engine_core::now_millis();
         let my_term = self.coordinator.term();
@@ -394,6 +425,86 @@ impl MasterService for MasterHandler {
             checkpoint_resolutions,
         }))
     }
+}
+
+
+/// Whether a heartbeat response carries nothing the worker must act on.
+fn response_has_nothing(r: &HeartbeatResponse) -> bool {
+    r.pending_tasks.is_empty()
+        && r.cancel_jobs.is_empty()
+        && r.preempted_task_ids.is_empty()
+        && r.checkpoint_triggers.is_empty()
+        && r.checkpoint_resolutions.is_empty()
+}
+
+#[tonic::async_trait]
+impl MasterService for MasterHandler {
+    async fn register_worker(
+        &self,
+        request: Request<WorkerRegistration>,
+    ) -> Result<Response<WorkerRegistrationResponse>, Status> {
+        let reg = request.into_inner();
+        info!(
+            "Worker {} registering at {} ({} running task(s), slots={})",
+            reg.worker_id,
+            reg.address,
+            reg.running_task_ids.len(),
+            reg.slots
+        );
+        // Adopt-first: tasks still assigned to this worker are re-marked
+        // Running for it (re-attach); only reassigned tasks get fenced.
+        self.reattach_tasks(&reg.worker_id, reg.running_task_ids.clone())
+            .await;
+        self.workers.write().unwrap().insert(
+            reg.worker_id.clone(),
+            WorkerEntry {
+                address: reg.address.clone(),
+                last_heartbeat_ms: seatunnel_engine_core::now_millis(),
+                slots: reg.slots,
+            },
+        );
+
+        Ok(Response::new(WorkerRegistrationResponse {
+            success: true,
+            message: "registered".to_string(),
+            leader_address: self.info.advertise_addr.clone(),
+            term: self.coordinator.term(),
+        }))
+    }
+
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let hb = request.into_inner();
+        let wait_ms = hb.wait_ms.max(0).min(10_000) as u64;
+
+        // Long-poll: compute the response; if there is nothing to deliver
+        // and the worker asked to wait, park on the wake signal until an
+        // event fires or the wait budget runs out, then recompute once.
+        let response = self.compute_heartbeat(hb).await?;
+        if wait_ms == 0 {
+            return Ok(response);
+        }
+        let inner = response.into_inner();
+        if !response_has_nothing(&inner) {
+            return Ok(Response::new(inner));
+        }
+        let worker_id = inner.worker_id.clone();
+        let mut notified = std::pin::pin!(self.wake.notified());
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let woken = tokio::select! {
+            _ = notified.as_mut() => true,
+            _ = tokio::time::sleep_until(deadline) => false,
+        };
+        let inner = if woken {
+            self.recompute_heartbeat(&worker_id).await
+        } else {
+            inner
+        };
+        Ok(Response::new(inner))
+    }
 
     async fn report_task_status(
         &self,
@@ -433,6 +544,8 @@ impl MasterService for MasterHandler {
         if let Err(e) = self.writes.propose(cmd).await {
             warn!("TaskStatus proposal failed: {}", e);
         }
+        // A terminal transition may unblock other dispatch decisions.
+        self.wake_heartbeats();
 
         Ok(Response::new(Empty {}))
     }
@@ -487,6 +600,8 @@ impl MasterService for MasterHandler {
                 if let Err(e) = self.writes.propose(cmd).await {
                     warn!("CheckpointResolved proposal failed: {}", e);
                 }
+                // Resolutions are waiting for their workers' heartbeats.
+                self.wake_heartbeats();
             }
         } else if !is_final {
             // Legacy interval-path report (pre-coordination senders):
@@ -538,6 +653,8 @@ impl MasterService for MasterHandler {
         if let Err(e) = self.writes.propose(cmd).await {
             warn!("EvictWorker proposal failed: {}", e);
         }
+        // The released tasks are claimable — wake the parked heartbeats.
+        self.wake_heartbeats();
         let affected: Vec<String> = Vec::new();
         if !affected.is_empty() {
             info!(

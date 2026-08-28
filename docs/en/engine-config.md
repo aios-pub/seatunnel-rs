@@ -41,6 +41,12 @@ seatunnel:
 | `...storage.clean-grace-minutes` | 10 | — | delay after a job cancel before its state is deleted (restore window) |
 | `...storage.clean-interval-minutes` | 60 | — | how often the TTL sweep runs (plus once at startup) |
 
+Dispatch is long-polled: workers send `wait_ms` with every heartbeat and
+the master parks the request until work appears, so task handout does not
+wait out the heartbeat interval. Placement is least-loaded by
+`slot-num` budgets (saturated workers are skipped; when every budget is
+exhausted the job still runs on all workers).
+
 Failure-detection defaults are deliberately conservative (soft 30 s /
 hard 60 s): the Java engine ships a 180 s heartbeat tolerance because a
 27-second full-GC stall once crossed a 60 s timeout and split the
