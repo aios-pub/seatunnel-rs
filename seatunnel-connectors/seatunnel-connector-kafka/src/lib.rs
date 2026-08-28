@@ -606,7 +606,19 @@ impl SourceReader for KafkaSourceReader {
                     let key = format!("{}-{}", msg.topic(), msg.partition());
                     self.last_offsets.insert(key, msg.offset());
                     if let Some(payload) = msg.payload() {
-                        self.pending.extend(self.decode_payload(payload));
+                        let decoded = self.decode_payload(payload);
+                        // Per-message detail (debug level): position, payload
+                        // size and decoded row count.
+                        tracing::debug!(
+                            "Kafka source: {}-{}@{} payload={} bytes decoded={} rows (format={})",
+                            msg.topic(),
+                            msg.partition(),
+                            msg.offset(),
+                            payload.len(),
+                            decoded.len(),
+                            self.config.format.name()
+                        );
+                        self.pending.extend(decoded);
                     }
                     if let Some(row) = self.pending.pop_front() {
                         return Ok(PollResult::Record(KafkaSourceOutput(row)));
@@ -1707,6 +1719,13 @@ impl KafkaSinkWriter {
             .iter()
             .map(|record| encode_row(record, &self.config.format, &self.config.field_delimiter))
             .collect();
+        // Batch encode detail (debug level): format and encoded payload size.
+        tracing::debug!(
+            "Kafka sink encode: {} rows format={} payload={} bytes",
+            records.len(),
+            self.config.format.name(),
+            payloads.iter().map(|p| p.len()).sum::<usize>()
+        );
         let keys: Vec<Option<String>> = records
             .iter()
             .map(|record| row_key(record, &self.config.partition_key_fields))

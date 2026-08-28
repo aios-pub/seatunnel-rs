@@ -133,6 +133,25 @@ const IDLE_BACKOFF_MS: [u64; 5] = [1, 2, 5, 10, 20];
 /// show live data flow without flooding the task log ring.
 const DATA_LOG_SAMPLE: u64 = 100;
 
+/// Interval between periodic pipeline stats lines (throughput + cumulative
+/// per-stage times). The final summary is emitted once at task exit.
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cumulative per-stage timings accumulated over the run loop; surfaced by
+/// the periodic stats line and the final task summary.
+#[derive(Default)]
+struct StageTimes {
+    /// Time spent inside productive `reader.poll_next()` calls (empty/EOF
+    /// polls are not counted so idle time does not skew the breakdown).
+    source: Duration,
+    /// Time spent running the transform chain.
+    transform: Duration,
+    /// Time spent writing rows into the sink.
+    sink: Duration,
+    /// Number of record batches pulled from the source.
+    batches: u64,
+}
+
 /// Compact `f0=.., f1=..` rendering of a row for DATA log lines.
 fn row_summary(row: &seatunnel_api::Row) -> String {
     let mut parts = Vec::new();
@@ -179,6 +198,10 @@ pub struct TaskGroup {
     sink_metrics: Option<std::sync::Arc<seatunnel_api::sink::SinkMetrics>>,
     /// Bounded task log ring surfaced through the worker heartbeat.
     logs: crate::task_log::TaskLogRing,
+    /// Per-stage timing accumulators for the stats/summary log lines.
+    stage_times: StageTimes,
+    /// Instant of the last periodic stats line (throttle state).
+    last_stats_log: Option<Instant>,
 }
 
 impl TaskGroup {
@@ -202,6 +225,8 @@ impl TaskGroup {
             last_checkpoint_meta: (0, 0),
             sink_metrics: None,
             logs: crate::task_log::TaskLogRing::default(),
+            stage_times: StageTimes::default(),
+            last_stats_log: None,
         }
     }
 
@@ -252,6 +277,8 @@ impl TaskGroup {
             status.state = TaskState::Running;
             status.start_time = crate::now_millis();
         }
+        let started = Instant::now();
+        self.last_stats_log = Some(started);
         self.logs.info(format!(
             "task started (job={}, parallelism={})",
             self.context.job_id, self.context.parallelism
@@ -315,10 +342,14 @@ impl TaskGroup {
                 ));
             }
 
+            let poll_started = Instant::now();
             match self.reader.poll_next().await {
                 Ok(PollResult::Record(output)) => {
                     self.empty_streak = 0;
+                    let source_elapsed = poll_started.elapsed();
+                    let transform_started = Instant::now();
                     let rows = self.apply_transforms(output)?;
+                    let transform_elapsed = transform_started.elapsed();
                     self.records_processed += rows.len() as u64;
                     self.last_record_at = crate::now_millis();
                     // Sample one row per DATA_LOG_SAMPLE records so the
@@ -334,9 +365,37 @@ impl TaskGroup {
                         }
                     }
                     self.publish_status_throttled().await;
+                    // Capture debug-only details before the rows are moved
+                    // into the sink write loop.
+                    let batch_rows = rows.len();
+                    let debug_last_row = if tracing::enabled!(tracing::Level::DEBUG) {
+                        rows.last().map(row_summary)
+                    } else {
+                        None
+                    };
+                    let sink_started = Instant::now();
                     for row in rows {
                         self.sink.write(row).await?;
                     }
+                    let sink_elapsed = sink_started.elapsed();
+                    self.stage_times.source += source_elapsed;
+                    self.stage_times.transform += transform_elapsed;
+                    self.stage_times.sink += sink_elapsed;
+                    self.stage_times.batches += 1;
+                    // Debug mode prints every batch with its per-stage cost.
+                    if let Some(last_row) = debug_last_row {
+                        tracing::debug!(
+                            "Task {} batch: rows={} batch={}us source={}us transform={}us sink={}us last: {}",
+                            self.context.task_id,
+                            batch_rows,
+                            (source_elapsed + transform_elapsed + sink_elapsed).as_micros(),
+                            source_elapsed.as_micros(),
+                            transform_elapsed.as_micros(),
+                            sink_elapsed.as_micros(),
+                            last_row,
+                        );
+                    }
+                    self.maybe_log_stats(started);
                 }
                 Ok(PollResult::SchemaChange(event)) => {
                     // Schema evolution: the sink flushes its old-schema buffer
@@ -455,7 +514,74 @@ impl TaskGroup {
             self.checkpoints_completed
         );
 
+        // Whole-pipeline timing summary: wall clock, effective throughput
+        // and the share of the wall time each stage consumed. Stage times
+        // are sequential segments of the loop, so they sum to <= elapsed
+        // (the rest is idle backoff / checkpoint pauses).
+        let total_elapsed = started.elapsed();
+        let secs = total_elapsed.as_secs_f64();
+        let rate = if secs > 0.0 {
+            self.records_processed as f64 / secs
+        } else {
+            0.0
+        };
+        let share = |d: Duration| {
+            if secs > 0.0 {
+                d.as_secs_f64() / secs * 100.0
+            } else {
+                0.0
+            }
+        };
+        let summary = format!(
+            "summary: records={} batches={} elapsed={:.3}s throughput={:.1}/s | source={}ms ({:.1}%) transform={}ms ({:.1}%) sink={}ms ({:.1}%)",
+            self.records_processed,
+            self.stage_times.batches,
+            secs,
+            rate,
+            self.stage_times.source.as_millis(),
+            share(self.stage_times.source),
+            self.stage_times.transform.as_millis(),
+            share(self.stage_times.transform),
+            self.stage_times.sink.as_millis(),
+            share(self.stage_times.sink),
+        );
+        self.logs.info(summary.clone());
+        tracing::info!("Task {} {}", self.context.task_id, summary);
+
         Ok(self.status.lock().await.clone())
+    }
+
+    /// Emit the periodic pipeline stats line, throttled to
+    /// [`STATS_LOG_INTERVAL`]: processed records, effective throughput and
+    /// the cumulative per-stage times since the task started.
+    fn maybe_log_stats(&mut self, started: Instant) {
+        let now = Instant::now();
+        let due = match self.last_stats_log {
+            Some(last) => now.duration_since(last) >= STATS_LOG_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_stats_log = Some(now);
+        let secs = now.duration_since(started).as_secs_f64();
+        let rate = if secs > 0.0 {
+            self.records_processed as f64 / secs
+        } else {
+            0.0
+        };
+        let line = format!(
+            "stats: records={} elapsed={:.1}s rate={:.1}/s source={}ms transform={}ms sink={}ms batches={}",
+            self.records_processed,
+            secs,
+            rate,
+            self.stage_times.source.as_millis(),
+            self.stage_times.transform.as_millis(),
+            self.stage_times.sink.as_millis(),
+            self.stage_times.batches,
+        );
+        self.logs.info(line.clone());
+        tracing::info!("Task {} {}", self.context.task_id, line);
     }
 
     /// Publish the processed-records counter to the shared status at most
@@ -512,14 +638,18 @@ impl TaskGroup {
 
         // 1. Flush downstream first — everything emitted before this point
         //    must be visible before we record where the source stands.
+        let prepare_started = Instant::now();
         self.sink.prepare_commit(cp_id).await?;
+        let prepare_elapsed = prepare_started.elapsed();
 
         // 2. Capture the source state after the flush.
+        let snapshot_started = Instant::now();
         let state = self
             .reader
             .snapshot_state()
             .await
             .map_err(|e| anyhow::anyhow!("reader snapshot_state failed: {}", e))?;
+        let snapshot_elapsed = snapshot_started.elapsed();
         self.last_checkpoint_meta = (cp_id, state.len() as u64);
 
         // 3. Persist + report via the listener.
@@ -536,10 +666,12 @@ impl TaskGroup {
         }
 
         tracing::debug!(
-            "Task {} checkpoint {} completed (records={})",
+            "Task {} checkpoint {} completed (records={}, sink prepare_commit={}ms, reader snapshot={}ms)",
             self.context.task_id,
             cp_id,
-            self.records_processed
+            self.records_processed,
+            prepare_elapsed.as_millis(),
+            snapshot_elapsed.as_millis()
         );
         Ok(Some(cp_id))
     }
@@ -553,13 +685,18 @@ impl TaskGroup {
     ///    committed, never less
     /// 4. report all three payloads to the checkpoint driver
     async fn execute_barrier(&mut self, checkpoint_id: u64) -> anyhow::Result<()> {
+        let barrier_started = Instant::now();
+        let prepare_started = Instant::now();
         let commit_infos = self.sink.prepare_commit(checkpoint_id).await?;
+        let prepare_elapsed = prepare_started.elapsed();
         let writer_state = self.sink.snapshot_state().await?;
+        let reader_started = Instant::now();
         let reader_state = self
             .reader
             .snapshot_state()
             .await
             .map_err(|e| anyhow::anyhow!("reader snapshot_state failed: {}", e))?;
+        let reader_elapsed = reader_started.elapsed();
         self.checkpoints_completed += 1;
         self.last_checkpoint_at = Some(crate::now_millis());
         // The exit barrier (FINAL_CHECKPOINT_ID) is a durable flush for
@@ -570,6 +707,9 @@ impl TaskGroup {
             self.last_checkpoint_meta = (checkpoint_id, reader_state.len() as u64);
         }
         self.last_commit_infos = commit_infos.clone();
+        // Captured before the payloads are moved into the driver report.
+        let commit_infos_len = commit_infos.len();
+        let reader_state_len = reader_state.len();
         if let Some(handle) = self.context.checkpoint_handle.clone() {
             handle.report(TaskToDriver::Checkpoint(
                 crate::local_checkpoint::TaskCheckpointReport {
@@ -584,10 +724,15 @@ impl TaskGroup {
                 },
             ));
         }
-        tracing::debug!(
-            "Task {} barrier {} done (records={})",
+        tracing::info!(
+            "Task {} barrier {}: total={}ms (sink prepare_commit={}ms, {} commit infos; reader snapshot={}ms, {} bytes; records={})",
             self.context.task_id,
             checkpoint_id,
+            barrier_started.elapsed().as_millis(),
+            prepare_elapsed.as_millis(),
+            commit_infos_len,
+            reader_elapsed.as_millis(),
+            reader_state_len,
             self.records_processed
         );
         Ok(())
@@ -601,11 +746,13 @@ impl TaskGroup {
                 if let Some(committer) = &mut self.committer {
                     if !self.last_commit_infos.is_empty() {
                         let infos = self.last_commit_infos.clone();
+                        let commit_started = Instant::now();
                         let aggregated = committer.commit(infos).await?;
-                        tracing::debug!(
-                            "Task {} checkpoint {} phase 2 committed: {:?}",
+                        tracing::info!(
+                            "Task {} checkpoint {} phase 2 committed in {}ms: {:?}",
                             self.context.task_id,
                             checkpoint_id,
+                            commit_started.elapsed().as_millis(),
                             aggregated
                         );
                     }

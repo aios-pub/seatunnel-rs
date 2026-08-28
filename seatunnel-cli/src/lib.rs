@@ -26,6 +26,13 @@ const WATCH_POLL_MS: u64 = 1000;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
+    /// Enable debug logging (verbose output for the data pipeline).
+    #[arg(long, short = 'd', global = true, env = "SEATUNNEL_DEBUG")]
+    pub debug: bool,
+    /// Log level filter: trace|debug|info|warn|error (takes precedence
+    /// over --debug; RUST_LOG is used when neither is given).
+    #[arg(long, global = true, env = "SEATUNNEL_LOG")]
+    pub log_level: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]

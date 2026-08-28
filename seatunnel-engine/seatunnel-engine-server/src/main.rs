@@ -82,12 +82,33 @@ struct Args {
     /// config/seatunnel.yaml for the reference layout.
     #[arg(long, short = 'f')]
     config: Option<String>,
+
+    /// Enable debug logging (verbose output for the data pipeline).
+    #[arg(long, env = "SEATUNNEL_DEBUG")]
+    debug: bool,
+
+    /// Log level filter: trace|debug|info|warn|error (takes precedence
+    /// over --debug; RUST_LOG is used when neither is given).
+    #[arg(long, env = "SEATUNNEL_LOG")]
+    log_level: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse first so --debug / --log-level can shape the log filter.
+    let args = Args::parse();
+
+    // Precedence: --log-level > --debug > RUST_LOG > "info".
+    let filter = match args.log_level.as_deref() {
+        Some(level) => EnvFilter::try_new(level).unwrap_or_else(|_| {
+            eprintln!("warning: invalid --log-level '{level}', falling back to RUST_LOG/info");
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+        }),
+        None if args.debug => EnvFilter::new("debug"),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    };
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(filter)
         .with(
             Layer::default().with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
                 // "YYYY-MM-DD HH:mm:ss" in the server's local timezone.
@@ -95,8 +116,6 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .init();
-
-    let args = Args::parse();
 
     // Precedence: --state-dir > SEATUNNEL_STATE_DIR > config file > default.
     let explicit_state_dir = if args.state_dir == ".seatunnel-state" {

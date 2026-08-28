@@ -1293,6 +1293,15 @@ impl PostgresCdcReader {
             }
         }
         self.stream_buffer.push_back(BufferedChange { row });
+        // Per-event detail (debug level): table, change kind and WAL position.
+        tracing::debug!(
+            "PostgreSQL CDC stream: {}.{} kind={:?} -> 1 row (lsn={}, buffered={})",
+            schema,
+            table,
+            kind,
+            self.lsn,
+            self.stream_buffer.len()
+        );
     }
 
     /// Pull already-available stream events into the replay buffer with a
@@ -1488,6 +1497,7 @@ impl SourceReader for PostgresCdcReader {
             }
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
+                let batch_started = std::time::Instant::now();
                 let client = self.connect_admin().await?;
                 let table_ref =
                     format!("\"{}\".\"{}\"", self.current_table.0, self.current_table.1);
@@ -1506,6 +1516,13 @@ impl SourceReader for PostgresCdcReader {
                 );
                 let rows = client.query(&sql, &[]).await?;
                 if rows.is_empty() {
+                    tracing::info!(
+                        "PostgreSQL CDC snapshot: range [{}, {}) complete (table={}.{})",
+                        start,
+                        end,
+                        self.current_table.0,
+                        self.current_table.1
+                    );
                     self.pending_ranges.pop_front();
                     self.last_pk = 0;
                     self.current_idx.set(self.current_idx.get() + 1);
@@ -1519,6 +1536,16 @@ impl SourceReader for PostgresCdcReader {
                     }
                     return Ok(PollResult::Empty);
                 }
+                tracing::debug!(
+                    "PostgreSQL CDC snapshot: {}.{} range [{}, {}) after pk={} -> {} rows in {}ms",
+                    self.current_table.0,
+                    self.current_table.1,
+                    start,
+                    end,
+                    self.last_pk,
+                    rows.len(),
+                    batch_started.elapsed().as_millis()
+                );
                 let types: Vec<Type> = rows[0]
                     .columns()
                     .iter()

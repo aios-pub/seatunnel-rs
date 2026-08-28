@@ -113,6 +113,12 @@ pub fn deserialize(
         MessageFormat::Protobuf => protobuf::deserialize(bytes, schema)?,
         MessageFormat::Native => native::deserialize(bytes, schema)?,
     };
+    tracing::debug!(
+        target: "format",
+        "deserialize format={} bytes={} rows=1",
+        format.name(),
+        bytes.len()
+    );
     rows.into_iter()
         .next()
         .ok_or("Empty result from format deserializer".into())
@@ -124,7 +130,7 @@ pub fn deserialize_all(
     bytes: &[u8],
     schema: &TableSchema,
 ) -> Result<Vec<Row>, Box<dyn Error>> {
-    match format {
+    let rows = match format {
         MessageFormat::Json => json::deserialize(bytes, schema),
         MessageFormat::Text => text::deserialize(bytes, schema),
         MessageFormat::CanalJson => canal_json::deserialize(bytes, schema),
@@ -141,7 +147,16 @@ pub fn deserialize_all(
         MessageFormat::Avro => avro::deserialize(bytes, schema),
         MessageFormat::Protobuf => protobuf::deserialize(bytes, schema),
         MessageFormat::Native => native::deserialize(bytes, schema),
-    }
+    };
+    let rows = rows?;
+    tracing::debug!(
+        target: "format",
+        "deserialize_all format={} bytes={} rows={}",
+        format.name(),
+        bytes.len(),
+        rows.len()
+    );
+    Ok(rows)
 }
 
 /// Serialize a Row into bytes using the specified format.
@@ -150,7 +165,7 @@ pub fn serialize(
     schema: &TableSchema,
     row: &Row,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    match format {
+    let bytes = match format {
         MessageFormat::Json => json::serialize(schema, row),
         MessageFormat::Text => text::serialize(schema, row),
         MessageFormat::CanalJson => canal_json::serialize(schema, row),
@@ -165,7 +180,16 @@ pub fn serialize(
         MessageFormat::Avro => avro::serialize(schema, row),
         MessageFormat::Protobuf => protobuf::serialize(schema, row),
         MessageFormat::Native => native::serialize(schema, row),
-    }
+    }?;
+    tracing::debug!(
+        target: "format",
+        "serialize format={} bytes={} kind={:?} table={:?}",
+        format.name(),
+        bytes.len(),
+        row.kind,
+        row.origin_table
+    );
+    Ok(bytes)
 }
 
 /// Convert a serde_json Value to a Row given a schema.

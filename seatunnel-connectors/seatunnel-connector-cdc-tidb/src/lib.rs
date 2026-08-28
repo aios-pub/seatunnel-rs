@@ -908,10 +908,22 @@ impl TiDBCdcReader {
             match engine.poll_with_budget(budget_ms).await {
                 Ok(_consumed) => {
                     self.engine_errors = 0;
+                    let mut decoded = 0usize;
                     while let Some(row_event) = engine.next_row() {
                         if let Some(row) = build_row_from_event(&row_event) {
                             self.pending_rows.push_back(row);
+                            decoded += 1;
                         }
+                    }
+                    // Per-poll detail (debug level): decoded change rows and
+                    // the engine's resolved-ts watermark.
+                    if decoded > 0 {
+                        tracing::debug!(
+                            "TiDB CDC stream: {} change rows decoded (pending={}, resolved_ts={})",
+                            decoded,
+                            self.pending_rows.len(),
+                            engine.resolved_ts()
+                        );
                     }
                 }
                 Err(e) => {
@@ -1177,6 +1189,7 @@ impl SourceReader for TiDBCdcReader {
             self.drain_engine(scan_budget).await;
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
+                let batch_started = std::time::Instant::now();
                 let pool = self
                     .sql_pool
                     .get_or_insert_with(|| self.config.conn.to_pool());
@@ -1202,6 +1215,13 @@ impl SourceReader for TiDBCdcReader {
                 );
                 let rows: Vec<mysql_async::Row> = conn.query(sql).await?;
                 if rows.is_empty() {
+                    tracing::info!(
+                        "TiDB CDC snapshot: range [{}, {}) complete (table={}.{})",
+                        start,
+                        end,
+                        cur_db,
+                        cur_table
+                    );
                     self.pending_ranges.pop_front();
                     self.last_pk = 0;
                     // Multi-table capture: advance to the next table once
@@ -1217,6 +1237,16 @@ impl SourceReader for TiDBCdcReader {
                     }
                     return Ok(PollResult::Empty);
                 }
+                tracing::debug!(
+                    "TiDB CDC snapshot: {}.{} range [{}, {}) after pk={} -> {} rows in {}ms",
+                    cur_db,
+                    cur_table,
+                    start,
+                    end,
+                    self.last_pk,
+                    rows.len(),
+                    batch_started.elapsed().as_millis()
+                );
                 let field_count = rows[0].len();
                 for r in rows.iter() {
                     let mut out_row = Row::new(RowKind::Insert, field_count);

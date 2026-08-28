@@ -122,6 +122,13 @@ const MAX_BUFFERED_BINLOG_ROWS: usize = 65_536;
 /// Events drained per poll during the timestamp warm-up skip.
 const TIMESTAMP_WARMUP_DRAIN_BUDGET: usize = 2000;
 
+/// How long an idle incremental poll blocks reading the binlog stream
+/// before returning `Empty`. Events arriving during the wait are returned
+/// immediately, so this never adds data latency — it only bounds how often
+/// the engine loop cycles, and with it the granularity of the sink's
+/// linger flush and the canal-client pairing-window expiry check.
+const INCREMENTAL_IDLE_READ_TIMEOUT_MS: u64 = 50;
+
 /// Binlog offset for MySQL binlog streaming.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BinlogOffset {
@@ -1231,6 +1238,12 @@ impl MySqlCdcReader {
             row.origin_table = Some(origin.clone());
             row
         };
+        let event_kind = match &rows {
+            RowsEventData::WriteRowsEvent(_) => "WRITE_ROWS",
+            RowsEventData::UpdateRowsEvent(_) => "UPDATE_ROWS",
+            RowsEventData::DeleteRowsEvent(_) => "DELETE_ROWS",
+            _ => "ROWS",
+        };
         match &rows {
             RowsEventData::WriteRowsEvent(e) => {
                 for pair in e.rows(tme) {
@@ -1264,7 +1277,21 @@ impl MySqlCdcReader {
             }
             _ => {}
         }
+        let decoded_rows = decoded.len();
         self.binlog_buffer.extend(decoded);
+        // Per-event detail (debug level): table, decoded change rows and the
+        // binlog position the event was read at.
+        if decoded_rows > 0 {
+            tracing::debug!(
+                "MySQL CDC binlog: {} {} -> {} rows (binlog {}:{}, replay buffer={})",
+                event_kind,
+                origin,
+                decoded_rows,
+                self.offset.file,
+                self.offset.position,
+                self.binlog_buffer.len()
+            );
+        }
     }
 
     /// Blocking-with-timeout read used in the incremental phase.
@@ -1543,13 +1570,27 @@ impl SourceReader for MySqlCdcReader {
                 split.end_key,
                 last_pk
             );
+            let batch_started = std::time::Instant::now();
             let pool = self.build_pool();
             let rows = query_snapshot_batch(&pool, &self.config, &split, last_pk).await?;
-            tracing::trace!(
-                "MySQL CDC poll[snapshot]: batch returned {} rows",
-                rows.len()
+            tracing::debug!(
+                "MySQL CDC snapshot: split {}/{} table={} range [{}, {}) after pk={} -> {} rows in {}ms",
+                idx + 1,
+                self.splits.len(),
+                self.config.table_name,
+                split.start_key,
+                split.end_key,
+                last_pk,
+                rows.len(),
+                batch_started.elapsed().as_millis()
             );
             if rows.is_empty() {
+                tracing::info!(
+                    "MySQL CDC snapshot: split {}/{} complete (table={})",
+                    idx + 1,
+                    self.splits.len(),
+                    self.config.table_name
+                );
                 self.current_idx.set(idx + 1);
                 return Ok(PollResult::Empty);
             }
@@ -1707,7 +1748,8 @@ impl MySqlCdcReader {
         // throttled capture to a handful of rows per second. Drain until a
         // row is available, the stop boundary is reached, or the deadline
         // passes.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(INCREMENTAL_IDLE_READ_TIMEOUT_MS);
         while self.binlog_buffer.is_empty() && !self.stop_reached {
             let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remain.is_zero() {

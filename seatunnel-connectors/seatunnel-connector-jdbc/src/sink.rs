@@ -429,6 +429,7 @@ impl JdbcSinkWriter {
         }
         self.ensure_connected().await?;
         let rows = std::mem::take(&mut self.buffer);
+        let flush_started = std::time::Instant::now();
 
         // Execute in arrival order, batching consecutive rows of the same
         // kind so an UPDATE (delete-before + insert-after) applies in order.
@@ -447,6 +448,14 @@ impl JdbcSinkWriter {
             }
             idx = run_end;
         }
+        // Batch flush detail (debug level): rows per flush and its cost.
+        tracing::debug!(
+            "JDBC sink flush: {} rows to {} in {}ms (total written={})",
+            rows.len(),
+            self.qualified_table(),
+            flush_started.elapsed().as_millis(),
+            self.written
+        );
         Ok(())
     }
 
