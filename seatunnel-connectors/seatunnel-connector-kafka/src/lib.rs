@@ -769,9 +769,10 @@ pub struct KafkaSinkConfig {
     pub canal_client: Option<seatunnel_formats::canal_client_json::CanalClientConfig>,
     /// Delimiter joining fields for TEXT format payloads.
     pub field_delimiter: String,
-    /// Ordered per-table topic routes (`topic-routes`): the first entry
-    /// whose `pattern` matches the row's origin `database.table` wins;
-    /// unmatched rows fall back to `topic`.
+    /// Per-table topic routes (`topic-routes`): EVERY entry whose anchored
+    /// `pattern` matches the row's origin `database.table` receives a copy
+    /// of the record (fanned out in declaration order, each rendered topic
+    /// delivered once); a table hit by no route falls back to `topic`.
     pub topic_routes: Vec<TopicRoute>,
     /// Raw librdkafka producer overrides collected from `producer.*`
     /// sink options (prefix stripped), applied AFTER the built-in
