@@ -188,7 +188,11 @@ fn decode_rowcodec_v2(
         prev_end = end;
     }
     for id in &null_ids {
-        if let Some(i) = usize::try_from(*id).ok().and_then(|v| v.checked_sub(1)).filter(|i| *i < out.len()) {
+        if let Some(i) = usize::try_from(*id)
+            .ok()
+            .and_then(|v| v.checked_sub(1))
+            .filter(|i| *i < out.len())
+        {
             out[i] = ColumnValue::Null;
         }
     }
@@ -570,13 +574,16 @@ impl TransactionTracker {
                 let start_key = RowKeyWithTs::of_start(handle, row.start_ts);
                 // Pipelined-DML (generation > 0) commits only match after
                 // INITIALIZED, mirroring official TiCDC.
-                let matched = self.prewrites.contains_key(&start_key)
-                    && (initialized || row.generation == 0);
+                let matched =
+                    self.prewrites.contains_key(&start_key) && (initialized || row.generation == 0);
                 if matched {
                     self.commits
                         .insert(RowKeyWithTs::of_commit(handle, row.commit_ts), pending);
                 } else if !initialized {
-                    self.cached_commits.entry(region_id).or_default().push(pending);
+                    self.cached_commits
+                        .entry(region_id)
+                        .or_default()
+                        .push(pending);
                 } else {
                     tracing::warn!(
                         "TiKV CDC tracker: commit without prewrite after initialized \
@@ -629,8 +636,10 @@ impl TransactionTracker {
         for commit in cached_commits {
             let start_key = RowKeyWithTs::of_start(commit.handle, commit.start_ts);
             if self.prewrites.contains_key(&start_key) {
-                self.commits
-                    .insert(RowKeyWithTs::of_commit(commit.handle, commit.commit_ts), commit);
+                self.commits.insert(
+                    RowKeyWithTs::of_commit(commit.handle, commit.commit_ts),
+                    commit,
+                );
             } else {
                 unmatched += 1;
             }
@@ -752,11 +761,11 @@ mod tests {
             [0x74u8, 0x80, 0, 0, 0, 0, 0, 0, 0xA4, b'_', b's'].as_slice(),
         );
         let enc_start = encode_comparable(raw_start);
+        assert_eq!(hex_of(&enc_start), "7480000000000000ffa45f720000000000fa");
         assert_eq!(
-            hex_of(&enc_start),
-            "7480000000000000ffa45f720000000000fa"
+            hex_of(&encode_comparable(raw_end)),
+            "7480000000000000ffa45f730000000000fa"
         );
-        assert_eq!(hex_of(&encode_comparable(raw_end)), "7480000000000000ffa45f730000000000fa");
 
         // A 9-byte key (table prefix only) pads with 7 zeros -> 0xF8 marker,
         // matching the split boundary between table regions.
@@ -823,11 +832,26 @@ mod tests {
         assert_eq!(row[2], ColumnValue::Int(88));
 
         // Compact integers: 63 inline i8, 250/1000 i16 LE, 100000 i32 LE, -5 i8.
-        assert_eq!(decode("8000020000000203 0300 0400 6e3633 3f", 18)[2], ColumnValue::Int(63));
-        assert_eq!(decode("8000020000000203 0400 0600 6e323530 fa00", 20)[2], ColumnValue::Int(250));
-        assert_eq!(decode("8000020000000203 0500 0700 6e31303030 e803", 23)[2], ColumnValue::Int(1000));
-        assert_eq!(decode("8000020000000203 0700 0b00 6e313030303030 a0860100", 24)[2], ColumnValue::Int(100000));
-        assert_eq!(decode("8000020000000203 0300 0400 6e6567 fb", 25)[2], ColumnValue::Int(-5));
+        assert_eq!(
+            decode("8000020000000203 0300 0400 6e3633 3f", 18)[2],
+            ColumnValue::Int(63)
+        );
+        assert_eq!(
+            decode("8000020000000203 0400 0600 6e323530 fa00", 20)[2],
+            ColumnValue::Int(250)
+        );
+        assert_eq!(
+            decode("8000020000000203 0500 0700 6e31303030 e803", 23)[2],
+            ColumnValue::Int(1000)
+        );
+        assert_eq!(
+            decode("8000020000000203 0700 0b00 6e313030303030 a0860100", 24)[2],
+            ColumnValue::Int(100000)
+        );
+        assert_eq!(
+            decode("8000020000000203 0300 0400 6e6567 fb", 25)[2],
+            ColumnValue::Int(-5)
+        );
 
         // score = NULL: the column is entirely absent from the value.
         let row = decode("80000100000002 0400 6e756c76", 26);
@@ -921,7 +945,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        tracker.on_row(7, &CdcRow { r#type: 5, ..Default::default() });
+        tracker.on_row(
+            7,
+            &CdcRow {
+                r#type: 5,
+                ..Default::default()
+            },
+        );
         let emitted = tracker.flush(11);
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].handle, 3);

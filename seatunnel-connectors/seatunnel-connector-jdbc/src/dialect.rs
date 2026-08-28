@@ -19,8 +19,10 @@
 //! `JdbcDialect` per-database statement builders (identifier quoting,
 //! INSERT / upsert / delete statements, placeholder style).
 
-use seatunnel_api::schema::{ColumnDef, DatabaseDialect, MySqlDialect, PostgresDialect, TableSchema};
 use seatunnel_api::ColumnType;
+use seatunnel_api::schema::{
+    ColumnDef, DatabaseDialect, MySqlDialect, PostgresDialect, TableSchema,
+};
 
 /// Database family this connector speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,13 +151,7 @@ impl JdbcDialectKind {
                 let updates: Vec<String> = columns
                     .iter()
                     .filter(|c| !primary_keys.contains(c))
-                    .map(|c| {
-                        format!(
-                            "{} = EXCLUDED.{}",
-                            self.quote(c),
-                            self.quote(c)
-                        )
-                    })
+                    .map(|c| format!("{} = EXCLUDED.{}", self.quote(c), self.quote(c)))
                     .collect();
                 sql.push_str(&format!(
                     " ON CONFLICT ({}) DO UPDATE SET {}",
@@ -182,15 +178,13 @@ impl JdbcDialectKind {
             .iter()
             .zip(key_types)
             .enumerate()
-            .map(|(i, (pk, ct))| {
-                format!(
-                    "{} = {}",
-                    self.quote(pk),
-                    self.placeholder(i + 1, ct)
-                )
-            })
+            .map(|(i, (pk, ct))| format!("{} = {}", self.quote(pk), self.placeholder(i + 1, ct)))
             .collect();
-        format!("DELETE FROM {} WHERE {}", self.quote_table(table), where_parts.join(" AND "))
+        format!(
+            "DELETE FROM {} WHERE {}",
+            self.quote_table(table),
+            where_parts.join(" AND ")
+        )
     }
 
     /// Build DDL statements for a schema change using the api dialects.
@@ -208,9 +202,7 @@ impl JdbcDialectKind {
                 self.api_dialect().build_drop_column(table, column_name)
             }
             SchemaChange::RenameColumn {
-                old_name,
-                new_name,
-                ..
+                old_name, new_name, ..
             } => self
                 .api_dialect()
                 .build_rename_column(table, old_name, new_name),
@@ -260,7 +252,14 @@ mod tests {
     #[test]
     fn test_postgres_insert_upsert_delete_with_casts() {
         let cols = vec!["id".to_string(), "score".to_string(), "born".to_string()];
-        let types = vec![ColumnType::Int64, ColumnType::Decimal { precision: 10, scale: 2 }, ColumnType::Date];
+        let types = vec![
+            ColumnType::Int64,
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            ColumnType::Date,
+        ];
         let pks = vec!["id".to_string()];
 
         let upsert = JdbcDialectKind::Postgres.build_upsert("public.users", &cols, &types, &pks, 1);

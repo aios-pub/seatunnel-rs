@@ -1,8 +1,8 @@
 // Micro-benchmark: rdkafka FutureProducer produce+delivery throughput with
 // the exact configuration the engine's Kafka sink uses.
 
-use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::{Duration, Instant};
 
 #[tokio::main]
@@ -13,11 +13,18 @@ async fn main() {
         ("linger0", &[("acks", "1"), ("linger.ms", "0")]),
         (
             "linger0+bnum",
-            &[("acks", "1"), ("linger.ms", "0"), ("batch.num.messages", "10000")],
+            &[
+                ("acks", "1"),
+                ("linger.ms", "0"),
+                ("batch.num.messages", "10000"),
+            ],
         ),
         (
             "inflight1",
-            &[("acks", "1"), ("max.in.flight.requests.per.connection", "1")],
+            &[
+                ("acks", "1"),
+                ("max.in.flight.requests.per.connection", "1"),
+            ],
         ),
         (
             "debug-nagle",

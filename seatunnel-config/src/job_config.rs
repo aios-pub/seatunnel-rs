@@ -310,10 +310,12 @@ mod tests {
         let schema = SchemaConfig::from_value(config).unwrap();
         assert_eq!(schema.fields.len(), 3);
         assert!(schema.fields.iter().any(|(n, t)| n == "id" && t == "int"));
-        assert!(schema
-            .fields
-            .iter()
-            .any(|(n, t)| n == "ts" && t == "timestamp"));
+        assert!(
+            schema
+                .fields
+                .iter()
+                .any(|(n, t)| n == "ts" && t == "timestamp")
+        );
     }
 
     #[test]

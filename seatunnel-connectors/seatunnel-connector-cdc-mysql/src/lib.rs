@@ -56,25 +56,25 @@ use std::pin::Pin;
 
 use futures::{Stream, StreamExt};
 use mysql_async::{
+    BinlogStream, BinlogStreamRequest, OptsBuilder, Pool, Row, Value,
     binlog::events::{Event, EventData, RowsEventData, TableMapEvent},
     binlog::row::BinlogRow,
     prelude::*,
-    BinlogStream, BinlogStreamRequest, OptsBuilder, Pool, Row, Value,
 };
 use seatunnel_api::{
     row::{Field, Row as SeatunnelRow, RowKind},
     schema::TableSchema,
     source::{
+        Boundedness, Source,
         source_reader::{PollResult, SourceReader, SourceReaderContext},
         source_split::SourceSplit,
         source_split_enum::SourceSplitEnumeratorContext,
-        Boundedness, Source,
     },
 };
 use seatunnel_connector_cdc_base::{
-    alter_table_target, build_table_selector, CdcConfig, CdcPhase, CdcSource, CdcState,
-    IncrementalSplit, SchemaEvolutionConfig, SchemaWatcher, SnapshotSplit, TableSelector,
-    Watermark,
+    CdcConfig, CdcPhase, CdcSource, CdcState, IncrementalSplit, SchemaEvolutionConfig,
+    SchemaWatcher, SnapshotSplit, TableSelector, Watermark, alter_table_target,
+    build_table_selector,
 };
 
 use seatunnel_connector_common::ConnectorConfig;
@@ -177,7 +177,6 @@ pub enum MySqlStartupMode {
     },
 }
 
-
 /// Stop condition for bounded capture (official `stop.mode`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MySqlStopMode {
@@ -272,17 +271,31 @@ impl MySqlCdcConfig {
             .unwrap_or_default();
         let database_name = {
             let v = config.get_string("database-name", &url_db);
-            if v.is_empty() { "seatunnel".to_string() } else { v }
+            if v.is_empty() {
+                "seatunnel".to_string()
+            } else {
+                v
+            }
         };
         let table_name = config.get_string("table-name", "users");
         MySqlCdcConfig {
             hostname: {
                 let v = config.get_string("hostname", &url_host);
-                if v.is_empty() { "localhost".to_string() } else { v }
+                if v.is_empty() {
+                    "localhost".to_string()
+                } else {
+                    v
+                }
             },
             port: {
                 let p = config.get_int("port", -1);
-                if p > 0 { p as u16 } else if url_port > 0 { url_port } else { 3306 }
+                if p > 0 {
+                    p as u16
+                } else if url_port > 0 {
+                    url_port
+                } else {
+                    3306
+                }
             },
             username: config.get_string("username", "root"),
             password: config.get_string("password", ""),
@@ -297,10 +310,8 @@ impl MySqlCdcConfig {
                     "earliest" => MySqlStartupMode::Earliest,
                     "latest" => MySqlStartupMode::Latest,
                     "timestamp" => MySqlStartupMode::Timestamp {
-                        timestamp: config.get_int(
-                            "startup.timestamp",
-                            config.get_int("startup_timestamp", 0),
-                        ),
+                        timestamp: config
+                            .get_int("startup.timestamp", config.get_int("startup_timestamp", 0)),
                     },
                     "specific" | "specific-offset" => MySqlStartupMode::Specific {
                         // Official keys: startup.specific-offset.file/.pos
@@ -345,7 +356,13 @@ impl MySqlCdcConfig {
             server_id_range: {
                 let raw = config.get_string("server-id", "");
                 if let Some((_, hi)) = raw.split_once('-') {
-                    let lo: u32 = raw.split('-').next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let lo: u32 = raw
+                        .split('-')
+                        .next()
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
                     let hi: u32 = hi.trim().parse().unwrap_or(lo);
                     hi.saturating_sub(lo)
                 } else {
@@ -357,10 +374,16 @@ impl MySqlCdcConfig {
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
             schema_evolution: SchemaEvolutionConfig::from_config(config),
             connect_timeout_ms: config
-                .get_int("connect.timeout.ms", config.get_int("connect.timeout-ms", 30_000))
+                .get_int(
+                    "connect.timeout.ms",
+                    config.get_int("connect.timeout-ms", 30_000),
+                )
                 .max(100) as u64,
             connect_max_retries: config
-                .get_int("connect.max-retries", config.get_int("connect.max_retries", 3))
+                .get_int(
+                    "connect.max-retries",
+                    config.get_int("connect.max_retries", 3),
+                )
                 .max(0) as u32,
             connection_pool_size: config
                 .get_int(
@@ -369,10 +392,16 @@ impl MySqlCdcConfig {
                 )
                 .max(1) as u32,
             snapshot_split_size: config
-                .get_int("snapshot.split.size", config.get_int("snapshot.split_size", 8096))
+                .get_int(
+                    "snapshot.split.size",
+                    config.get_int("snapshot.split_size", 8096),
+                )
                 .max(1),
             snapshot_fetch_size: config
-                .get_int("snapshot.fetch.size", config.get_int("snapshot_fetch_size", 1024))
+                .get_int(
+                    "snapshot.fetch.size",
+                    config.get_int("snapshot_fetch_size", 1024),
+                )
                 .max(1),
             stop_mode: parse_stop_mode(config),
             table_selector: build_table_selector(config, &database_name, &table_name),
@@ -408,14 +437,16 @@ impl MySqlCdcConfig {
         // Keep well clear of typical server ids (0/1) and of the sign bit.
         (mixed % 0x0FFF_FFF0) + 0x1000
     }
-
 }
-
 
 /// Parse `stop.mode` + `stop.*` options (official: never | latest |
 /// specific; `timestamp` additionally accepted for symmetry with Java).
 fn parse_stop_mode(config: &ConnectorConfig) -> MySqlStopMode {
-    match config.get_string("stop.mode", "never").to_lowercase().as_str() {
+    match config
+        .get_string("stop.mode", "never")
+        .to_lowercase()
+        .as_str()
+    {
         "latest" => MySqlStopMode::Latest,
         "specific" | "specific-offset" => MySqlStopMode::Specific {
             file: config.get_string("stop.specific-offset.file", ""),
@@ -436,7 +467,9 @@ fn parse_stop_mode(config: &ConnectorConfig) -> MySqlStopMode {
 /// Parse `jdbc:mysql://host:port/db?...` (or `mysql://`) into
 /// (host, port, database). Returns `None` when the value is not a URL.
 fn parse_mysql_jdbc_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.strip_prefix("jdbc:mysql://").or_else(|| url.strip_prefix("mysql://"))?;
+    let rest = url
+        .strip_prefix("jdbc:mysql://")
+        .or_else(|| url.strip_prefix("mysql://"))?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let database = path.split('?').next().unwrap_or("").to_string();
     let (host, port) = match authority.rsplit_once(':') {
@@ -483,11 +516,9 @@ impl MySqlCdcSource {
     }
 
     fn build_pool_for(config: &MySqlCdcConfig) -> Pool {
-        let constraints = mysql_async::PoolConstraints::new(
-            1,
-            config.connection_pool_size.max(1) as usize,
-        )
-        .expect("valid pool constraints");
+        let constraints =
+            mysql_async::PoolConstraints::new(1, config.connection_pool_size.max(1) as usize)
+                .expect("valid pool constraints");
         let opts = OptsBuilder::default()
             .ip_or_hostname(&config.hostname)
             .tcp_port(config.port)
@@ -1299,14 +1330,11 @@ impl SourceReader for MySqlCdcReader {
             // right now; `specific` uses the configured offset.
             match self.config.stop_mode.clone() {
                 MySqlStopMode::Latest => {
-                    self.stop_boundary =
-                        Some((self.offset.file.clone(), self.offset.position));
+                    self.stop_boundary = Some((self.offset.file.clone(), self.offset.position));
                 }
                 MySqlStopMode::Specific { file, position } => {
                     if file.is_empty() {
-                        anyhow::bail!(
-                            "stop.mode=specific requires stop.specific-offset.file"
-                        );
+                        anyhow::bail!("stop.mode=specific requires stop.specific-offset.file");
                     }
                     self.stop_boundary = Some((file, position));
                 }
@@ -1339,9 +1367,7 @@ impl SourceReader for MySqlCdcReader {
                     ref gtid_set,
                 } => {
                     if file.is_empty() {
-                        anyhow::bail!(
-                            "startup.mode=specific requires startup.specific.file"
-                        );
+                        anyhow::bail!("startup.mode=specific requires startup.specific.file");
                     }
                     self.offset.file = file.clone();
                     self.offset.position = position;
@@ -1398,8 +1424,7 @@ impl SourceReader for MySqlCdcReader {
                             // to the baseline position.
                         }
                     }
-                    let stream =
-                        Self::open_binlog_stream(conn, &self.config, &self.offset).await?;
+                    let stream = Self::open_binlog_stream(conn, &self.config, &self.offset).await?;
                     self.binlog_stream = Some(Box::pin(stream));
                     tracing::info!(
                         "MySQL CDC reader: timestamp startup — skipping binlog events before {}",
@@ -1602,7 +1627,10 @@ impl MySqlCdcReader {
     async fn poll_incremental(&mut self) -> anyhow::Result<PollResult<MySqlCdcOutput>> {
         // 0. Drained after crossing the stop boundary → bounded capture ends.
         if self.stop_reached {
-            tracing::info!("MySQL CDC reader: bounded capture complete (stop.mode={:?})", self.config.stop_mode);
+            tracing::info!(
+                "MySQL CDC reader: bounded capture complete (stop.mode={:?})",
+                self.config.stop_mode
+            );
             return Ok(PollResult::EOF);
         }
 
@@ -1631,10 +1659,10 @@ impl MySqlCdcReader {
                         }
                     }
                     Ok(None) => {
-                tracing::trace!("MySQL CDC warm-up: idle at tail (no event within budget)");
-                break;
-            }
-            Err(e) => return Err(e),
+                        tracing::trace!("MySQL CDC warm-up: idle at tail (no event within budget)");
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             if let Some(row) = self.next_buffered_change() {
@@ -2125,9 +2153,10 @@ mod tests {
         let ids: std::collections::HashSet<u32> =
             (0..16).map(|_| cfg.effective_server_id()).collect();
         assert_eq!(ids.len(), 16);
-        assert!(ids
-            .iter()
-            .all(|id| *id >= 0x1000 && *id < 0x1000 + 0x0FFF_FFF0));
+        assert!(
+            ids.iter()
+                .all(|id| *id >= 0x1000 && *id < 0x1000 + 0x0FFF_FFF0)
+        );
         // Explicit configuration always wins.
         cfg.server_id = 42;
         assert_eq!(cfg.effective_server_id(), 42);
@@ -2274,7 +2303,10 @@ mod tests {
                 position: 99,
             }
         );
-        let cfg = mk(&[("stop.mode", "timestamp"), ("stop.timestamp", "1667232000000")]);
+        let cfg = mk(&[
+            ("stop.mode", "timestamp"),
+            ("stop.timestamp", "1667232000000"),
+        ]);
         assert_eq!(
             cfg.stop_mode,
             MySqlStopMode::Timestamp {

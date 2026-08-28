@@ -6112,7 +6112,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "seatunnel-api"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -6129,7 +6129,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-benchmarks"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -6146,7 +6146,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-cli"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6167,7 +6167,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-config"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "seatunnel-api",
@@ -6180,7 +6180,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-cdc-base"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -6199,7 +6199,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-cdc-mysql"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -6221,7 +6221,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-cdc-postgres"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6243,7 +6243,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-cdc-tidb"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6268,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-clickhouse"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6284,7 +6284,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-common"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6297,7 +6297,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-elasticsearch"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6313,7 +6313,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-http"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -6327,7 +6327,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-jdbc"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -6346,7 +6346,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-kafka"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6364,7 +6364,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-rabbitmq"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -6380,7 +6380,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-connector-redis"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -6396,7 +6396,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-e2e"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -6417,7 +6417,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-engine-client"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -6431,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-engine-comm"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6449,7 +6449,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-engine-core"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6481,7 +6481,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-engine-server"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6519,7 +6519,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-formats"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow 50.0.0",
@@ -6537,7 +6537,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-macros"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6546,7 +6546,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-transforms"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "datafusion",
@@ -6559,7 +6559,7 @@ dependencies = [
 
 [[package]]
 name = "seatunnel-web"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",

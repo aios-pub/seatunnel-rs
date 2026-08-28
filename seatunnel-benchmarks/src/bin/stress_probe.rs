@@ -11,8 +11,8 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::Message;
+use rdkafka::consumer::{Consumer, StreamConsumer};
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -111,8 +111,7 @@ async fn main() -> anyhow::Result<()> {
                     Err(_) => {
                         eprintln!(
                             "stress-probe[{}]: non-JSON payload on {}",
-                            tag,
-                            topics[topic_idx]
+                            tag, topics[topic_idx]
                         );
                         continue;
                     }

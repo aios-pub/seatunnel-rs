@@ -67,16 +67,17 @@ async fn mysql_exec(sql: &str) -> anyhow::Result<()> {
     // prepared XA) must fail the test, not hang it forever.
     let out = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new("docker").args([
-            "exec",
-            "seatunnel-rs-mysql-1",
-            "mysql",
-            "-uroot",
-            "-proot",
-            "-e",
-            sql,
-        ])
-        .output(),
+        Command::new("docker")
+            .args([
+                "exec",
+                "seatunnel-rs-mysql-1",
+                "mysql",
+                "-uroot",
+                "-proot",
+                "-e",
+                sql,
+            ])
+            .output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("mysql exec timed out: {}", sql))??;
@@ -324,7 +325,9 @@ fn temp_dir(tag: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kafka_transactional_sink_survives_kill9_exactly_once() {
     if !prerequisites().await {
-        eprintln!("SKIP: mysql/kafka/cli binary not available (build with `cargo build -p seatunnel-cli`)");
+        eprintln!(
+            "SKIP: mysql/kafka/cli binary not available (build with `cargo build -p seatunnel-cli`)"
+        );
         return;
     }
     let topic = "e2e-eos-kafka-txn";
@@ -409,13 +412,23 @@ pipelines:
     }
 
     // Final run: flow the rest, then stop gracefully (final checkpoint).
-    let runner = JobRunner::start(&binary, &job_path, "e2e-eos-kafka", &state_dir, &dir.join("final.log"));
+    let runner = JobRunner::start(
+        &binary,
+        &job_path,
+        "e2e-eos-kafka",
+        &state_dir,
+        &dir.join("final.log"),
+    );
     tokio::time::sleep(Duration::from_millis(1500)).await;
     insert_rows("e2e_eos", &mut seq, TOTAL, 1).await;
     // Give the last rows a checkpoint cycle, then SIGTERM.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let status = runner.graceful_stop().await.unwrap();
-    assert!(status.success(), "graceful stop failed: {:?}", status.code());
+    assert!(
+        status.success(),
+        "graceful stop failed: {:?}",
+        status.code()
+    );
 
     // Verify from the read_committed consumer's point of view.
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -472,12 +485,18 @@ pipelines:
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_xa_sink_survives_kill9_strictly_exactly_once() {
     if !prerequisites().await {
-        eprintln!("SKIP: mysql/kafka/cli binary not available (build with `cargo build -p seatunnel-cli`)");
+        eprintln!(
+            "SKIP: mysql/kafka/cli binary not available (build with `cargo build -p seatunnel-cli`)"
+        );
         return;
     }
     xa_rollback_all().await.unwrap();
-    mysql_exec("DROP DATABASE IF EXISTS e2e_eos_src").await.unwrap();
-    mysql_exec("DROP DATABASE IF EXISTS e2e_eos_xa").await.unwrap();
+    mysql_exec("DROP DATABASE IF EXISTS e2e_eos_src")
+        .await
+        .unwrap();
+    mysql_exec("DROP DATABASE IF EXISTS e2e_eos_xa")
+        .await
+        .unwrap();
     mysql_exec("CREATE DATABASE e2e_eos_src").await.unwrap();
     mysql_exec("CREATE DATABASE e2e_eos_xa").await.unwrap();
     for db in ["e2e_eos_src", "e2e_eos_xa"] {
@@ -559,28 +578,44 @@ pipelines:
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    let runner = JobRunner::start(&binary, &job_path, "e2e-eos-xa", &state_dir, &dir.join("final.log"));
+    let runner = JobRunner::start(
+        &binary,
+        &job_path,
+        "e2e-eos-xa",
+        &state_dir,
+        &dir.join("final.log"),
+    );
     tokio::time::sleep(Duration::from_millis(1500)).await;
     insert_rows("e2e_eos_src", &mut seq, TOTAL, 1).await;
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let status = runner.graceful_stop().await.unwrap();
-    assert!(status.success(), "graceful stop failed: {:?}", status.code());
+    assert!(
+        status.success(),
+        "graceful stop failed: {:?}",
+        status.code()
+    );
 
     // Strict exactly-once: every seq 1..=TOTAL present exactly once.
-    let count = mysql_scalar("SELECT COUNT(*) FROM e2e_eos_xa.orders").await.unwrap();
+    let count = mysql_scalar("SELECT COUNT(*) FROM e2e_eos_xa.orders")
+        .await
+        .unwrap();
     let distinct = mysql_scalar("SELECT COUNT(DISTINCT seq) FROM e2e_eos_xa.orders")
         .await
         .unwrap();
-    let max_seq = mysql_scalar("SELECT MAX(seq) FROM e2e_eos_xa.orders").await.unwrap();
+    let max_seq = mysql_scalar("SELECT MAX(seq) FROM e2e_eos_xa.orders")
+        .await
+        .unwrap();
     assert_eq!(count, TOTAL, "row count must match total");
     assert_eq!(distinct, TOTAL, "every seq exactly once");
     assert_eq!(max_seq, TOTAL, "highest seq must be present");
 
     // No prepared xid may survive a completed run.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let prepared = mysql_scalar("SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_state = 'PREPARED'")
-        .await
-        .unwrap_or(0);
+    let prepared = mysql_scalar(
+        "SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_state = 'PREPARED'",
+    )
+    .await
+    .unwrap_or(0);
     assert_eq!(prepared, 0, "prepared XA transactions left behind");
     let _ = std::fs::remove_dir_all(&dir);
 }

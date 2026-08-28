@@ -214,11 +214,13 @@ mod tests {
     #[test]
     fn test_is_numeric() {
         assert!(ColumnType::Int32.is_numeric());
-        assert!(ColumnType::Decimal {
-            precision: 10,
-            scale: 2
-        }
-        .is_numeric());
+        assert!(
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+            .is_numeric()
+        );
         assert!(!ColumnType::String.is_numeric());
         assert!(!ColumnType::Bool.is_numeric());
     }

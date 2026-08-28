@@ -108,7 +108,11 @@ impl MySqlDialect {
             ColumnType::Float32 => "FLOAT".to_string(),
             ColumnType::Float64 => "DOUBLE".to_string(),
             ColumnType::Decimal { precision, scale } => {
-                format!("DECIMAL({},{})", (*precision).clamp(1, 65), (*scale).clamp(0, 30))
+                format!(
+                    "DECIMAL({},{})",
+                    (*precision).clamp(1, 65),
+                    (*scale).clamp(0, 30)
+                )
             }
             // Indexed/PK columns cannot be TEXT in MySQL; use VARCHAR.
             ColumnType::String => {
@@ -273,7 +277,11 @@ impl PostgresDialect {
             ColumnType::Float32 => "REAL".to_string(),
             ColumnType::Float64 => "DOUBLE PRECISION".to_string(),
             ColumnType::Decimal { precision, scale } => {
-                format!("NUMERIC({},{})", (*precision).clamp(1, 255), (*scale).clamp(0, 127))
+                format!(
+                    "NUMERIC({},{})",
+                    (*precision).clamp(1, 255),
+                    (*scale).clamp(0, 127)
+                )
             }
             ColumnType::String => "TEXT".to_string(),
             ColumnType::Bytes => "BYTEA".to_string(),
@@ -511,7 +519,10 @@ mod tests {
         );
 
         let drop = MySqlDialect.build_drop_column("users", "rating");
-        assert_eq!(drop, vec!["ALTER TABLE `users` DROP COLUMN `rating`".to_string()]);
+        assert_eq!(
+            drop,
+            vec!["ALTER TABLE `users` DROP COLUMN `rating`".to_string()]
+        );
     }
 
     #[test]
@@ -526,10 +537,13 @@ mod tests {
     fn test_postgres_alter_statements() {
         let modify = PostgresDialect.build_modify_column(
             "users",
-            &ColumnDef::new("score", ColumnType::Decimal {
-                precision: 10,
-                scale: 2,
-            }),
+            &ColumnDef::new(
+                "score",
+                ColumnType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
         );
         assert_eq!(
             modify,
@@ -539,9 +553,15 @@ mod tests {
             ]
         );
 
-        let add = PostgresDialect.build_add_column("users", &ColumnDef::new("tags", ColumnType::Array {
-            element_type: Box::new(ColumnType::String),
-        }));
+        let add = PostgresDialect.build_add_column(
+            "users",
+            &ColumnDef::new(
+                "tags",
+                ColumnType::Array {
+                    element_type: Box::new(ColumnType::String),
+                },
+            ),
+        );
         assert_eq!(
             add,
             vec!["ALTER TABLE \"users\" ADD COLUMN \"tags\" TEXT[]".to_string()]
@@ -557,7 +577,8 @@ mod tests {
         let sql = MySqlDialect.build_create_table(&schema);
         assert!(sql.starts_with("CREATE TABLE `db`.`users` ("));
 
-        let alter = MySqlDialect.build_add_column("db.users", &ColumnDef::new("c", ColumnType::String));
+        let alter =
+            MySqlDialect.build_add_column("db.users", &ColumnDef::new("c", ColumnType::String));
         assert_eq!(
             alter,
             vec!["ALTER TABLE `db`.`users` ADD COLUMN `c` TEXT".to_string()]

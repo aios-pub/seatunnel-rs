@@ -169,7 +169,9 @@ impl RedisConfig {
                 .unwrap_or(RedisDataType::String),
             as_text: format.eq_ignore_ascii_case("text"),
             field_delimiter: config.get_string("field-delimiter", ","),
-            batch_size: config.get_int("batch-size", config.get_int("batch.size", 10)).max(1) as usize,
+            batch_size: config
+                .get_int("batch-size", config.get_int("batch.size", 10))
+                .max(1) as usize,
             expire: config.get_int("expire", -1),
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
@@ -229,8 +231,8 @@ impl RedisConn {
                 // redis:// scheme does not carry the DB index when auth is
                 // present in some server versions; select explicitly after.
                 url = url.replace(&format!("/{}", config.db_num), "");
-                let client = redis::Client::open(url)
-                    .map_err(|e| anyhow::anyhow!("redis client: {}", e))?;
+                let client =
+                    redis::Client::open(url).map_err(|e| anyhow::anyhow!("redis client: {}", e))?;
                 let mut conn: redis::aio::ConnectionManager = client
                     .get_connection_manager()
                     .await
@@ -331,7 +333,14 @@ impl RedisSourceReader {
             return Ok(false);
         };
         let (next_cursor, keys): (u64, Vec<String>) = conn
-            .exec(redis::cmd("SCAN").cursor_arg(self.scan_cursor.unwrap_or(0)).arg("MATCH").arg(&self.config.keys_pattern).arg("COUNT").arg(self.config.batch_size))
+            .exec(
+                redis::cmd("SCAN")
+                    .cursor_arg(self.scan_cursor.unwrap_or(0))
+                    .arg("MATCH")
+                    .arg(&self.config.keys_pattern)
+                    .arg("COUNT")
+                    .arg(self.config.batch_size),
+            )
             .await?;
         self.scanned_keys = keys;
         self.key_index = 0;
@@ -386,8 +395,7 @@ impl RedisSourceReader {
                 }
             }
             "set" => {
-                let mut members: Vec<String> =
-                    conn.exec(redis::cmd("SMEMBERS").arg(&key)).await?;
+                let mut members: Vec<String> = conn.exec(redis::cmd("SMEMBERS").arg(&key)).await?;
                 members.sort();
                 for m in members {
                     rows.push(row_of(&[Field::String(key.clone()), Field::String(m)]));
@@ -395,7 +403,13 @@ impl RedisSourceReader {
             }
             "zset" => {
                 let pairs: Vec<(String, f64)> = conn
-                    .exec(redis::cmd("ZRANGE").arg(&key).arg(0).arg(-1).arg("WITHSCORES"))
+                    .exec(
+                        redis::cmd("ZRANGE")
+                            .arg(&key)
+                            .arg(0)
+                            .arg(-1)
+                            .arg("WITHSCORES"),
+                    )
                     .await?;
                 for (m, score) in pairs {
                     rows.push(row_of(&[
@@ -523,7 +537,9 @@ impl Source for RedisSource {
 
     fn enumerate_splits(
         &self,
-        _context: &seatunnel_api::source::source_split_enum::SourceSplitEnumeratorContext<Self::Split>,
+        _context: &seatunnel_api::source::source_split_enum::SourceSplitEnumeratorContext<
+            Self::Split,
+        >,
     ) -> anyhow::Result<Vec<Self::Split>> {
         // The reader scans inline; no pre-computed splits.
         Ok(Vec::new())
@@ -571,7 +587,10 @@ fn resolve_template(template: &str, row: &Row) -> String {
 /// configured field).
 fn serialize_value(config: &RedisConfig, row: &Row) -> String {
     if let Some(field) = &config.value_field {
-        if let Some(ordinal) = field.strip_prefix('f').and_then(|n| n.parse::<usize>().ok()) {
+        if let Some(ordinal) = field
+            .strip_prefix('f')
+            .and_then(|n| n.parse::<usize>().ok())
+        {
             return match row.fields.get(ordinal) {
                 Some(Field::String(s)) => s.clone(),
                 Some(Field::Null) | None => String::new(),
@@ -590,13 +609,8 @@ fn serialize_value(config: &RedisConfig, row: &Row) -> String {
             .collect::<Vec<_>>()
             .join(&config.field_delimiter)
     } else {
-        serde_json::to_string(
-            &row.fields
-                .iter()
-                .map(field_to_json)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_default()
+        serde_json::to_string(&row.fields.iter().map(field_to_json).collect::<Vec<_>>())
+            .unwrap_or_default()
     }
 }
 
@@ -612,8 +626,12 @@ fn field_to_json(field: &Field) -> serde_json::Value {
         Field::UInt16(v) => (*v as u64).into(),
         Field::UInt32(v) => (*v as u64).into(),
         Field::UInt64(v) => (*v).into(),
-        Field::Float32(v) => serde_json::Number::from_f64(*v as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
-        Field::Float64(v) => serde_json::Number::from_f64(*v).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+        Field::Float32(v) => serde_json::Number::from_f64(*v as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Field::Float64(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Field::String(s) => serde_json::Value::String(s.clone()),
         Field::Bytes(b) => serde_json::Value::String(hex::encode(b)),
         Field::Decimal(d) => serde_json::Value::String(d.to_string()),
@@ -683,26 +701,24 @@ impl RedisSinkWriter {
                         pipe.expire(&key, config.expire);
                     }
                 }
-                RowKind::Delete => {
-                    match config.data_type {
-                        RedisDataType::String => {
-                            pipe.del(&key);
-                        }
-                        RedisDataType::Hash => {
-                            let field = resolve_template(&config.hash_field_template, row);
-                            pipe.hdel(&key, field);
-                        }
-                        RedisDataType::List => {
-                            pipe.lrem(&key, 1, value);
-                        }
-                        RedisDataType::Set => {
-                            pipe.srem(&key, value);
-                        }
-                        RedisDataType::ZSet => {
-                            pipe.zrem(&key, value);
-                        }
+                RowKind::Delete => match config.data_type {
+                    RedisDataType::String => {
+                        pipe.del(&key);
                     }
-                }
+                    RedisDataType::Hash => {
+                        let field = resolve_template(&config.hash_field_template, row);
+                        pipe.hdel(&key, field);
+                    }
+                    RedisDataType::List => {
+                        pipe.lrem(&key, 1, value);
+                    }
+                    RedisDataType::Set => {
+                        pipe.srem(&key, value);
+                    }
+                    RedisDataType::ZSet => {
+                        pipe.zrem(&key, value);
+                    }
+                },
             }
         }
         let written = rows.len() as u64;
@@ -760,7 +776,9 @@ impl SinkWriter for RedisSinkWriter {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let written = self.written;
         Box::pin(async move {
-            Ok(serde_json::to_vec(&serde_json::json!({ "written": written }))?)
+            Ok(serde_json::to_vec(
+                &serde_json::json!({ "written": written }),
+            )?)
         })
     }
 
@@ -804,7 +822,13 @@ impl Sink for RedisSink {
         &self,
         _ctx: &SinkWriterContext,
     ) -> anyhow::Result<
-        Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>,
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
     > {
         Ok(Box::new(RedisSinkWriter::new(self.config.clone())))
     }
@@ -814,7 +838,13 @@ impl Sink for RedisSink {
         _ctx: &SinkWriterContext,
         _states: &[Vec<u8>],
     ) -> anyhow::Result<
-        Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>,
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
     > {
         Ok(Box::new(RedisSinkWriter::new(self.config.clone())))
     }
@@ -828,9 +858,9 @@ impl Sink for RedisSink {
     ) -> Option<
         Box<
             dyn seatunnel_api::sink::SinkCommitter<
-                CommitInfo = Self::CommitInfo,
-                AggregatedCommitInfo = Self::AggregatedCommitInfo,
-            >,
+                    CommitInfo = Self::CommitInfo,
+                    AggregatedCommitInfo = Self::AggregatedCommitInfo,
+                >,
         >,
     > {
         None
@@ -847,7 +877,10 @@ mod tests {
 
     #[test]
     fn test_data_type_parsing() {
-        assert_eq!(RedisDataType::parse("string").unwrap(), RedisDataType::String);
+        assert_eq!(
+            RedisDataType::parse("string").unwrap(),
+            RedisDataType::String
+        );
         assert_eq!(RedisDataType::parse("HASH").unwrap(), RedisDataType::Hash);
         assert_eq!(RedisDataType::parse("zset").unwrap(), RedisDataType::ZSet);
         assert!(RedisDataType::parse("bogus").is_err());
@@ -871,7 +904,11 @@ mod tests {
             field_delimiter: "|".into(),
             ..Default::default()
         };
-        let r = row(vec![Field::Int64(1), Field::String("a".into()), Field::Null]);
+        let r = row(vec![
+            Field::Int64(1),
+            Field::String("a".into()),
+            Field::Null,
+        ]);
         assert_eq!(serialize_value(&config, &r), "1|a|");
 
         let config = RedisConfig::default();

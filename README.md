@@ -140,10 +140,31 @@ source (e.g. disjoint MySQL id ranges) across subtasks distributed over workers.
 | Redis | Source/Sink | Key/scan reads, value-type writes |
 | Console | Sink | JSON lines to stdout (local runs / smoke tests) |
 
+## Web Console
+
+`seatunnel-web` serves a browser-based management console (embedded Leptos
+WASM UI + REST API + Prometheus `/metrics`) for a running cluster:
+
+```bash
+seatunnel-web --master 127.0.0.1:5800 --listen 0.0.0.0:8080
+```
+
+It supports job listing/detail/submit/cancel, checkpoint history, cluster
+worker views and health monitoring, behind a configurable username/password
+login (`--auth-user`, `--auth-password` / `SEATUNNEL_WEB_PASSWORD`).
+For a one-command local demo (master + worker + console + streaming job):
+
+```bash
+./scripts/web-demo.sh   # console at http://127.0.0.1:8080, Ctrl+C cleans up
+```
+
+See [Web UI docs](docs/en/web-ui.md).
+
 ## Documentation
 
 - [Quick Start](docs/en/quickstart.md)
 - [Architecture](docs/en/architecture.md)
+- [Web Console](docs/en/web-ui.md)
 - [Kafka Connector](docs/en/connectors/kafka.md)
 
 ## License

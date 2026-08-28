@@ -86,22 +86,12 @@ pub fn field_to_sql_value(field: &Field) -> SqlValue {
         // Durations are stored as nanosecond counts.
         Field::Duration(ns) => SqlValue::Int(*ns),
         Field::Array(items) => SqlValue::Str(
-            serde_json::to_string(
-                &items
-                    .iter()
-                    .map(field_to_json_scalar)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_default(),
+            serde_json::to_string(&items.iter().map(field_to_json_scalar).collect::<Vec<_>>())
+                .unwrap_or_default(),
         ),
         Field::Row(fields) => SqlValue::Str(
-            serde_json::to_string(
-                &fields
-                    .iter()
-                    .map(field_to_json_scalar)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_default(),
+            serde_json::to_string(&fields.iter().map(field_to_json_scalar).collect::<Vec<_>>())
+                .unwrap_or_default(),
         ),
     }
 }
@@ -165,16 +155,46 @@ pub fn parse_text_to_field(s: &str, column_type: &ColumnType) -> Field {
             "false" | "f" | "0" | "no" => Field::Bool(false),
             _ => Field::String(s.to_string()),
         },
-        Int8 => s.parse::<i8>().map(Field::Int8).unwrap_or(Field::String(s.to_string())),
-        Int16 => s.parse::<i16>().map(Field::Int16).unwrap_or(Field::String(s.to_string())),
-        Int32 => s.parse::<i32>().map(Field::Int32).unwrap_or(Field::String(s.to_string())),
-        Int64 => s.parse::<i64>().map(Field::Int64).unwrap_or(Field::String(s.to_string())),
-        UInt8 => s.parse::<u8>().map(Field::UInt8).unwrap_or(Field::String(s.to_string())),
-        UInt16 => s.parse::<u16>().map(Field::UInt16).unwrap_or(Field::String(s.to_string())),
-        UInt32 => s.parse::<u32>().map(Field::UInt32).unwrap_or(Field::String(s.to_string())),
-        UInt64 => s.parse::<u64>().map(Field::UInt64).unwrap_or(Field::String(s.to_string())),
-        Float32 => s.parse::<f32>().map(Field::Float32).unwrap_or(Field::String(s.to_string())),
-        Float64 => s.parse::<f64>().map(Field::Float64).unwrap_or(Field::String(s.to_string())),
+        Int8 => s
+            .parse::<i8>()
+            .map(Field::Int8)
+            .unwrap_or(Field::String(s.to_string())),
+        Int16 => s
+            .parse::<i16>()
+            .map(Field::Int16)
+            .unwrap_or(Field::String(s.to_string())),
+        Int32 => s
+            .parse::<i32>()
+            .map(Field::Int32)
+            .unwrap_or(Field::String(s.to_string())),
+        Int64 => s
+            .parse::<i64>()
+            .map(Field::Int64)
+            .unwrap_or(Field::String(s.to_string())),
+        UInt8 => s
+            .parse::<u8>()
+            .map(Field::UInt8)
+            .unwrap_or(Field::String(s.to_string())),
+        UInt16 => s
+            .parse::<u16>()
+            .map(Field::UInt16)
+            .unwrap_or(Field::String(s.to_string())),
+        UInt32 => s
+            .parse::<u32>()
+            .map(Field::UInt32)
+            .unwrap_or(Field::String(s.to_string())),
+        UInt64 => s
+            .parse::<u64>()
+            .map(Field::UInt64)
+            .unwrap_or(Field::String(s.to_string())),
+        Float32 => s
+            .parse::<f32>()
+            .map(Field::Float32)
+            .unwrap_or(Field::String(s.to_string())),
+        Float64 => s
+            .parse::<f64>()
+            .map(Field::Float64)
+            .unwrap_or(Field::String(s.to_string())),
         Decimal { .. } => s
             .parse::<bigdecimal::BigDecimal>()
             .map(Field::Decimal)
@@ -299,7 +319,8 @@ pub fn mysql_value_to_sql(value: &mysql_async::Value) -> SqlValue {
             }
         }
         mysql_async::Value::Time(neg, d, h, m, s, us) => {
-            let total_secs = (*d as u64) * 86_400 + (*h as u64) * 3_600 + (*m as u64) * 60 + *s as u64;
+            let total_secs =
+                (*d as u64) * 86_400 + (*h as u64) * 3_600 + (*m as u64) * 60 + *s as u64;
             if *neg {
                 // Negative durations are stored as nanosecond counts.
                 SqlValue::Int(-(total_secs as i64) * 1_000_000_000 - (*us as i64) * 1_000)
@@ -346,7 +367,13 @@ mod tests {
             Field::Json(_)
         ));
         assert!(matches!(
-            parse_text_to_field("3.14", &ColumnType::Decimal { precision: 10, scale: 2 }),
+            parse_text_to_field(
+                "3.14",
+                &ColumnType::Decimal {
+                    precision: 10,
+                    scale: 2
+                }
+            ),
             Field::Decimal(_)
         ));
     }

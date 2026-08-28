@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 
-use tonic::transport::Channel;
 use tonic::Streaming;
+use tonic::transport::Channel;
 
 use crate::kvproto::cdcpb::change_data_client::ChangeDataClient;
 use crate::kvproto::cdcpb::change_data_request::KvApi;
@@ -195,7 +195,10 @@ impl RegionCdcStream {
                 ))
             }
             None => {
-                tracing::warn!("TiKV CDC: reader task stopped for region {}", self.region_id);
+                tracing::warn!(
+                    "TiKV CDC: reader task stopped for region {}",
+                    self.region_id
+                );
                 Ok(None)
             }
         }

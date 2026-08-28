@@ -58,16 +58,16 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use postgres_types::Type;
 use rustcdc::core::Operation;
-use rustcdc::source::postgres::{PostgresConnection, PostgresSourceConfig};
 use rustcdc::source::Source as _;
 use rustcdc::source::StreamHandle;
+use rustcdc::source::postgres::{PostgresConnection, PostgresSourceConfig};
 use seatunnel_api::row::{Field, Row, RowKind};
 use seatunnel_api::schema::TableSchema;
 use seatunnel_api::source::{
+    Boundedness, Source,
     source_reader::{PollResult, SourceReader, SourceReaderContext},
     source_split::SourceSplit,
     source_split_enum::SourceSplitEnumeratorContext,
-    Boundedness, Source,
 };
 use seatunnel_connector_cdc_base::{CdcPhase, IncrementalSplit, SnapshotSplit, Watermark};
 use seatunnel_connector_common::ConnectorConfig;
@@ -222,7 +222,6 @@ pub enum PostgresStartupMode {
     },
 }
 
-
 // ---------------------------------------------------------------------------
 // Table selection (official option set)
 // ---------------------------------------------------------------------------
@@ -255,17 +254,20 @@ impl PgTableMatcher {
                 return true;
             }
         }
-        if self.exact.iter().any(|(q, t)| {
-            t == table
-                && q.as_ref().is_none_or(|q| q == schema || q == database)
-        }) {
+        if self
+            .exact
+            .iter()
+            .any(|(q, t)| t == table && q.as_ref().is_none_or(|q| q == schema || q == database))
+        {
             return true;
         }
         let qualified = [
             format!("{}.{}", schema, table),
             format!("{}.{}", database, table),
         ];
-        self.patterns.iter().any(|re| qualified.iter().any(|q| re.is_match(q)))
+        self.patterns
+            .iter()
+            .any(|re| qualified.iter().any(|q| re.is_match(q)))
     }
 
     pub fn is_multi(&self) -> bool {
@@ -383,8 +385,13 @@ impl PostgresCdcConfig {
 
         // database-names: the reader connects to a single database; extra
         // entries are validated against it.
-        let database_names = config.get_string("database-names", &config.get_string("database_names", ""));
-        for name in database_names.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        let database_names =
+            config.get_string("database-names", &config.get_string("database_names", ""));
+        for name in database_names
+            .split(',')
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
             if name != config.get_string("database-name", &url_db) {
                 tracing::warn!(
                     "PostgreSQL CDC: database-names entry '{}' ignored — this reader \
@@ -398,25 +405,29 @@ impl PostgresCdcConfig {
         let mut matcher = PgTableMatcher::default();
         // table-names: db.table / schema.table / db.schema.table entries.
         let table_names = config.get_string("table-names", &config.get_string("table_names", ""));
-        for qualified in table_names.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        for qualified in table_names
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             let parts: Vec<&str> = qualified.split('.').collect();
             match parts.as_slice() {
                 [table] => matcher.exact.push((None, table.to_string())),
-                [qualifier, table] => {
-                    matcher
-                        .exact
-                        .push((Some(qualifier.to_string()), table.to_string()))
-                }
-                [_, schema, table] => {
-                    matcher
-                        .exact
-                        .push((Some(schema.to_string()), table.to_string()))
-                }
-                _ => tracing::warn!("PostgreSQL CDC: unparseable table-names entry '{}'", qualified),
+                [qualifier, table] => matcher
+                    .exact
+                    .push((Some(qualifier.to_string()), table.to_string())),
+                [_, schema, table] => matcher
+                    .exact
+                    .push((Some(schema.to_string()), table.to_string())),
+                _ => tracing::warn!(
+                    "PostgreSQL CDC: unparseable table-names entry '{}'",
+                    qualified
+                ),
             }
         }
         // table-pattern: regex over schema.table / database.table.
-        let table_pattern = config.get_string("table-pattern", &config.get_string("table_pattern", ""));
+        let table_pattern =
+            config.get_string("table-pattern", &config.get_string("table_pattern", ""));
         if !table_pattern.is_empty() {
             match regex::Regex::new(&table_pattern) {
                 Ok(re) => matcher.patterns.push(re),
@@ -433,17 +444,31 @@ impl PostgresCdcConfig {
         PostgresCdcConfig {
             hostname: {
                 let v = config.get_string("hostname", &url_host);
-                if v.is_empty() { "localhost".to_string() } else { v }
+                if v.is_empty() {
+                    "localhost".to_string()
+                } else {
+                    v
+                }
             },
             port: {
                 let p = config.get_int("port", -1);
-                if p > 0 { p as u16 } else if url_port > 0 { url_port } else { 5432 }
+                if p > 0 {
+                    p as u16
+                } else if url_port > 0 {
+                    url_port
+                } else {
+                    5432
+                }
             },
             username: config.get_string("username", "postgres"),
             password: config.get_string("password", ""),
             database_name: {
                 let v = config.get_string("database-name", &url_db);
-                if v.is_empty() { "seatunnel".to_string() } else { v }
+                if v.is_empty() {
+                    "seatunnel".to_string()
+                } else {
+                    v
+                }
             },
             schema_name: config.get_string("schema-name", "public"),
             table_name: config.get_string("table-name", "users"),
@@ -451,7 +476,10 @@ impl PostgresCdcConfig {
             publication_name: config.get_string("publication-name", "seatunnel_pub"),
             slot_name: config.get_string(
                 "slot.name",
-                &config.get_string("slot-name", &config.get_string("slot_name", "seatunnel_slot")),
+                &config.get_string(
+                    "slot-name",
+                    &config.get_string("slot_name", "seatunnel_slot"),
+                ),
             ),
             auto_create_slot: config.get_bool("auto-create-slot", true),
             startup_mode: config
@@ -466,14 +494,22 @@ impl PostgresCdcConfig {
                 .unwrap_or(PostgresStartupMode::Initial),
             parallelism: config.get_int("parallelism", 4) as usize,
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
-            schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::from_config(config),
+            schema_evolution: seatunnel_connector_cdc_base::SchemaEvolutionConfig::from_config(
+                config,
+            ),
             subtask_count: config.get_int("subtask.count", 1).max(1) as usize,
             decoding_plugin,
             snapshot_split_size: config
-                .get_int("snapshot.split.size", config.get_int("snapshot_split_size", 8096))
+                .get_int(
+                    "snapshot.split.size",
+                    config.get_int("snapshot_split_size", 8096),
+                )
                 .max(1),
             snapshot_fetch_size: config
-                .get_int("snapshot.fetch.size", config.get_int("snapshot_fetch_size", 1024))
+                .get_int(
+                    "snapshot.fetch.size",
+                    config.get_int("snapshot_fetch_size", 1024),
+                )
                 .max(1),
             table_matcher: matcher,
             compat_warnings: seatunnel_connector_cdc_base::compatibility_warnings(config),
@@ -628,9 +664,9 @@ impl Source for PostgresCdcSource {
             let config = self.config.clone();
             let schema = self.config.schema_name.clone();
             let table = self.config.table_name.clone();
-            tokio_block_on(async move {
-                enumerate_snapshot_ranges(&config, &schema, &table).await
-            })?
+            tokio_block_on(
+                async move { enumerate_snapshot_ranges(&config, &schema, &table).await },
+            )?
         };
         Ok(ranges
             .into_iter()
@@ -696,9 +732,7 @@ async fn enumerate_snapshot_ranges(
         // Cast to bigint: MIN/MAX over an int4 column would otherwise return
         // int4 and tokio_postgres refuses cross-type reads.
         "SELECT MIN(\"{}\")::bigint, MAX(\"{}\")::bigint FROM {}",
-        config.split_column,
-        config.split_column,
-        table_ref
+        config.split_column, config.split_column, table_ref
     );
     let row = client
         .query_one(&sql, &[])
@@ -753,9 +787,7 @@ async fn enumerate_snapshot_ranges(
 
 /// Resolve concrete (schema, table) pairs matching the configured
 /// selection via the catalog.
-async fn resolve_pg_tables(
-    config: &PostgresCdcConfig,
-) -> anyhow::Result<Vec<(String, String)>> {
+async fn resolve_pg_tables(config: &PostgresCdcConfig) -> anyhow::Result<Vec<(String, String)>> {
     let (client, connection) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -1053,8 +1085,7 @@ impl PostgresCdcReader {
         // Bind the guard clone first: argument temporaries would otherwise
         // live across the await and make the future non-Send.
         let admin = self.admin_client.lock().clone();
-        match fetch_pg_column_defs(admin, &self.config.schema_name, &self.config.table_name).await
-        {
+        match fetch_pg_column_defs(admin, &self.config.schema_name, &self.config.table_name).await {
             Ok(defs) if !defs.is_empty() => watcher.prime(defs),
             Ok(_) => tracing::warn!("PostgreSQL CDC: schema watcher found no columns"),
             Err(e) => tracing::warn!("PostgreSQL CDC: schema watcher priming failed: {}", e),
@@ -1079,11 +1110,12 @@ impl PostgresCdcReader {
         let schema_name = config.schema_name.clone();
         let table_name = config.table_name.clone();
         let admin_fetch = admin.clone();
-        let result = watcher
-            .poll(|| async move {
-                fetch_pg_column_defs(admin_fetch, &schema_name, &table_name).await
-            })
-            .await;
+        let result =
+            watcher
+                .poll(|| async move {
+                    fetch_pg_column_defs(admin_fetch, &schema_name, &table_name).await
+                })
+                .await;
         if let Err(e) = result {
             tracing::debug!("PostgreSQL CDC: schema poll failed: {}", e);
             return None;
@@ -1093,7 +1125,11 @@ impl PostgresCdcReader {
             let sql = format!("SELECT * FROM {} LIMIT 0", config.qualified_table());
             match client.prepare(&sql).await {
                 Ok(stmt) => {
-                    *columns = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+                    *columns = stmt
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect();
                     *column_types = stmt.columns().iter().map(|c| c.type_().clone()).collect();
                 }
                 Err(e) => tracing::warn!("PostgreSQL CDC: column cache refresh failed: {}", e),
@@ -1111,7 +1147,11 @@ impl PostgresCdcReader {
     ) -> anyhow::Result<()> {
         let sql = format!("SELECT * FROM \"{}\".\"{}\" LIMIT 0", schema, table);
         let stmt = client.prepare(&sql).await?;
-        let names: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+        let names: Vec<String> = stmt
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         let types: Vec<Type> = stmt.columns().iter().map(|c| c.type_().clone()).collect();
         if names.is_empty() {
             anyhow::bail!("table {}.{} has no columns", schema, table);
@@ -1120,7 +1160,8 @@ impl PostgresCdcReader {
             self.columns = names.clone();
             self.column_types = types.clone();
         }
-        self.layouts.insert(format!("{}.{}", schema, table), (names, types));
+        self.layouts
+            .insert(format!("{}.{}", schema, table), (names, types));
         Ok(())
     }
 
@@ -1153,8 +1194,8 @@ impl PostgresCdcReader {
     }
 
     fn build_rustcdc_config(&self) -> PostgresSourceConfig {
-        use rustcdc::core::SecretString;
         use rustcdc::TransportConfig;
+        use rustcdc::core::SecretString;
         PostgresSourceConfig {
             host: self.config.hostname.clone(),
             port: self.config.port,
@@ -1211,7 +1252,10 @@ impl PostgresCdcReader {
             return;
         };
         // Multi-table capture: filter by the configured selection.
-        let schema = event.schema.clone().unwrap_or_else(|| self.config.schema_name.clone());
+        let schema = event
+            .schema
+            .clone()
+            .unwrap_or_else(|| self.config.schema_name.clone());
         let table = event.table.clone();
         if !self
             .config
@@ -1364,7 +1408,9 @@ impl SourceReader for PostgresCdcReader {
                         self.pending_ranges.clear();
                     }
                     PostgresStartupMode::Timestamp { .. } => {
-                        tracing::warn!("PostgreSQL CDC: startup.mode=timestamp not supported yet, using initial");
+                        tracing::warn!(
+                            "PostgreSQL CDC: startup.mode=timestamp not supported yet, using initial"
+                        );
                     }
                     PostgresStartupMode::Initial | PostgresStartupMode::SnapshotOnly => {}
                 }
@@ -1388,7 +1434,13 @@ impl SourceReader for PostgresCdcReader {
             if self.phase == CdcPhase::Snapshot && self.pending_ranges.is_empty() {
                 let matched = resolve_pg_tables(&self.config).await?;
                 let (first, rest): (Vec<_>, Vec<_>) = if matched.is_empty() {
-                    (vec![(self.config.schema_name.clone(), self.config.table_name.clone())], vec![])
+                    (
+                        vec![(
+                            self.config.schema_name.clone(),
+                            self.config.table_name.clone(),
+                        )],
+                        vec![],
+                    )
                 } else {
                     (vec![matched[0].clone()], matched[1..].to_vec())
                 };
@@ -1399,15 +1451,15 @@ impl SourceReader for PostgresCdcReader {
                     );
                 }
                 for (schema, table) in &rest {
-                    self.pending_tables.push_back(format!("{}.{}", schema, table));
+                    self.pending_tables
+                        .push_back(format!("{}.{}", schema, table));
                 }
                 if let Some((schema, table)) = first.first() {
                     self.current_table = (schema.clone(), table.clone());
                     if !self.layouts.contains_key(&format!("{}.{}", schema, table)) {
                         self.cache_columns_for(&client, schema, table).await?;
                     }
-                    let ranges =
-                        enumerate_snapshot_ranges(&self.config, schema, table).await?;
+                    let ranges = enumerate_snapshot_ranges(&self.config, schema, table).await?;
                     self.pending_ranges.extend(ranges);
                 }
             }
@@ -1437,10 +1489,8 @@ impl SourceReader for PostgresCdcReader {
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
                 let client = self.connect_admin().await?;
-                let table_ref = format!(
-                    "\"{}\".\"{}\"",
-                    self.current_table.0, self.current_table.1
-                );
+                let table_ref =
+                    format!("\"{}\".\"{}\"", self.current_table.0, self.current_table.1);
                 let sql = format!(
                     "SELECT * FROM {} WHERE \"{}\" >= {} AND \"{}\" < {} AND \"{}\" > {} \
                      ORDER BY \"{}\" ASC LIMIT {}",
@@ -1640,7 +1690,6 @@ fn json_val_to_field(val: &serde_json::Value) -> Field {
         serde_json::Value::Object(_) => Field::String(val.to_string()),
     }
 }
-
 
 /// Fetch table columns from the pg catalog (schema-evolution watcher input).
 async fn fetch_pg_column_defs(
@@ -1842,14 +1891,15 @@ mod tests {
 
         // table-names entries (db.table / db.schema.table) + pattern.
         let cfg = mk(&[("table-names", "inventory.public.orders,analytics.events")]);
-        assert!(cfg
-            .table_matcher
-            .matches("inventory", "public", "orders"));
+        assert!(cfg.table_matcher.matches("inventory", "public", "orders"));
         assert!(cfg.table_matcher.matches("analytics", "public", "events"));
         assert!(!cfg.table_matcher.matches("inventory", "public", "users"));
 
         let cfg = mk(&[("table-pattern", ".*\\.events_.*")]);
-        assert!(cfg.table_matcher.matches("inventory", "public", "events_2026"));
+        assert!(
+            cfg.table_matcher
+                .matches("inventory", "public", "events_2026")
+        );
         assert!(!cfg.table_matcher.matches("inventory", "public", "orders"));
     }
 

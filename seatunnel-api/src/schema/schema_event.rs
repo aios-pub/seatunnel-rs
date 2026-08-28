@@ -226,9 +226,7 @@ impl TableSchema {
             }
             SchemaChange::DropColumn { column_name, .. } => {
                 if self.primary_key.iter().any(|pk| pk == column_name) {
-                    return Err(SchemaChangeError::CannotDropPrimaryKey(
-                        column_name.clone(),
-                    ));
+                    return Err(SchemaChangeError::CannotDropPrimaryKey(column_name.clone()));
                 }
                 let idx = self
                     .column_index(column_name)
@@ -237,15 +235,17 @@ impl TableSchema {
                 Ok(())
             }
             SchemaChange::RenameColumn {
-                old_name,
-                new_name,
-                ..
+                old_name, new_name, ..
             } => {
                 let idx = self
                     .column_index(old_name)
                     .ok_or_else(|| SchemaChangeError::ColumnNotFound(old_name.clone()))?;
                 self.columns[idx].name = new_name.clone();
-                if let Some(pk) = self.primary_key.iter_mut().find(|pk| pk.as_str() == old_name) {
+                if let Some(pk) = self
+                    .primary_key
+                    .iter_mut()
+                    .find(|pk| pk.as_str() == old_name)
+                {
                     *pk = new_name.clone();
                 }
                 Ok(())
@@ -312,7 +312,10 @@ mod tests {
             ColumnType::Float64,
         )))
         .unwrap();
-        assert_eq!(s.get_column("score").unwrap().column_type, ColumnType::Float64);
+        assert_eq!(
+            s.get_column("score").unwrap().column_type,
+            ColumnType::Float64
+        );
 
         s.apply_schema_change(&SchemaChange::drop_column("full_name"))
             .unwrap();
@@ -336,10 +339,13 @@ mod tests {
             "db.t",
             vec![
                 SchemaChange::add_column(ColumnDef::new("c", ColumnType::String).nullable(true)),
-                SchemaChange::modify_column(ColumnDef::new("n", ColumnType::Decimal {
-                    precision: 20,
-                    scale: 4,
-                })),
+                SchemaChange::modify_column(ColumnDef::new(
+                    "n",
+                    ColumnType::Decimal {
+                        precision: 20,
+                        scale: 4,
+                    },
+                )),
             ],
         )
         .with_statement("ALTER TABLE t ADD COLUMN c varchar(64)");

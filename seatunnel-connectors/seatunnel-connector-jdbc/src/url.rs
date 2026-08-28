@@ -62,7 +62,9 @@ pub fn parse_jdbc_url(url: &str) -> anyhow::Result<JdbcUrl> {
         .map(|(_, rest)| rest)
         .unwrap_or(url);
 
-    let (authority, rest) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (authority, rest) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     let database = rest.split('?').next().unwrap_or("").to_string();
 
     let (host, port) = match authority.rsplit_once(':') {
@@ -100,9 +102,18 @@ mod tests {
 
     #[test]
     fn test_detect_dialect() {
-        assert_eq!(detect_dialect("jdbc:mysql://h:3306/db"), JdbcDialectKind::MySql);
-        assert_eq!(detect_dialect("jdbc:mariadb://h:3306/db"), JdbcDialectKind::MySql);
-        assert_eq!(detect_dialect("jdbc:postgresql://h:5432/db"), JdbcDialectKind::Postgres);
+        assert_eq!(
+            detect_dialect("jdbc:mysql://h:3306/db"),
+            JdbcDialectKind::MySql
+        );
+        assert_eq!(
+            detect_dialect("jdbc:mariadb://h:3306/db"),
+            JdbcDialectKind::MySql
+        );
+        assert_eq!(
+            detect_dialect("jdbc:postgresql://h:5432/db"),
+            JdbcDialectKind::Postgres
+        );
         assert_eq!(detect_dialect("postgres://h/db"), JdbcDialectKind::Postgres);
     }
 
@@ -132,8 +143,14 @@ mod tests {
 
     #[test]
     fn test_split_table_name() {
-        assert_eq!(split_table_name("db.users"), (Some("db".into()), "users".into()));
-        assert_eq!(split_table_name("public.users"), (Some("public".into()), "users".into()));
+        assert_eq!(
+            split_table_name("db.users"),
+            (Some("db".into()), "users".into())
+        );
+        assert_eq!(
+            split_table_name("public.users"),
+            (Some("public".into()), "users".into())
+        );
         assert_eq!(split_table_name("users"), (None, "users".into()));
     }
 }

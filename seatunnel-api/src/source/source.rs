@@ -53,9 +53,9 @@ pub trait Source: Send + Sync {
     ) -> anyhow::Result<
         Box<
             dyn crate::source::source_reader::SourceReader<
-                Output = Self::Output,
-                Split = Self::Split,
-            >,
+                    Output = Self::Output,
+                    Split = Self::Split,
+                >,
         >,
     >;
 
@@ -67,9 +67,9 @@ pub trait Source: Send + Sync {
     ) -> anyhow::Result<
         Box<
             dyn crate::source::source_reader::SourceReader<
-                Output = Self::Output,
-                Split = Self::Split,
-            >,
+                    Output = Self::Output,
+                    Split = Self::Split,
+                >,
         >,
     >;
 

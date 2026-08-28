@@ -16,11 +16,11 @@ use tokio::time::sleep;
 
 use crate::cdc_client::{CdcClient, RegionCdcStream};
 use crate::decoder::{
-    decode_record_key, decode_row_value_with_schema, encode_comparable, ColumnValue, RowColType,
-    TransactionTracker,
+    ColumnValue, RowColType, TransactionTracker, decode_record_key, decode_row_value_with_schema,
+    encode_comparable,
 };
-use crate::kvproto::cdcpb::event::{Event as CdcEvent, Row as CdcRow};
 use crate::kvproto::cdcpb::ChangeDataEvent;
+use crate::kvproto::cdcpb::event::{Event as CdcEvent, Row as CdcRow};
 use crate::kvproto::metapb::RegionEpoch;
 use crate::pd_client::{PdClient, RegionInfo};
 
@@ -336,7 +336,11 @@ impl CdcEngine {
                     // the periodic refresh will drop it.
                 }
                 Err(e) => {
-                    tracing::debug!("TiKV CDC: region {} metadata refresh failed: {}", region_id, e);
+                    tracing::debug!(
+                        "TiKV CDC: region {} metadata refresh failed: {}",
+                        region_id,
+                        e
+                    );
                 }
             }
         }

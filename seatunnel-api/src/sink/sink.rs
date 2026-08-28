@@ -61,9 +61,9 @@ pub trait Sink: Send + Sync {
     ) -> Option<
         Box<
             dyn SinkCommitter<
-                CommitInfo = Self::CommitInfo,
-                AggregatedCommitInfo = Self::AggregatedCommitInfo,
-            >,
+                    CommitInfo = Self::CommitInfo,
+                    AggregatedCommitInfo = Self::AggregatedCommitInfo,
+                >,
         >,
     >;
 }

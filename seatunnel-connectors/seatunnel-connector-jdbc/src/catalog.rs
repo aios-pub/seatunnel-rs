@@ -22,7 +22,7 @@ use seatunnel_api::schema::{ColumnDef, TableSchema};
 
 use crate::conn::{DbEndpoint, QueryResult};
 use crate::dialect::JdbcDialectKind;
-use crate::url::{split_table_name, JdbcUrl};
+use crate::url::{JdbcUrl, split_table_name};
 use crate::value::SqlValue;
 
 /// Discover columns of `table` (optionally `namespace.table`) on the endpoint.
@@ -62,7 +62,10 @@ async fn discover_mysql(
              FROM information_schema.columns \
              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
              ORDER BY ORDINAL_POSITION",
-            &[SqlValue::Str(database.to_string()), SqlValue::Str(table.to_string())],
+            &[
+                SqlValue::Str(database.to_string()),
+                SqlValue::Str(table.to_string()),
+            ],
         )
         .await?;
 
@@ -78,8 +81,7 @@ async fn discover_mysql(
         let nullable = text_of(row.get(2).unwrap_or(&SqlValue::Null))
             .map(|s| s == "YES")
             .unwrap_or(true);
-        let column_key =
-            text_of(row.get(3).unwrap_or(&SqlValue::Null)).unwrap_or_default();
+        let column_key = text_of(row.get(3).unwrap_or(&SqlValue::Null)).unwrap_or_default();
         let length = row.get(4).and_then(|v| match v {
             SqlValue::Int(n) => Some(*n as u32),
             SqlValue::Str(s) => s.parse().ok(),
@@ -207,7 +209,11 @@ pub async fn table_exists(
 }
 
 /// Count rows (used for split sizing).
-pub async fn count_rows(endpoint: &DbEndpoint, dialect: JdbcDialectKind, table: &str) -> anyhow::Result<u64> {
+pub async fn count_rows(
+    endpoint: &DbEndpoint,
+    dialect: JdbcDialectKind,
+    table: &str,
+) -> anyhow::Result<u64> {
     let quoted = dialect.quote_table(table);
     let result = endpoint
         .query(&format!("SELECT COUNT(*) FROM {}", quoted), &[])

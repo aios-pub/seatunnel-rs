@@ -72,7 +72,6 @@ pub struct TableFields {
     pub update: HashMap<String, String>,
 }
 
-
 /// Timezone used to interpret naive datetime strings (`yyyy-MM-dd
 /// HH:mm:ss`), mirroring Java `SimpleDateFormat` with the JVM default
 /// timezone: the default is the SERVER's local timezone.
@@ -202,9 +201,7 @@ pub fn is_java_number(value: &str) -> bool {
     if value == "0" {
         return true;
     }
-    !value.is_empty()
-        && !value.starts_with('0')
-        && value.bytes().all(|b| b.is_ascii_digit())
+    !value.is_empty() && !value.starts_with('0') && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Java `isValidDate` + conversion: strict `yyyy-MM-dd HH:mm:ss` parse
@@ -230,8 +227,12 @@ pub fn convert_field(tz: &ServerTz, field: &Field) -> Value {
         Field::UInt16(v) => (*v as u64).into(),
         Field::UInt32(v) => (*v as u64).into(),
         Field::UInt64(v) => (*v).into(),
-        Field::Float32(v) => Number::from_f64(*v as f64).map(Value::Number).unwrap_or(Value::Null),
-        Field::Float64(v) => Number::from_f64(*v).map(Value::Number).unwrap_or(Value::Null),
+        Field::Float32(v) => Number::from_f64(*v as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        Field::Float64(v) => Number::from_f64(*v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         Field::Decimal(d) => Value::String(d.to_string()),
         Field::String(s) => convert_string(tz, s),
         Field::Date(d) => NaiveDateTime::parse_from_str(
@@ -251,12 +252,8 @@ pub fn convert_field(tz: &ServerTz, field: &Field) -> Value {
         Field::Duration(ns) => (*ns).into(),
         Field::Bytes(b) => Value::String(hex::encode(b)),
         Field::Json(j) => j.clone(),
-        Field::Array(items) => Value::Array(
-            items.iter().map(|f| convert_field(tz, f)).collect(),
-        ),
-        Field::Row(fields) => Value::Array(
-            fields.iter().map(|f| convert_field(tz, f)).collect(),
-        ),
+        Field::Array(items) => Value::Array(items.iter().map(|f| convert_field(tz, f)).collect()),
+        Field::Row(fields) => Value::Array(fields.iter().map(|f| convert_field(tz, f)).collect()),
     }
 }
 
@@ -304,16 +301,12 @@ impl CanalClientEncoder {
     pub fn new(config: CanalClientConfig) -> anyhow::Result<Self> {
         let tz_string = config.server_time_zone.clone();
         let camel = camel_case_name(&config.table_name);
-        let fields = config
-            .tables
-            .get(&camel)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "canal-client config has no field mapping for table '{}'",
-                    camel
-                )
-            })?;
+        let fields = config.tables.get(&camel).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "canal-client config has no field mapping for table '{}'",
+                camel
+            )
+        })?;
         let column_positions: HashMap<String, usize> = config
             .columns
             .iter()
@@ -373,7 +366,8 @@ impl CanalClientEncoder {
         }
         for (col, target) in &self.fields.update {
             let changed = old.is_some_and(|o| {
-                self.get(o, col).map(|f| convert_field(&self.tz, f)) != self.get(row, col).map(|f| convert_field(&self.tz, f))
+                self.get(o, col).map(|f| convert_field(&self.tz, f))
+                    != self.get(row, col).map(|f| convert_field(&self.tz, f))
             });
             if old.is_none() || changed {
                 if let Some(field) = self.get(row, col) {
@@ -472,9 +466,12 @@ impl CanalClientEncoder {
                     Some(pending) if pending.key == key => Some(pending),
                     Some(pending) => {
                         // Different key: the stashed row was a real delete.
-                        messages.push(
-                            self.build_message("delete", &pending.key, pending.data, None),
-                        );
+                        messages.push(self.build_message(
+                            "delete",
+                            &pending.key,
+                            pending.data,
+                            None,
+                        ));
                         None
                     }
                     None => None,
@@ -513,9 +510,7 @@ impl CanalClientEncoder {
     /// Flush any held before-image (job close / bounded end).
     pub fn flush(&mut self) -> Vec<(String, String)> {
         match self.pending.take() {
-            Some(pending) => vec![
-                self.build_message("delete", &pending.key, pending.data, None),
-            ],
+            Some(pending) => vec![self.build_message("delete", &pending.key, pending.data, None)],
             None => Vec::new(),
         }
     }
@@ -535,7 +530,10 @@ impl CanalClientEncoder {
 /// pulled from `data` by schema column name; delete → RowKind::Delete.
 pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(bytes)?;
-    let event_type = value.get("eventType").and_then(|v| v.as_str()).unwrap_or("insert");
+    let event_type = value
+        .get("eventType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("insert");
     let kind = match event_type {
         "update" => RowKind::UpdateAfter,
         "delete" => RowKind::Delete,
@@ -544,7 +542,10 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<d
     let data = value.get("data").cloned().unwrap_or(Value::Null);
     let mut row = Row::new(kind, schema.column_count());
     for (i, col) in schema.columns.iter().enumerate() {
-        let field = data.get(&col.name).map(json_value_to_field).unwrap_or(Field::Null);
+        let field = data
+            .get(&col.name)
+            .map(json_value_to_field)
+            .unwrap_or(Field::Null);
         row.set(i, field);
     }
     Ok(vec![row])
@@ -600,12 +601,18 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
         RowKind::UpdateBefore => ("update", ()),
         RowKind::Delete => ("delete", ()),
     };
-    message.insert("eventType".to_string(), Value::String(event_type.to_string()));
+    message.insert(
+        "eventType".to_string(),
+        Value::String(event_type.to_string()),
+    );
     let mut data = Map::new();
     for (i, col) in schema.columns.iter().enumerate() {
         data.insert(
             col.name.clone(),
-            convert_field(&ServerTz::default(), row.fields.get(i).unwrap_or(&Field::Null)),
+            convert_field(
+                &ServerTz::default(),
+                row.fields.get(i).unwrap_or(&Field::Null),
+            ),
         );
     }
     message.insert("data".to_string(), Value::Object(data));
@@ -641,10 +648,19 @@ mod tests {
         let v = convert_string(&tz, "2024-05-06 07:08:09");
         assert_eq!(v, Value::Number(Number::from(1714979289000i64)));
         // Non-strict date stays a string.
-        assert_eq!(convert_string(&tz, "2024-05-06"), Value::String("2024-05-06".into()));
-        assert_eq!(convert_string(&tz, "2024-13-40 00:00:00"), Value::String("2024-13-40 00:00:00".into()));
+        assert_eq!(
+            convert_string(&tz, "2024-05-06"),
+            Value::String("2024-05-06".into())
+        );
+        assert_eq!(
+            convert_string(&tz, "2024-13-40 00:00:00"),
+            Value::String("2024-13-40 00:00:00".into())
+        );
         // Numbers.
-        assert_eq!(convert_string(&tz, "1001"), Value::Number(Number::from(1001i64)));
+        assert_eq!(
+            convert_string(&tz, "1001"),
+            Value::Number(Number::from(1001i64))
+        );
         assert_eq!(convert_string(&tz, "0123"), Value::String("0123".into()));
     }
 
@@ -670,7 +686,10 @@ mod tests {
         assert!(matches!(ServerTz::parse("local"), ServerTz::Local));
         assert!(matches!(ServerTz::parse("UTC"), ServerTz::Utc));
         assert!(matches!(ServerTz::parse("+08:00"), ServerTz::Fixed(_)));
-        assert!(matches!(ServerTz::parse("Asia/Shanghai"), ServerTz::Named(_)));
+        assert!(matches!(
+            ServerTz::parse("Asia/Shanghai"),
+            ServerTz::Named(_)
+        ));
         // Bogus values fall back to the local zone.
         assert!(matches!(ServerTz::parse("not-a-zone"), ServerTz::Local));
         // Default is the server-local zone (Java behavior).
@@ -689,13 +708,12 @@ mod tests {
     }
 
     fn fields_config() -> CanalClientConfig {
-        let tables: HashMap<String, TableFields> =
-            serde_json::from_str(
-                r#"{"lClassStudent": {"key": "id",
+        let tables: HashMap<String, TableFields> = serde_json::from_str(
+            r#"{"lClassStudent": {"key": "id",
                      "must": {"id": "id", "name": "name"},
                      "update": {"status": "status"}}}"#,
-            )
-            .unwrap();
+        )
+        .unwrap();
         CanalClientConfig {
             database_name: "NewOriental_Data_Recommand".into(),
             table_name: "l_class_student".into(),
@@ -717,7 +735,9 @@ mod tests {
     #[test]
     fn test_encoder_insert_maps_must_and_update_fields() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
-        let messages = encoder.encode(&row_of(RowKind::Insert, 1001, "张三", 1)).unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::Insert, 1001, "张三", 1))
+            .unwrap();
         assert_eq!(messages.len(), 1);
         let (key, payload) = &messages[0];
         assert_eq!(key, "1001");
@@ -758,17 +778,24 @@ mod tests {
     fn test_encoder_filters_update_without_configured_changes() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
         // Only 'other' (not configured) changes between the images.
-        encoder.encode(&row_of(RowKind::Delete, 1001, "same", 0)).unwrap();
+        encoder
+            .encode(&row_of(RowKind::Delete, 1001, "same", 0))
+            .unwrap();
         let messages = encoder
             .encode(&row_of(RowKind::Insert, 1001, "same", 0))
             .unwrap();
-        assert!(messages.is_empty(), "update without configured changes must be filtered");
+        assert!(
+            messages.is_empty(),
+            "update without configured changes must be filtered"
+        );
     }
 
     #[test]
     fn test_encoder_real_delete_flushes_before_unrelated_insert() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
-        encoder.encode(&row_of(RowKind::Delete, 7, "gone", 0)).unwrap();
+        encoder
+            .encode(&row_of(RowKind::Delete, 7, "gone", 0))
+            .unwrap();
         let messages = encoder
             .encode(&row_of(RowKind::Insert, 1001, "new", 1))
             .unwrap();
@@ -785,7 +812,9 @@ mod tests {
     #[test]
     fn test_encoder_flush_emits_trailing_delete() {
         let mut encoder = CanalClientEncoder::new(fields_config()).unwrap();
-        encoder.encode(&row_of(RowKind::Delete, 9, "tail", 0)).unwrap();
+        encoder
+            .encode(&row_of(RowKind::Delete, 9, "tail", 0))
+            .unwrap();
         let flushed = encoder.flush();
         assert_eq!(flushed.len(), 1);
         let json: Value = serde_json::from_str(&flushed[0].1).unwrap();

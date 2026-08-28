@@ -16,7 +16,7 @@ pub mod parser;
 
 pub use hocon::{get_dot_path, parse_hocon};
 pub use job_config::{JobConfig, JobMode, SchemaConfig, SinkConfig, SourceConfig, TransformConfig};
-pub use parser::{parse_config_file, ConfigFormat, ParsedConfig};
+pub use parser::{ConfigFormat, ParsedConfig, parse_config_file};
 
 /// Parse a config file into a typed JobConfig.
 /// Auto-detects format from extension: .toml -> TOML, .conf -> HOCON, else -> YAML.

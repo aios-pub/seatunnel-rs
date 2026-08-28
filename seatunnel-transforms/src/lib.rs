@@ -322,10 +322,10 @@ pub mod sql {
 
     use datafusion::{dataframe::DataFrame, execution::context::SessionContext, prelude::*};
     use seatunnel_api::{
+        ColumnType,
         row::{Row, RowKind},
         schema::{ColumnDef, TableSchema},
         transform::Transform,
-        ColumnType,
     };
 
     /// A SQL-based transform that applies an arbitrary SELECT statement.
@@ -387,8 +387,8 @@ pub mod sql {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seatunnel_api::row::RowKind;
     use seatunnel_api::ColumnType;
+    use seatunnel_api::row::RowKind;
 
     fn make_schema() -> TableSchema {
         TableSchema::new(

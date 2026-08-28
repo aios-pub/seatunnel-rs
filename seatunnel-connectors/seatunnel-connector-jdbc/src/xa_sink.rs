@@ -40,19 +40,19 @@ use std::future::Future;
 use std::pin::Pin;
 
 use mysql_async::prelude::*;
+use seatunnel_api::ColumnType;
 use seatunnel_api::row::{Field, Row, RowKind};
 use seatunnel_api::schema::TableSchema;
 use seatunnel_api::sink::sink_committer::{CommitterFuture, SinkCommitter};
 use seatunnel_api::sink::sink_writer::SinkWriter;
 use seatunnel_api::sink::{Sink, SinkWriterContext};
-use seatunnel_api::ColumnType;
 use seatunnel_connector_common::ConnectorConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::conn::DbEndpoint;
 use crate::url::parse_jdbc_url;
-use crate::value::{field_to_sql_value, SqlValue};
-use crate::{catalog, JdbcUrl};
+use crate::value::{SqlValue, field_to_sql_value};
+use crate::{JdbcUrl, catalog};
 
 /// Commit descriptor: the prepared xid phase 2 must commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,11 @@ impl XaSinkConfig {
             url: config.get_string("url", ""),
             username: config.get_string("username", &config.get_string("user", "")),
             password: config.get_string("password", ""),
-            database: if database.is_empty() { None } else { Some(database) },
+            database: if database.is_empty() {
+                None
+            } else {
+                Some(database)
+            },
             table: config.get_string("table", ""),
             primary_keys: config
                 .get_string("primary-keys", &config.get_string("primary_keys", ""))
@@ -110,7 +114,10 @@ impl XaSinkConfig {
                 .get_int("batch.size", config.get_int("batch_size", 1000))
                 .max(1) as usize,
             enable_upsert: config.get_bool("enable-upsert", config.get_bool("enable_upsert", true)),
-            xid_prefix: config.get_string("xa.xid-prefix", &config.get_string("xid-prefix", "seatunnel-xa")),
+            xid_prefix: config.get_string(
+                "xa.xid-prefix",
+                &config.get_string("xid-prefix", "seatunnel-xa"),
+            ),
             context_pipeline: config.get_string("pipeline.name", "p0"),
             context_subtask: config.get_int("subtask.index", 0).max(0) as usize,
         }
@@ -121,7 +128,13 @@ impl XaSinkConfig {
 fn sanitize_component(component: &str) -> String {
     component
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -155,7 +168,13 @@ impl Sink for XaSink {
         &self,
         _ctx: &SinkWriterContext,
     ) -> anyhow::Result<
-        Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>,
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
     > {
         Ok(Box::new(XaSinkWriter::new(self.config.clone())))
     }
@@ -165,7 +184,13 @@ impl Sink for XaSink {
         _ctx: &SinkWriterContext,
         states: &[Vec<u8>],
     ) -> anyhow::Result<
-        Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>,
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
     > {
         let mut writer = XaSinkWriter::new(self.config.clone());
         if let Some(bytes) = states.last() {
@@ -180,7 +205,14 @@ impl Sink for XaSink {
 
     fn create_committer(
         &self,
-    ) -> Option<Box<dyn SinkCommitter<CommitInfo = Self::CommitInfo, AggregatedCommitInfo = Self::AggregatedCommitInfo>>> {
+    ) -> Option<
+        Box<
+            dyn SinkCommitter<
+                    CommitInfo = Self::CommitInfo,
+                    AggregatedCommitInfo = Self::AggregatedCommitInfo,
+                >,
+        >,
+    > {
         Some(Box::new(XaSinkCommitter::new(
             self.config.url.clone(),
             self.config.username.clone(),
@@ -282,12 +314,19 @@ impl XaSinkWriter {
             return Ok(());
         }
         let url = parse_jdbc_url(&self.config.url)?;
-        if !matches!(url.dialect, crate::dialect::JdbcDialectKind::MySql | crate::dialect::JdbcDialectKind::TiDB) {
-            anyhow::bail!("XaSink requires a MySQL-compatible url (got {:?})", url.dialect);
+        if !matches!(
+            url.dialect,
+            crate::dialect::JdbcDialectKind::MySql | crate::dialect::JdbcDialectKind::TiDB
+        ) {
+            anyhow::bail!(
+                "XaSink requires a MySQL-compatible url (got {:?})",
+                url.dialect
+            );
         }
         // Discover the target schema through a short-lived pool; the XA
         // work itself runs on one dedicated connection.
-        let endpoint = DbEndpoint::connect(&url, &self.config.username, &self.config.password, 2).await?;
+        let endpoint =
+            DbEndpoint::connect(&url, &self.config.username, &self.config.password, 2).await?;
         let table = self.qualified_table();
         if !catalog::table_exists(&endpoint, &url, &table).await? {
             anyhow::bail!(
@@ -298,7 +337,9 @@ impl XaSinkWriter {
         }
         let schema = catalog::discover_schema(&endpoint, &url, &table)
             .await
-            .map_err(|e| anyhow::anyhow!("XaSink schema discovery for '{}' failed: {}", table, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("XaSink schema discovery for '{}' failed: {}", table, e)
+            })?;
         let mut schema = schema;
         if schema.primary_key.is_empty() && !self.config.primary_keys.is_empty() {
             schema.primary_key = self.config.primary_keys.clone();
@@ -354,13 +395,20 @@ impl XaSinkWriter {
         let rows: Vec<mysql_async::Row> = match conn.query(&sql).await {
             Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!("XaSinkWriter: zombie session scan failed (continuing): {}", e);
+                tracing::warn!(
+                    "XaSinkWriter: zombie session scan failed (continuing): {}",
+                    e
+                );
                 return Ok(());
             }
         };
         for row in rows {
             if let Some(id) = row.get::<i64, usize>(0) {
-                tracing::info!("XaSinkWriter: killing zombie session {} holding a transaction on {}", id, target_db);
+                tracing::info!(
+                    "XaSinkWriter: killing zombie session {} holding a transaction on {}",
+                    id,
+                    target_db
+                );
                 let _ = conn.query_drop(format!("KILL {}", id)).await;
             }
         }
@@ -385,11 +433,19 @@ impl XaSinkWriter {
                 continue; // not ours
             };
             if window <= self.last_committed_window {
-                tracing::info!("XaSinkWriter: committing prepared xid {} (window ≤ {})", xid, self.last_committed_window);
+                tracing::info!(
+                    "XaSinkWriter: committing prepared xid {} (window ≤ {})",
+                    xid,
+                    self.last_committed_window
+                );
                 self.xa_exec(&format!("XA COMMIT '{}'", xid)).await?;
                 committed += 1;
             } else {
-                tracing::info!("XaSinkWriter: rolling back prepared xid {} (window > {})", xid, self.last_committed_window);
+                tracing::info!(
+                    "XaSinkWriter: rolling back prepared xid {} (window > {})",
+                    xid,
+                    self.last_committed_window
+                );
                 self.xa_exec(&format!("XA ROLLBACK '{}'", xid)).await?;
                 rolled_back += 1;
             }
@@ -433,13 +489,16 @@ impl XaSinkWriter {
             let gtrid_len = match row.get::<mysql_async::Value, usize>(1) {
                 Some(mysql_async::Value::Int(n)) => n as usize,
                 Some(mysql_async::Value::UInt(n)) => n as usize,
-                Some(mysql_async::Value::Bytes(b)) => {
-                    String::from_utf8_lossy(&b).trim().parse::<usize>().unwrap_or(0)
-                }
+                Some(mysql_async::Value::Bytes(b)) => String::from_utf8_lossy(&b)
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(0),
                 _ => 0,
             };
             let data = match row.get::<mysql_async::Value, usize>(3) {
-                Some(mysql_async::Value::Bytes(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
+                Some(mysql_async::Value::Bytes(bytes)) => {
+                    String::from_utf8_lossy(&bytes).to_string()
+                }
                 _ => String::new(),
             };
             if let Some(xid) = decode_xa_recover_data(&data, gtrid_len) {
@@ -455,7 +514,9 @@ impl XaSinkWriter {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("XaSink not connected"))?;
         let values: Vec<mysql_async::Value> = params.iter().map(mysql_async::Value::from).collect();
-        conn.exec_drop(sql, values).await.map_err(|e| anyhow::anyhow!("xa exec: {}", e))?;
+        conn.exec_drop(sql, values)
+            .await
+            .map_err(|e| anyhow::anyhow!("xa exec: {}", e))?;
         Ok(conn.affected_rows())
     }
 
@@ -484,8 +545,11 @@ impl XaSinkWriter {
         let table = self.qualified_table();
         let schema = self.table_schema.clone().expect("schema resolved");
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let column_types: Vec<ColumnType> =
-            schema.columns.iter().map(|c| c.column_type.clone()).collect();
+        let column_types: Vec<ColumnType> = schema
+            .columns
+            .iter()
+            .map(|c| c.column_type.clone())
+            .collect();
         let primary_keys: Vec<String> = if !self.config.primary_keys.is_empty() {
             self.config.primary_keys.clone()
         } else {
@@ -510,8 +574,10 @@ impl XaSinkWriter {
                             .ok_or_else(|| anyhow::anyhow!("delete key '{}' not in schema", pk))
                     })
                     .collect::<Result<_, _>>()?;
-                let key_types: Vec<ColumnType> =
-                    key_positions.iter().map(|&i| schema.columns[i].column_type.clone()).collect();
+                let key_types: Vec<ColumnType> = key_positions
+                    .iter()
+                    .map(|&i| schema.columns[i].column_type.clone())
+                    .collect();
                 let sql = dialect.build_delete_by_pk(&table, &primary_keys, &key_types);
                 for row in run {
                     let params: Vec<SqlValue> = key_positions
@@ -528,7 +594,13 @@ impl XaSinkWriter {
                         continue;
                     }
                     let sql = if upsert {
-                        dialect.build_upsert(&table, &columns, &column_types, &primary_keys, chunk.len())
+                        dialect.build_upsert(
+                            &table,
+                            &columns,
+                            &column_types,
+                            &primary_keys,
+                            chunk.len(),
+                        )
                     } else {
                         dialect.build_insert(&table, &columns, &column_types, chunk.len())
                     };
@@ -572,7 +644,10 @@ impl SinkWriter for XaSinkWriter {
         })
     }
 
-    fn write(&mut self, record: Self::Input) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+    fn write(
+        &mut self,
+        record: Self::Input,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         let full = self.buffer.len() + 1 >= self.config.batch_size;
         self.buffer.push(record);
         Box::pin(async move {
@@ -617,7 +692,9 @@ impl SinkWriter for XaSinkWriter {
         })
     }
 
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let state = serde_json::json!({
             "last_committed_window": self.last_committed_window,
             "written": self.written,
@@ -740,13 +817,16 @@ impl XaSinkCommitter {
             let gtrid_len = match row.get::<mysql_async::Value, usize>(1) {
                 Some(mysql_async::Value::Int(n)) => n as usize,
                 Some(mysql_async::Value::UInt(n)) => n as usize,
-                Some(mysql_async::Value::Bytes(b)) => {
-                    String::from_utf8_lossy(&b).trim().parse::<usize>().unwrap_or(0)
-                }
+                Some(mysql_async::Value::Bytes(b)) => String::from_utf8_lossy(&b)
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(0),
                 _ => 0,
             };
             let data = match row.get::<mysql_async::Value, usize>(3) {
-                Some(mysql_async::Value::Bytes(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
+                Some(mysql_async::Value::Bytes(bytes)) => {
+                    String::from_utf8_lossy(&bytes).to_string()
+                }
                 _ => String::new(),
             };
             if let Some(xid) = decode_xa_recover_data(&data, gtrid_len) {
@@ -772,7 +852,10 @@ impl SinkCommitter for XaSinkCommitter {
     type CommitInfo = XaCommitInfo;
     type AggregatedCommitInfo = XaAggregatedCommitInfo;
 
-    fn commit(&mut self, commit_infos: Vec<Self::CommitInfo>) -> CommitterFuture<'_, Self::AggregatedCommitInfo> {
+    fn commit(
+        &mut self,
+        commit_infos: Vec<Self::CommitInfo>,
+    ) -> CommitterFuture<'_, Self::AggregatedCommitInfo> {
         Box::pin(async move {
             self.ensure_connected().await?;
             let prepared = self.prepared_xids().await?;
@@ -781,7 +864,8 @@ impl SinkCommitter for XaSinkCommitter {
             for info in commit_infos {
                 rows += info.rows;
                 if prepared.contains(&info.xid) {
-                    self.xa_statement(&format!("XA COMMIT '{}'", info.xid)).await?;
+                    self.xa_statement(&format!("XA COMMIT '{}'", info.xid))
+                        .await?;
                     committed += 1;
                     tracing::info!(
                         "XaSinkCommitter: committed xid {} (checkpoint {}, {} row(s))",
@@ -791,7 +875,10 @@ impl SinkCommitter for XaSinkCommitter {
                     );
                 } else {
                     // Already committed on a previous attempt (idempotent).
-                    tracing::debug!("XaSinkCommitter: xid {} no longer prepared (already committed)", info.xid);
+                    tracing::debug!(
+                        "XaSinkCommitter: xid {} no longer prepared (already committed)",
+                        info.xid
+                    );
                 }
             }
             Ok(XaAggregatedCommitInfo { committed, rows })
@@ -804,7 +891,8 @@ impl SinkCommitter for XaSinkCommitter {
             let prepared = self.prepared_xids().await?;
             for info in commit_infos {
                 if prepared.contains(&info.xid) {
-                    self.xa_statement(&format!("XA ROLLBACK '{}'", info.xid)).await?;
+                    self.xa_statement(&format!("XA ROLLBACK '{}'", info.xid))
+                        .await?;
                     tracing::info!("XaSinkCommitter: rolled back prepared xid {}", info.xid);
                 }
             }
@@ -884,7 +972,9 @@ mod live_tests {
     use super::*;
 
     async fn mysql_up() -> bool {
-        tokio::net::TcpStream::connect("127.0.0.1:13306").await.is_ok()
+        tokio::net::TcpStream::connect("127.0.0.1:13306")
+            .await
+            .is_ok()
     }
 
     fn opts() -> mysql_async::OptsBuilder {
@@ -914,8 +1004,9 @@ mod live_tests {
         let rows: Vec<mysql_async::Row> = b.query("XA RECOVER").await.unwrap();
         eprintln!("rows: {}", rows.len());
         for r in &rows {
-            let vals: Vec<mysql_async::Value> =
-                (0..4).filter_map(|i| r.get::<mysql_async::Value, usize>(i)).collect();
+            let vals: Vec<mysql_async::Value> = (0..4)
+                .filter_map(|i| r.get::<mysql_async::Value, usize>(i))
+                .collect();
             eprintln!("row: {:?}", vals);
         }
         let seen = rows.iter().any(|r| {
@@ -925,6 +1016,9 @@ mod live_tests {
             )
         });
         let _ = a.query_drop(format!("XA ROLLBACK '{}'", xid)).await;
-        assert!(seen, "XA RECOVER on connection B must list the xid prepared on A");
+        assert!(
+            seen,
+            "XA RECOVER on connection B must list the xid prepared on A"
+        );
     }
 }

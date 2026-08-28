@@ -32,8 +32,8 @@ use seatunnel_connector_common::ConnectorConfig;
 
 use crate::catalog;
 use crate::conn::DbEndpoint;
-use crate::url::{parse_jdbc_url, split_table_name, JdbcUrl};
-use crate::value::{field_to_sql_value, SqlValue};
+use crate::url::{JdbcUrl, parse_jdbc_url, split_table_name};
+use crate::value::{SqlValue, field_to_sql_value};
 
 /// Startup behavior for the target table
 /// (Java: `org.apache.seatunnel.api.sink.SchemaSaveMode`).
@@ -100,7 +100,10 @@ pub struct JdbcSinkConfig {
 impl JdbcSinkConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
         let schema_save_mode = {
-            let v = config.get_string("schema-save-mode", &config.get_string("schema_save_mode", ""));
+            let v = config.get_string(
+                "schema-save-mode",
+                &config.get_string("schema_save_mode", ""),
+            );
             if !v.is_empty() {
                 SchemaSaveMode::parse(&v)
             } else {
@@ -108,24 +111,21 @@ impl JdbcSinkConfig {
                 SchemaSaveMode::CreateWhenNotExist
             }
         };
-        let data_save_mode = DataSaveMode::parse(&config.get_string(
-            "data-save-mode",
-            &config.get_string("data_save_mode", ""),
-        ));
+        let data_save_mode = DataSaveMode::parse(
+            &config.get_string("data-save-mode", &config.get_string("data_save_mode", "")),
+        );
         JdbcSinkConfig {
             url: config.get_string("url", ""),
-            username: config
-                .get_string("username", &config.get_string("user", "")),
+            username: config.get_string("username", &config.get_string("user", "")),
             password: config.get_string("password", ""),
             database: {
                 let v = config.get_string("database", "");
                 if v.is_empty() { None } else { Some(v) }
             },
             table: config.get_string("table", ""),
-            primary_keys: split_csv(&config.get_string(
-                "primary-keys",
-                &config.get_string("primary_keys", ""),
-            )),
+            primary_keys: split_csv(
+                &config.get_string("primary-keys", &config.get_string("primary_keys", "")),
+            ),
             columns: split_csv(&config.get_string("columns", "")),
             batch_size: config
                 .get_int("batch.size", config.get_int("batch_size", 1000))
@@ -184,7 +184,10 @@ impl JdbcSinkWriter {
 
     /// Fully-qualified table name including the optional database/schema.
     fn qualified_table(&self) -> String {
-        match (&self.config.database, split_table_name(&self.config.table).0) {
+        match (
+            &self.config.database,
+            split_table_name(&self.config.table).0,
+        ) {
             (Some(db), _) => format!("{}.{}", db, self.config.table),
             (None, Some(_)) => self.config.table.clone(),
             (None, None) => match &self.url {
@@ -242,13 +245,19 @@ impl JdbcSinkWriter {
         match self.config.schema_save_mode {
             SchemaSaveMode::ErrorWhenNotExist => {
                 if !exists {
-                    anyhow::bail!("table '{}' does not exist and schema-save-mode is error-when-not-exist", table);
+                    anyhow::bail!(
+                        "table '{}' does not exist and schema-save-mode is error-when-not-exist",
+                        table
+                    );
                 }
             }
             SchemaSaveMode::RecreateSchema => {
                 if exists {
                     endpoint
-                        .exec_best_effort(&format!("DROP TABLE IF EXISTS {}", dialect.quote_table(&table)))
+                        .exec_best_effort(&format!(
+                            "DROP TABLE IF EXISTS {}",
+                            dialect.quote_table(&table)
+                        ))
                         .await?;
                 }
                 if let Some(schema) = &self.table_schema {
@@ -279,13 +288,20 @@ impl JdbcSinkWriter {
             SchemaSaveMode::Ignore => {}
         }
 
-        let exists_after =
-            exists || self.table_schema.is_some() && matches!(self.config.schema_save_mode, SchemaSaveMode::CreateWhenNotExist | SchemaSaveMode::RecreateSchema);
+        let exists_after = exists
+            || self.table_schema.is_some()
+                && matches!(
+                    self.config.schema_save_mode,
+                    SchemaSaveMode::CreateWhenNotExist | SchemaSaveMode::RecreateSchema
+                );
         if exists_after {
             match self.config.data_save_mode {
                 DataSaveMode::DropData => {
                     endpoint
-                        .exec_best_effort(&format!("TRUNCATE TABLE {}", dialect.quote_table(&table)))
+                        .exec_best_effort(&format!(
+                            "TRUNCATE TABLE {}",
+                            dialect.quote_table(&table)
+                        ))
                         .await?;
                 }
                 DataSaveMode::ErrorWhenDataExists => {
@@ -334,7 +350,11 @@ impl JdbcSinkWriter {
         let mut columns = Vec::with_capacity(row.field_count());
         for (i, field) in row.fields.iter().enumerate() {
             let name = names.get(i).cloned().unwrap_or_else(|| format!("f{}", i));
-            let primary = self.config.primary_keys.iter().any(|pk| pk.eq_ignore_ascii_case(&name));
+            let primary = self
+                .config
+                .primary_keys
+                .iter()
+                .any(|pk| pk.eq_ignore_ascii_case(&name));
             columns.push(
                 ColumnDef::new(name, column_type_of_field(field))
                     .nullable(true)
@@ -363,12 +383,17 @@ impl JdbcSinkWriter {
                 }
                 SchemaSaveMode::CreateWhenNotExist | SchemaSaveMode::RecreateSchema => {
                     let schema = self.table_schema.clone().expect("schema inferred");
-                    let ddl = url.dialect.build_create_table(&self.create_table_schema(&schema));
+                    let ddl = url
+                        .dialect
+                        .build_create_table(&self.create_table_schema(&schema));
                     endpoint.exec_best_effort(&ddl).await?;
                     tracing::info!("JDBC sink: auto-created table {} from first batch", table);
                 }
                 SchemaSaveMode::Ignore => {
-                    tracing::warn!("JDBC sink: table {} missing (schema-save-mode=ignore); writes will fail", table);
+                    tracing::warn!(
+                        "JDBC sink: table {} missing (schema-save-mode=ignore); writes will fail",
+                        table
+                    );
                 }
             }
             self.apply_save_modes().await?;
@@ -441,8 +466,11 @@ impl JdbcSinkWriter {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("JDBC sink has no schema"))?;
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let column_types: Vec<ColumnType> =
-            schema.columns.iter().map(|c| c.column_type.clone()).collect();
+        let column_types: Vec<ColumnType> = schema
+            .columns
+            .iter()
+            .map(|c| c.column_type.clone())
+            .collect();
         let primary_keys: Vec<String> = if !self.config.primary_keys.is_empty() {
             self.config.primary_keys.clone()
         } else {
@@ -658,7 +686,9 @@ impl SinkWriter for JdbcSinkWriter {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         let written = self.written;
         Box::pin(async move {
-            Ok(serde_json::to_vec(&serde_json::json!({ "written": written }))?)
+            Ok(serde_json::to_vec(
+                &serde_json::json!({ "written": written }),
+            )?)
         })
     }
 
@@ -786,8 +816,15 @@ impl Sink for JdbcSink {
     fn create_writer(
         &self,
         _writer_context: &SinkWriterContext,
-    ) -> anyhow::Result<Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>>
-    {
+    ) -> anyhow::Result<
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
+    > {
         Ok(Box::new(JdbcSinkWriter::new(
             self.config.clone(),
             self.schema.clone(),
@@ -798,8 +835,15 @@ impl Sink for JdbcSink {
         &self,
         _writer_context: &SinkWriterContext,
         _states: &[Vec<u8>],
-    ) -> anyhow::Result<Box<dyn SinkWriter<Input = Self::Input, WriterState = Self::WriterState, CommitInfo = Self::CommitInfo>>>
-    {
+    ) -> anyhow::Result<
+        Box<
+            dyn SinkWriter<
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
+        >,
+    > {
         Ok(Box::new(JdbcSinkWriter::new(
             self.config.clone(),
             self.schema.clone(),
@@ -815,9 +859,9 @@ impl Sink for JdbcSink {
     ) -> Option<
         Box<
             dyn seatunnel_api::sink::SinkCommitter<
-                CommitInfo = Self::CommitInfo,
-                AggregatedCommitInfo = Self::AggregatedCommitInfo,
-            >,
+                    CommitInfo = Self::CommitInfo,
+                    AggregatedCommitInfo = Self::AggregatedCommitInfo,
+                >,
         >,
     > {
         None
@@ -862,11 +906,11 @@ mod tests {
             SchemaSaveMode::parse("CREATE_SCHEMA_WHEN_NOT_EXIST"),
             SchemaSaveMode::CreateWhenNotExist
         );
-        assert_eq!(SchemaSaveMode::parse("recreate-schema"), SchemaSaveMode::RecreateSchema);
         assert_eq!(
-            DataSaveMode::parse("DROP_DATA"),
-            DataSaveMode::DropData
+            SchemaSaveMode::parse("recreate-schema"),
+            SchemaSaveMode::RecreateSchema
         );
+        assert_eq!(DataSaveMode::parse("DROP_DATA"), DataSaveMode::DropData);
     }
 
     #[test]
@@ -892,9 +936,7 @@ mod tests {
 
     #[test]
     fn test_benign_ddl_errors() {
-        assert!(is_benign_ddl_error(
-            "Duplicate column name 'email'"
-        ));
+        assert!(is_benign_ddl_error("Duplicate column name 'email'"));
         assert!(is_benign_ddl_error(
             "column \"email\" of relation \"t\" does not exist" // drop column replay
         ));

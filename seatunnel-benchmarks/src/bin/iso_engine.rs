@@ -54,7 +54,9 @@ impl SourceReader for SeqSource {
             Ok(PollResult::Record(row))
         })
     }
-    fn snapshot_state(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
+    fn snapshot_state(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send + '_>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     fn add_splits(&mut self, _splits: Vec<Self::Split>) {}
@@ -76,7 +78,10 @@ impl SinkWriter for NoopWriter {
     fn open(&mut self) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn write(&mut self, _record: Self::Input) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
+    fn write(
+        &mut self,
+        _record: Self::Input,
+    ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
         self.writes += 1;
         Box::pin(async { Ok(()) })
     }
@@ -103,7 +108,10 @@ fn boxed_source(total: u64) -> seatunnel_engine_core::connector_factory::BoxedSo
 }
 
 async fn scenario_raw() -> Duration {
-    let mut source = SeqSource { emitted: 0, total: ROWS };
+    let mut source = SeqSource {
+        emitted: 0,
+        total: ROWS,
+    };
     let mut sink = NoopWriter::default();
     let start = Instant::now();
     source.open().await.unwrap();
@@ -143,11 +151,23 @@ async fn scenario_taskgroup(fanout: bool) -> Duration {
 #[tokio::main]
 async fn main() {
     let d = scenario_raw().await;
-    println!("raw    : {:>10?}  ({:>8.0} rows/s)", d, ROWS as f64 / d.as_secs_f64());
+    println!(
+        "raw    : {:>10?}  ({:>8.0} rows/s)",
+        d,
+        ROWS as f64 / d.as_secs_f64()
+    );
 
     let d = scenario_taskgroup(false).await;
-    println!("single : {:>10?}  ({:>8.0} rows/s)", d, ROWS as f64 / d.as_secs_f64());
+    println!(
+        "single : {:>10?}  ({:>8.0} rows/s)",
+        d,
+        ROWS as f64 / d.as_secs_f64()
+    );
 
     let d = scenario_taskgroup(true).await;
-    println!("fanout : {:>10?}  ({:>8.0} rows/s)", d, ROWS as f64 / d.as_secs_f64());
+    println!(
+        "fanout : {:>10?}  ({:>8.0} rows/s)",
+        d,
+        ROWS as f64 / d.as_secs_f64()
+    );
 }

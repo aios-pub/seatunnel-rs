@@ -31,8 +31,8 @@ use seatunnel_connector_common::ConnectorConfig;
 use crate::catalog;
 use crate::conn::DbEndpoint;
 use crate::dialect::JdbcDialectKind;
-use crate::url::{parse_jdbc_url, JdbcUrl};
-use crate::value::{field_to_sql_value, sql_value_to_field, SqlValue};
+use crate::url::{JdbcUrl, parse_jdbc_url};
+use crate::value::{SqlValue, field_to_sql_value, sql_value_to_field};
 
 /// JDBC source configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,8 +61,7 @@ impl JdbcSourceConfig {
         let query = config.get_string("query", "");
         JdbcSourceConfig {
             url: config.get_string("url", ""),
-            username: config
-                .get_string("username", &config.get_string("user", "")),
+            username: config.get_string("username", &config.get_string("user", "")),
             password: config.get_string("password", ""),
             table: config.get_string("table", ""),
             query: if query.is_empty() { None } else { Some(query) },
@@ -89,7 +88,10 @@ impl JdbcSourceConfig {
                 }
             },
             fetch_size: config
-                .get_int("fetch.size", config.get_int("batch.size", config.get_int("fetch_size", 1024)))
+                .get_int(
+                    "fetch.size",
+                    config.get_int("batch.size", config.get_int("fetch_size", 1024)),
+                )
                 .max(1) as usize,
             parallelism: config.get_int("parallelism", 4).max(1) as usize,
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
@@ -167,7 +169,8 @@ impl JdbcSourceReader {
             return Ok(());
         }
         let url = parse_jdbc_url(&self.config.url)?;
-        let endpoint = DbEndpoint::connect(&url, &self.config.username, &self.config.password, 4).await?;
+        let endpoint =
+            DbEndpoint::connect(&url, &self.config.username, &self.config.password, 4).await?;
 
         let (schema, partition_column) = if self.config.query.is_some() {
             // Custom query: schema discovered lazily from the result set.
@@ -182,11 +185,7 @@ impl JdbcSourceReader {
             (Some(schema), pk)
         };
 
-        self.partition_column = self
-            .config
-            .partition_column
-            .clone()
-            .or(partition_column);
+        self.partition_column = self.config.partition_column.clone().or(partition_column);
         self.schema = schema.or(self.initial_schema.clone());
         self.url = Some(url.clone());
         self.endpoint = Some(endpoint);
@@ -194,7 +193,10 @@ impl JdbcSourceReader {
         // Compute ranges: query mode → single split on subtask 0.
         if self.config.query.is_some() {
             if self.config.subtask_index == 0 {
-                self.ranges = vec![JdbcRange { start: 0, end: i64::MAX }];
+                self.ranges = vec![JdbcRange {
+                    start: 0,
+                    end: i64::MAX,
+                }];
             }
             return Ok(());
         }
@@ -221,7 +223,10 @@ impl JdbcSourceReader {
             // Fallback: a single full-table split read with offset paging,
             // executed by subtask 0 only.
             if self.config.subtask_index == 0 {
-                self.ranges = vec![JdbcRange { start: i64::MIN, end: i64::MAX }];
+                self.ranges = vec![JdbcRange {
+                    start: i64::MIN,
+                    end: i64::MAX,
+                }];
             }
             return Ok(());
         }
@@ -237,16 +242,24 @@ impl JdbcSourceReader {
                 &[],
             )
             .await?;
-        let min = min_max.rows.first().and_then(|r| r.first()).and_then(|v| match v {
-            SqlValue::Int(i) => Some(*i),
-            SqlValue::UInt(u) => Some(*u as i64),
-            _ => None,
-        });
-        let max = min_max.rows.first().and_then(|r| r.get(1)).and_then(|v| match v {
-            SqlValue::Int(i) => Some(*i),
-            SqlValue::UInt(u) => Some(*u as i64),
-            _ => None,
-        });
+        let min = min_max
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| match v {
+                SqlValue::Int(i) => Some(*i),
+                SqlValue::UInt(u) => Some(*u as i64),
+                _ => None,
+            });
+        let max = min_max
+            .rows
+            .first()
+            .and_then(|r| r.get(1))
+            .and_then(|v| match v {
+                SqlValue::Int(i) => Some(*i),
+                SqlValue::UInt(u) => Some(*u as i64),
+                _ => None,
+            });
         let (Some(min), Some(max)) = (min, max) else {
             // Empty table.
             self.ranges = Vec::new();
@@ -330,7 +343,11 @@ impl JdbcSourceReader {
                 if native {
                     dialect.quote(&c.name)
                 } else {
-                    format!("{}::text AS {}", dialect.quote(&c.name), dialect.quote(&c.name))
+                    format!(
+                        "{}::text AS {}",
+                        dialect.quote(&c.name),
+                        dialect.quote(&c.name)
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -438,7 +455,12 @@ impl JdbcSourceReader {
         if page_len < fetch {
             // Range exhausted → advance to the next one.
             self.range_idx += 1;
-            self.last_pk = self.ranges.get(self.range_idx).map(|r| r.start).unwrap_or(0) - 1;
+            self.last_pk = self
+                .ranges
+                .get(self.range_idx)
+                .map(|r| r.start)
+                .unwrap_or(0)
+                - 1;
             self.offset = 0;
         }
         Ok(page_len > 0)

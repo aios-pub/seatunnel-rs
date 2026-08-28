@@ -6,8 +6,8 @@
 // own receive time to derive end-to-end latency. Seeded (snapshot) rows use
 // `ts_ms = 0` and are excluded from latency statistics by the probe.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mysql_async::prelude::*;

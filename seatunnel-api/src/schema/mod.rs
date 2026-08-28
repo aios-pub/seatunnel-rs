@@ -26,5 +26,5 @@ mod table_schema;
 pub use column_def::ColumnDef;
 pub use dialect::{DatabaseDialect, MySqlDialect, PostgresDialect, SchemaDiscovery, TiDbDialect};
 pub use discoverer::SchemaDiscoverer;
-pub use schema_event::{translate_positional, SchemaChange, SchemaChangeEvent, SchemaChangeError};
+pub use schema_event::{SchemaChange, SchemaChangeError, SchemaChangeEvent, translate_positional};
 pub use table_schema::TableSchema;

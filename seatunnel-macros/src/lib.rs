@@ -22,7 +22,7 @@
 extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemStruct};
+use syn::{ItemStruct, parse_macro_input};
 
 /// Attribute arguments: `id = "xxx", category = "xxx"`.
 #[derive(Default)]

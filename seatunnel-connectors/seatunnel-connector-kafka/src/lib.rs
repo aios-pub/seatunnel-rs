@@ -32,21 +32,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::TopicPartitionList;
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::Message as RdkafkaMessage;
 use rdkafka::Offset;
+use rdkafka::TopicPartitionList;
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use seatunnel_api::{
     row::{Row, RowKind},
     schema::TableSchema,
-    sink::{sink_committer::SinkCommitter, sink_writer::SinkWriter, Sink, SinkWriterContext},
+    sink::{Sink, SinkWriterContext, sink_committer::SinkCommitter, sink_writer::SinkWriter},
     source::{
+        Boundedness, Source,
         source_reader::{PollResult, SourceReader, SourceReaderContext},
         source_split::SourceSplit,
         source_split_enum::SourceSplitEnumeratorContext,
-        Boundedness, Source,
     },
 };
 use seatunnel_connector_common::ConnectorConfig;
@@ -207,9 +207,7 @@ impl KafkaSourceConfig {
                 },
                 "group-offsets" | "group_offsets" | "groupoffsets" => KafkaStartupMode::GroupOffset,
                 "specific-offsets" | "specific_offsets" | "specificoffsets" => {
-                    KafkaStartupMode::SpecificOffsets {
-                        offsets: specific,
-                    }
+                    KafkaStartupMode::SpecificOffsets { offsets: specific }
                 }
                 _ => KafkaStartupMode::Earliest,
             },
@@ -339,7 +337,12 @@ impl KafkaSourceReader {
                     config
                         .columns
                         .iter()
-                        .map(|c| seatunnel_api::ColumnDef::new(c.clone(), seatunnel_api::ColumnType::String))
+                        .map(|c| {
+                            seatunnel_api::ColumnDef::new(
+                                c.clone(),
+                                seatunnel_api::ColumnType::String,
+                            )
+                        })
                         .collect(),
                 ))
             }
@@ -375,9 +378,10 @@ impl KafkaSourceReader {
             return Offset::Offset(last + 1);
         }
         match &config.startup_mode {
-            KafkaStartupMode::SpecificOffsets { offsets } => {
-                offsets.get(&partition).map(|o| Offset::Offset(*o)).unwrap_or(Offset::Beginning)
-            }
+            KafkaStartupMode::SpecificOffsets { offsets } => offsets
+                .get(&partition)
+                .map(|o| Offset::Offset(*o))
+                .unwrap_or(Offset::Beginning),
             KafkaStartupMode::Timestamp { ts } => {
                 let mut times = TopicPartitionList::new();
                 // librdkafka interprets the offset field as the lookup timestamp (ms).
@@ -432,7 +436,10 @@ impl KafkaSourceReader {
         match self.config.format {
             MessageFormat::Text => {
                 let mut row = Row::new(RowKind::Insert, 1);
-                row.set(0, seatunnel_api::Field::String(String::from_utf8_lossy(payload).to_string()));
+                row.set(
+                    0,
+                    seatunnel_api::Field::String(String::from_utf8_lossy(payload).to_string()),
+                );
                 vec![row]
             }
             _ => {
@@ -538,7 +545,9 @@ impl SourceReader for KafkaSourceReader {
                     t.partitions()
                         .iter()
                         .map(|p| p.id())
-                        .filter(|p| *p as usize % self.config.subtask_count == self.config.subtask_index)
+                        .filter(|p| {
+                            *p as usize % self.config.subtask_count == self.config.subtask_index
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -556,9 +565,12 @@ impl SourceReader for KafkaSourceReader {
                 let key = format!("{}-{}", self.config.topic, p);
                 let restored = self.restore_offsets.get(&key).copied();
                 let start =
-                    Self::start_offset(&consumer, &self.config.topic, p, &self.config, restored).await;
+                    Self::start_offset(&consumer, &self.config.topic, p, &self.config, restored)
+                        .await;
                 tpl.add_partition_offset(&self.config.topic, p, start)
-                    .map_err(|e| anyhow::anyhow!("assign offset for {}-{}: {}", self.config.topic, p, e))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("assign offset for {}-{}: {}", self.config.topic, p, e)
+                    })?;
             }
             consumer
                 .assign(&tpl)
@@ -584,7 +596,12 @@ impl SourceReader for KafkaSourceReader {
             let Some(consumer) = &self.consumer else {
                 return Ok(PollResult::Empty);
             };
-            match tokio::time::timeout(Duration::from_millis(self.config.poll_timeout_ms), consumer.recv()).await {
+            match tokio::time::timeout(
+                Duration::from_millis(self.config.poll_timeout_ms),
+                consumer.recv(),
+            )
+            .await
+            {
                 Ok(Ok(msg)) => {
                     let key = format!("{}-{}", msg.topic(), msg.partition());
                     self.last_offsets.insert(key, msg.offset());
@@ -638,7 +655,10 @@ impl SourceReader for KafkaSourceReader {
     }
 
     fn add_splits(&mut self, splits: Vec<Self::Split>) {
-        tracing::info!("KafkaSourceReader: adding {} splits (assignment is partition-based)", splits.len());
+        tracing::info!(
+            "KafkaSourceReader: adding {} splits (assignment is partition-based)",
+            splits.len()
+        );
     }
 
     fn handle_no_more_splits(&mut self) {}
@@ -776,7 +796,8 @@ impl KafkaSinkConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
         let tx_enabled = config.get_bool(
             "transactions.enabled",
-            KafkaSemantics::parse(&config.get_string("semantics", "")) == KafkaSemantics::ExactlyOnce,
+            KafkaSemantics::parse(&config.get_string("semantics", ""))
+                == KafkaSemantics::ExactlyOnce,
         );
         KafkaSinkConfig {
             bootstrap_servers: config.get_string("bootstrap.servers", "localhost:9092"),
@@ -793,7 +814,10 @@ impl KafkaSinkConfig {
             transactions_enabled: tx_enabled,
             transactional_id: config.get("transactional.id").cloned().or_else(|| {
                 if tx_enabled {
-                    Some(format!("seatunnel-{}", config.get_string("job.id", "local")))
+                    Some(format!(
+                        "seatunnel-{}",
+                        config.get_string("job.id", "local")
+                    ))
                 } else {
                     None
                 }
@@ -802,7 +826,10 @@ impl KafkaSinkConfig {
             context_subtask: config.get_int("subtask.index", 0).max(0) as usize,
             message_timeout_ms: config.get_int("message.timeout.ms", 30_000) as u64,
             partition_key_fields: config
-                .get_string("partition-key-fields", &config.get_string("partition_key_fields", ""))
+                .get_string(
+                    "partition-key-fields",
+                    &config.get_string("partition_key_fields", ""),
+                )
                 .split(',')
                 .map(|f| f.trim().to_string())
                 .filter(|f| !f.is_empty())
@@ -841,7 +868,10 @@ impl KafkaSinkConfig {
                     })
                 })
                 .flatten(),
-            field_delimiter: config.get_string("field.delimiter", &config.get_string("field_delimiter", ",")),
+            field_delimiter: config.get_string(
+                "field.delimiter",
+                &config.get_string("field_delimiter", ","),
+            ),
         }
     }
 }
@@ -878,10 +908,10 @@ impl Sink for KafkaSink {
     ) -> anyhow::Result<
         Box<
             dyn SinkWriter<
-                Input = Self::Input,
-                WriterState = Self::WriterState,
-                CommitInfo = Self::CommitInfo,
-            >,
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
         >,
     > {
         Ok(Box::new(KafkaSinkWriter::new(self.config.clone())?))
@@ -894,10 +924,10 @@ impl Sink for KafkaSink {
     ) -> anyhow::Result<
         Box<
             dyn SinkWriter<
-                Input = Self::Input,
-                WriterState = Self::WriterState,
-                CommitInfo = Self::CommitInfo,
-            >,
+                    Input = Self::Input,
+                    WriterState = Self::WriterState,
+                    CommitInfo = Self::CommitInfo,
+                >,
         >,
     > {
         let mut writer = KafkaSinkWriter::new(self.config.clone())?;
@@ -916,9 +946,9 @@ impl Sink for KafkaSink {
     ) -> Option<
         Box<
             dyn SinkCommitter<
-                CommitInfo = Self::CommitInfo,
-                AggregatedCommitInfo = Self::AggregatedCommitInfo,
-            >,
+                    CommitInfo = Self::CommitInfo,
+                    AggregatedCommitInfo = Self::AggregatedCommitInfo,
+                >,
         >,
     > {
         Some(Box::new(KafkaSinkCommitter::new()))
@@ -997,8 +1027,8 @@ impl KafkaSinkWriter {
     /// `open()` re-initializes the same transactional id, which fences any
     /// zombie producer left by the crashed run.
     pub fn restore_from_state_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        let state: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|e| anyhow::anyhow!("kafka writer state: {}", e))?;
+        let state: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("kafka writer state: {}", e))?;
         self.total_written = state
             .get("total_written")
             .and_then(|v| v.as_u64())
@@ -1339,7 +1369,10 @@ impl SinkWriter for KafkaSinkWriter {
                         }
                         Err(e) => {
                             let _ = producer.abort_transaction(Duration::from_secs(10));
-                            tracing::warn!("KafkaSinkWriter: final commit_transaction failed: {}", e);
+                            tracing::warn!(
+                                "KafkaSinkWriter: final commit_transaction failed: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -1388,7 +1421,10 @@ fn row_key(row: &Row, key_fields: &[String]) -> Option<String> {
     let mut parts = Vec::with_capacity(key_fields.len());
     for selector in key_fields {
         let field = if let Some(ordinal) = selector.strip_prefix('#') {
-            ordinal.parse::<usize>().ok().and_then(|i| row.fields.get(i))
+            ordinal
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| row.fields.get(i))
         } else {
             // Match generated field names (f0..fN) against the selector.
             selector
@@ -1669,8 +1705,9 @@ mod tests {
         // Encoder builds and finds the mapping.
         assert!(seatunnel_formats::canal_client_json::CanalClientEncoder::new(canal).is_ok());
         // Non-canal-client formats leave it off.
-        let props2: HashMap<String, String> =
-            [("format".to_string(), "json".to_string())].into_iter().collect();
+        let props2: HashMap<String, String> = [("format".to_string(), "json".to_string())]
+            .into_iter()
+            .collect();
         assert!(
             KafkaSinkConfig::from_config(&ConnectorConfig::new(props2))
                 .canal_client

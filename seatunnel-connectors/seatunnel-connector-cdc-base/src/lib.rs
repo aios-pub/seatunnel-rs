@@ -233,14 +233,15 @@ pub fn diff_columns(
     {
         return vec![SchemaChangeEvent::new(
             table,
-            vec![SchemaChange::rename_column(dropped[0], added[0].name.clone())],
+            vec![SchemaChange::rename_column(
+                dropped[0],
+                added[0].name.clone(),
+            )],
         )];
     }
 
     // Positions in the NEW layout so positional sinks can map by ordinal.
-    let position_of = |name: &str| -> Option<usize> {
-        new.iter().position(|c| c.name == name)
-    };
+    let position_of = |name: &str| -> Option<usize> { new.iter().position(|c| c.name == name) };
     let mut changes: Vec<SchemaChange> = Vec::new();
     for col in added {
         let pos = position_of(&col.name);
@@ -270,7 +271,6 @@ pub fn diff_columns(
     }
     vec![SchemaChangeEvent::new(table, changes)]
 }
-
 
 // ---------------------------------------------------------------------------
 // Table selection (official option set)
@@ -319,7 +319,9 @@ impl TableSelector {
                     .expect("escaped regex"),
             );
         } else {
-            selector.tables.push((database.to_string(), table.to_string()));
+            selector
+                .tables
+                .push((database.to_string(), table.to_string()));
         }
         selector
     }
@@ -340,10 +342,7 @@ impl TableSelector {
         }
         let qualified = format!("{}.{}", database, table);
         self.tables.iter().any(|(d, t)| d == database && t == table)
-            || self
-                .table_patterns
-                .iter()
-                .any(|re| re.is_match(&qualified))
+            || self.table_patterns.iter().any(|re| re.is_match(&qualified))
     }
 
     /// Database names in the selection (diagnostics).
@@ -364,8 +363,6 @@ impl TableSelector {
     }
 }
 
-
-
 /// Assemble the [`TableSelector`] from the official option set, folding in
 /// the legacy single-name forms.
 pub fn build_table_selector(
@@ -375,24 +372,50 @@ pub fn build_table_selector(
 ) -> TableSelector {
     // Official options REPLACE the legacy single-name forms; legacy
     // selection only applies when its official counterpart is absent.
-    let has_official_databases = !config.get_string("database-names", &config.get_string("database_names", "")).is_empty()
-        || !config.get_string("database-pattern", &config.get_string("database_pattern", "")).is_empty();
-    let has_official_tables = !config.get_string("table-names", &config.get_string("table_names", "")).is_empty()
-        || !config.get_string("table-pattern", &config.get_string("table_pattern", "")).is_empty();
+    let has_official_databases = !config
+        .get_string("database-names", &config.get_string("database_names", ""))
+        .is_empty()
+        || !config
+            .get_string(
+                "database-pattern",
+                &config.get_string("database_pattern", ""),
+            )
+            .is_empty();
+    let has_official_tables = !config
+        .get_string("table-names", &config.get_string("table_names", ""))
+        .is_empty()
+        || !config
+            .get_string("table-pattern", &config.get_string("table_pattern", ""))
+            .is_empty();
     let mut selector = TableSelector::from_legacy(
-        if has_official_databases { "" } else { legacy_db },
-        if has_official_tables { "" } else { legacy_table },
+        if has_official_databases {
+            ""
+        } else {
+            legacy_db
+        },
+        if has_official_tables {
+            ""
+        } else {
+            legacy_table
+        },
     );
 
     // database-names: comma list of exact names (arrays arrive comma-joined).
     let databases = config.get_string("database-names", &config.get_string("database_names", ""));
-    for db in databases.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+    for db in databases
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
         if !selector.databases.contains(&db.to_string()) {
             selector.databases.push(db.to_string());
         }
     }
     // database-pattern: regex.
-    let db_pattern = config.get_string("database-pattern", &config.get_string("database_pattern", ""));
+    let db_pattern = config.get_string(
+        "database-pattern",
+        &config.get_string("database_pattern", ""),
+    );
     if !db_pattern.is_empty() {
         if let Some(re) = TableSelector::compile(&format!("^(?:{})$", db_pattern)) {
             selector.database_pattern = Some(re);
@@ -413,16 +436,20 @@ pub fn build_table_selector(
         }
     }
     // table-names-config: per-table primaryKeys / snapshotSplitColumn.
-    let config_list = config.get_string("table-names-config", &config.get_string("table_names_config", ""));
+    let config_list = config.get_string(
+        "table-names-config",
+        &config.get_string("table_names_config", ""),
+    );
     if !config_list.is_empty() {
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&config_list)
-            .unwrap_or_default();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&config_list).unwrap_or_default();
         for entry in parsed {
             let Some(table) = entry.get("table").and_then(|t| t.as_str()) else {
                 continue;
             };
             if let Some(split_col) = entry.get("snapshotSplitColumn").and_then(|c| c.as_str()) {
-                selector.split_columns.insert(table.to_string(), split_col.to_string());
+                selector
+                    .split_columns
+                    .insert(table.to_string(), split_col.to_string());
             }
         }
     }
@@ -572,10 +599,8 @@ impl SchemaWatcher {
             let event =
                 SchemaChangeEvent::new(self.table_id.clone(), changes).with_statement(ddl.trim());
             if !self.columns.is_empty() {
-                let mut schema = seatunnel_api::TableSchema::new(
-                    self.table_id.clone(),
-                    self.columns.clone(),
-                );
+                let mut schema =
+                    seatunnel_api::TableSchema::new(self.table_id.clone(), self.columns.clone());
                 if schema.apply_schema_change_event(&event).is_ok() {
                     self.columns = schema.columns;
                 }
@@ -647,9 +672,7 @@ fn set_position(
         },
         (
             SchemaChange::RenameColumn {
-                old_name,
-                new_name,
-                ..
+                old_name, new_name, ..
             },
             pos,
         ) => SchemaChange::RenameColumn {
@@ -720,7 +743,11 @@ pub fn parse_alter_table(ddl: &str) -> Option<Vec<seatunnel_api::SchemaChange>> 
         } else if action_lower.starts_with("drop ") {
             let inner = strip_keyword(&action_norm, "drop");
             let inner = strip_keyword(inner, "column");
-            let name = inner.split_whitespace().next().unwrap_or("").trim_matches('`');
+            let name = inner
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('`');
             if !name.is_empty() {
                 changes.push(SchemaChange::drop_column(name));
             }
@@ -887,7 +914,6 @@ pub fn parse_type_spec(ty: &str) -> (String, Option<u32>, Option<i8>) {
         (ty.trim().to_string(), None, None)
     }
 }
-
 
 /// Official SeaTunnel options that are accepted for configuration
 /// compatibility but not implemented by this Rust engine; each present
@@ -1112,7 +1138,9 @@ mod tests {
         use seatunnel_api::{ColumnDef, ColumnType, SchemaChange};
 
         // ADD COLUMN
-        let changes = parse_alter_table("ALTER TABLE `db`.`users` ADD COLUMN email VARCHAR(64) NOT NULL").unwrap();
+        let changes =
+            parse_alter_table("ALTER TABLE `db`.`users` ADD COLUMN email VARCHAR(64) NOT NULL")
+                .unwrap();
         assert_eq!(
             changes,
             vec![SchemaChange::add_column(
@@ -1143,7 +1171,9 @@ mod tests {
         );
 
         // CHANGE COLUMN = rename + modify
-        let changes = parse_alter_table("ALTER TABLE users CHANGE COLUMN name full_name VARCHAR(128)").unwrap();
+        let changes =
+            parse_alter_table("ALTER TABLE users CHANGE COLUMN name full_name VARCHAR(128)")
+                .unwrap();
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0], SchemaChange::rename_column("name", "full_name"));
 
@@ -1156,7 +1186,11 @@ mod tests {
         assert_eq!(changes.len(), 2);
 
         // Ignored clause types produce no changes; non-ALTER is None.
-        assert!(parse_alter_table("ALTER TABLE t ADD INDEX idx_name (name)").unwrap().is_empty());
+        assert!(
+            parse_alter_table("ALTER TABLE t ADD INDEX idx_name (name)")
+                .unwrap()
+                .is_empty()
+        );
         assert!(parse_alter_table("CREATE TABLE t (a INT)").is_none());
         assert!(parse_alter_table("BEGIN").is_none());
     }
@@ -1219,4 +1253,3 @@ mod tests {
         assert!(watcher.columns().iter().any(|c| c.name == "email"));
     }
 }
-

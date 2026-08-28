@@ -51,20 +51,20 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 
-use mysql_async::{prelude::*, OptsBuilder, Pool, Value as MysqlValue};
+use mysql_async::{OptsBuilder, Pool, Value as MysqlValue, prelude::*};
 use seatunnel_api::{
     row::{Field, Row, RowKind},
     schema::TableSchema,
     source::{
+        Boundedness, Source,
         source_reader::{PollResult, SourceReader, SourceReaderContext},
         source_split::SourceSplit,
         source_split_enum::SourceSplitEnumeratorContext,
-        Boundedness, Source,
     },
 };
 use seatunnel_connector_cdc_base::{
-    parse_type_spec, SchemaEvolutionConfig, SchemaWatcher,
-    CdcPhase, CdcState, IncrementalSplit, SnapshotSplit, Watermark,
+    CdcPhase, CdcState, IncrementalSplit, SchemaEvolutionConfig, SchemaWatcher, SnapshotSplit,
+    Watermark, parse_type_spec,
 };
 use seatunnel_connector_common::ConnectorConfig;
 
@@ -240,7 +240,10 @@ impl Default for TiDBCdcConfig {
             tikv_batch_scan_concurrency: 0,
             startup_specific_tso: 0,
             compat_warnings: Vec::new(),
-            table_selector: seatunnel_connector_cdc_base::TableSelector::from_legacy("seatunnel", "users"),
+            table_selector: seatunnel_connector_cdc_base::TableSelector::from_legacy(
+                "seatunnel",
+                "users",
+            ),
             schema_evolution: SchemaEvolutionConfig::default(),
             conn: TiDBCdcConnConfig::new("127.0.0.1", 4000, "root", "", "seatunnel"),
         }
@@ -249,10 +252,11 @@ impl Default for TiDBCdcConfig {
 
 impl TiDBCdcConfig {
     pub fn from_config(config: &ConnectorConfig) -> Self {
-        let pd = config.get_string(
-            "pd-addresses",
-            &config.get_string("pd_addrs", &config.get_string("pd-addrs", "127.0.0.1:2379")),
-        )
+        let pd = config
+            .get_string(
+                "pd-addresses",
+                &config.get_string("pd_addrs", &config.get_string("pd-addrs", "127.0.0.1:2379")),
+            )
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -261,14 +265,20 @@ impl TiDBCdcConfig {
         let (url_host, url_port, url_db) = config
             .get("url")
             .and_then(|u| {
-                let rest = u.strip_prefix("jdbc:mysql://").or_else(|| u.strip_prefix("mysql://"))?;
+                let rest = u
+                    .strip_prefix("jdbc:mysql://")
+                    .or_else(|| u.strip_prefix("mysql://"))?;
                 let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
                 let database = path.split('?').next().unwrap_or("").to_string();
                 let (host, port) = match authority.rsplit_once(':') {
                     Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(4000)),
                     None => (authority.to_string(), 4000),
                 };
-                if host.is_empty() { None } else { Some((host, port, database)) }
+                if host.is_empty() {
+                    None
+                } else {
+                    Some((host, port, database))
+                }
             })
             .unwrap_or_default();
 
@@ -276,16 +286,16 @@ impl TiDBCdcConfig {
             pd_addrs: pd,
             cluster_id: {
                 let v = config.get_int("cluster-id", -1);
-                if v >= 0 {
-                    Some(v as u64)
-                } else {
-                    None
-                }
+                if v >= 0 { Some(v as u64) } else { None }
             },
             namespace: config.get_string("namespace", "seatunnel"),
             database_name: {
                 let v = config.get_string("database-name", &url_db);
-                if v.is_empty() { "seatunnel".to_string() } else { v }
+                if v.is_empty() {
+                    "seatunnel".to_string()
+                } else {
+                    v
+                }
             },
             table_name: config.get_string("table-name", "users"),
             split_column: config.get_string("split.column", "id"),
@@ -311,15 +321,15 @@ impl TiDBCdcConfig {
             // churn against TiKV's observe-handle lifecycle.
             resubscribe_interval_ms: config.get_int("resubscribe-interval-ms", 0).max(0) as u64,
             batch_size_per_scan: config
-                .get_int("batch-size-per-scan", config.get_int("batch_size_per_scan", 1000))
+                .get_int(
+                    "batch-size-per-scan",
+                    config.get_int("batch_size_per_scan", 1000),
+                )
                 .max(1),
             tikv_timeout_ms: config
                 .get_int(
                     "tikv.grpc.timeout_in_ms",
-                    config.get_int(
-                        "timeout",
-                        config.get_int("tikv.grpc.timeout-in-ms", 0),
-                    ),
+                    config.get_int("timeout", config.get_int("tikv.grpc.timeout-in-ms", 0)),
                 )
                 .max(0) as u64,
             tikv_scan_timeout_ms: config
@@ -328,10 +338,14 @@ impl TiDBCdcConfig {
                     config.get_int("tikv.grpc.scan-timeout-in-ms", 0),
                 )
                 .max(0) as u64,
-            tikv_batch_get_concurrency: config
-                .get_int("tikv.batch_get_concurrency", config.get_int("tikv.batch-get-concurrency", 0)),
-            tikv_batch_scan_concurrency: config
-                .get_int("tikv.batch_scan_concurrency", config.get_int("tikv.batch-scan-concurrency", 0)),
+            tikv_batch_get_concurrency: config.get_int(
+                "tikv.batch_get_concurrency",
+                config.get_int("tikv.batch-get-concurrency", 0),
+            ),
+            tikv_batch_scan_concurrency: config.get_int(
+                "tikv.batch_scan_concurrency",
+                config.get_int("tikv.batch-scan-concurrency", 0),
+            ),
             startup_specific_tso: config
                 .get_int(
                     "startup.specific-offset.pos",
@@ -348,18 +362,32 @@ impl TiDBCdcConfig {
             conn: TiDBCdcConnConfig::new(
                 {
                     let v = config.get_string("conn-host", &url_host);
-                    if v.is_empty() { "127.0.0.1".to_string() } else { v }
+                    if v.is_empty() {
+                        "127.0.0.1".to_string()
+                    } else {
+                        v
+                    }
                 }
                 .as_str(),
                 {
                     let p = config.get_int("conn-port", -1);
-                    if p > 0 { p as u16 } else if url_port > 0 { url_port } else { 4000 }
+                    if p > 0 {
+                        p as u16
+                    } else if url_port > 0 {
+                        url_port
+                    } else {
+                        4000
+                    }
                 },
                 config.get_string("conn-user", "root").as_str(),
                 config.get_string("conn-password", "").as_str(),
                 {
                     let v = config.get_string("conn-database", &url_db);
-                    if v.is_empty() { "seatunnel".to_string() } else { v }
+                    if v.is_empty() {
+                        "seatunnel".to_string()
+                    } else {
+                        v
+                    }
                 }
                 .as_str(),
             ),
@@ -437,7 +465,6 @@ async fn resolve_captured_tables(
     }
     Ok(targets)
 }
-
 
 /// Compute this subtask's disjoint snapshot ranges `[start,end)` over the
 /// split column, chunked into ≤ SNAPSHOT_BATCH_SIZE spans.
@@ -778,14 +805,17 @@ impl TiDBCdcReader {
         Ok(())
     }
 
-
     /// Fetch the table's column metadata as (ColumnDef list, engine column
     /// types, pk ordinal). Used to prime and refresh the schema watcher.
     async fn fetch_column_metadata_for(
         config: &TiDBCdcConfig,
         database: &str,
         table: &str,
-    ) -> anyhow::Result<(Vec<seatunnel_api::ColumnDef>, Vec<crate::decoder::RowColType>, Option<usize>)> {
+    ) -> anyhow::Result<(
+        Vec<seatunnel_api::ColumnDef>,
+        Vec<crate::decoder::RowColType>,
+        Option<usize>,
+    )> {
         let pool = config.conn.to_pool();
         let mut conn = pool.get_conn().await?;
         let sql = format!(
@@ -814,13 +844,10 @@ impl TiDBCdcReader {
                 pk_ordinal = Some(idx);
             }
             defs.push(
-                seatunnel_api::ColumnDef::new(
-                    name,
-                    dialect.map_type(&base, len, scale),
-                )
-                .nullable(nullable.as_deref() != Some("NO"))
-                .with_primary_key(primary)
-                .source_type(ctype.clone()),
+                seatunnel_api::ColumnDef::new(name, dialect.map_type(&base, len, scale))
+                    .nullable(nullable.as_deref() != Some("NO"))
+                    .with_primary_key(primary)
+                    .source_type(ctype.clone()),
             );
             col_types.push(crate::decoder::parse_column_type(&ctype));
         }
@@ -1064,14 +1091,21 @@ impl SourceReader for TiDBCdcReader {
                     self.start_engine_for(&target).await?;
                 }
             }
-            if streams_changes && self.config.schema_evolution.enabled && self.schema_watchers.is_empty() {
+            if streams_changes
+                && self.config.schema_evolution.enabled
+                && self.schema_watchers.is_empty()
+            {
                 for target in &self.tables {
                     let mut watcher = SchemaWatcher::new(
                         format!("{}.{}", target.database, target.table),
                         &self.config.schema_evolution,
                     );
-                    match Self::fetch_column_metadata_for(&self.config, &target.database, &target.table)
-                        .await
+                    match Self::fetch_column_metadata_for(
+                        &self.config,
+                        &target.database,
+                        &target.table,
+                    )
+                    .await
                     {
                         Ok((defs, _, _)) => watcher.prime(defs),
                         Err(e) => {
@@ -1090,8 +1124,7 @@ impl SourceReader for TiDBCdcReader {
                     .get(self.current_table_idx)
                     .cloned()
                     .unwrap_or(first);
-                let ranges =
-                    enumerate_snapshot_ranges(&mut conn, &self.config, &target).await?;
+                let ranges = enumerate_snapshot_ranges(&mut conn, &self.config, &target).await?;
                 self.pending_ranges.extend(ranges);
             }
 
@@ -1144,7 +1177,9 @@ impl SourceReader for TiDBCdcReader {
             self.drain_engine(scan_budget).await;
 
             if let Some((start, end)) = self.pending_ranges.front().copied() {
-                let pool = self.sql_pool.get_or_insert_with(|| self.config.conn.to_pool());
+                let pool = self
+                    .sql_pool
+                    .get_or_insert_with(|| self.config.conn.to_pool());
                 let mut conn = pool.get_conn().await?;
                 let (cur_db, cur_table) = {
                     let target = &self.tables[self.current_table_idx.min(self.tables.len() - 1)];
@@ -1176,8 +1211,7 @@ impl SourceReader for TiDBCdcReader {
                             let target = self.tables[next_idx].clone();
                             self.current_table_idx = next_idx;
                             let ranges =
-                                enumerate_snapshot_ranges(&mut conn, &self.config, &target)
-                                    .await?;
+                                enumerate_snapshot_ranges(&mut conn, &self.config, &target).await?;
                             self.pending_ranges = ranges.into_iter().collect();
                         }
                     }
@@ -1231,7 +1265,11 @@ impl SourceReader for TiDBCdcReader {
             .map(|e| e.resolved_ts())
             .min()
             .unwrap_or(self.resolved_ts.0);
-        self.resolved_ts = ResolvedTs(resolved_ts.max(self.resolved_ts.0).min(resolved_ts.max(self.resolved_ts.0)));
+        self.resolved_ts = ResolvedTs(
+            resolved_ts
+                .max(self.resolved_ts.0)
+                .min(resolved_ts.max(self.resolved_ts.0)),
+        );
         offset.insert("resolved_ts".to_string(), resolved_ts.to_string());
         if self.tables.len() > 1 {
             offset.insert(

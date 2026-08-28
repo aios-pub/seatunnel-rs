@@ -44,11 +44,9 @@ pub mod xa_sink;
 
 pub use conn::{DbEndpoint, QueryResult};
 pub use dialect::JdbcDialectKind;
-pub use sink::{
-    DataSaveMode, JdbcSink, JdbcSinkConfig, JdbcSinkWriter, SchemaSaveMode,
-};
+pub use sink::{DataSaveMode, JdbcSink, JdbcSinkConfig, JdbcSinkWriter, SchemaSaveMode};
 pub use source::{JdbcSourceConfig, JdbcSourceReader, JdbcSourceState};
-pub use url::{parse_jdbc_url, JdbcUrl};
+pub use url::{JdbcUrl, parse_jdbc_url};
 pub use value::SqlValue;
 
 pub use source::JdbcSplit;

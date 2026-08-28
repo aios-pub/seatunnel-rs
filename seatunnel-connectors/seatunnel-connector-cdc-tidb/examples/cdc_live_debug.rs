@@ -21,11 +21,11 @@ use futures::StreamExt;
 use prost::Message;
 use tokio::time::sleep;
 
+use seatunnel_connector_cdc_tidb::decoder::decode_record_key;
 use seatunnel_connector_cdc_tidb::kvproto::cdcpb::change_data_client::ChangeDataClient;
 use seatunnel_connector_cdc_tidb::kvproto::cdcpb::event::Event as CdcEvent;
 use seatunnel_connector_cdc_tidb::kvproto::cdcpb::{ChangeDataRequest, Header};
 use seatunnel_connector_cdc_tidb::kvproto::kvrpcpb::ExtraOp;
-use seatunnel_connector_cdc_tidb::decoder::decode_record_key;
 use seatunnel_connector_cdc_tidb::pd_client::PdClient;
 use seatunnel_connector_cdc_tidb::table_key_range;
 
@@ -243,7 +243,12 @@ async fn main() -> anyhow::Result<()> {
     std::process::exit(0);
 }
 
-async fn run_region_stream(addr: String, region_id: u64, request: ChangeDataRequest, duration: u64) {
+async fn run_region_stream(
+    addr: String,
+    region_id: u64,
+    request: ChangeDataRequest,
+    duration: u64,
+) {
     let uri = if addr.starts_with("http://") {
         addr.clone()
     } else {
@@ -273,12 +278,7 @@ async fn run_region_stream(addr: String, region_id: u64, request: ChangeDataRequ
     let mut stream = match client.event_feed_v2(grpc_req).await {
         Ok(resp) => resp.into_inner(),
         Err(e) => {
-            eprintln!(
-                "[{}] region {} EventFeedV2 failed: {}",
-                now(),
-                region_id,
-                e
-            );
+            eprintln!("[{}] region {} EventFeedV2 failed: {}", now(), region_id, e);
             return;
         }
     };
@@ -304,7 +304,7 @@ async fn run_region_stream(addr: String, region_id: u64, request: ChangeDataRequ
                 eprintln!("[{}] region {} stream closed by server", now(), region_id);
                 break;
             }
-            Ok(Ok(Some(ev)) ) => ev,
+            Ok(Ok(Some(ev))) => ev,
         };
         counters.messages += 1;
         print_event(region_id, &event, &mut counters);
@@ -326,7 +326,11 @@ async fn run_region_stream(addr: String, region_id: u64, request: ChangeDataRequ
     );
 }
 
-fn print_event(region_id: u64, event: &seatunnel_connector_cdc_tidb::kvproto::cdcpb::ChangeDataEvent, counters: &mut Counters) {
+fn print_event(
+    region_id: u64,
+    event: &seatunnel_connector_cdc_tidb::kvproto::cdcpb::ChangeDataEvent,
+    counters: &mut Counters,
+) {
     for ev in &event.events {
         let tag = format!("region={} rid={}", ev.region_id, ev.request_id);
         match &ev.event {

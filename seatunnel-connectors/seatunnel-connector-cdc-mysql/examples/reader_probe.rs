@@ -34,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
     for _ in 0..40 {
         match reader.poll_next().await? {
             PollResult::Record(_) => println!("[warmup] unexpected record"),
-            PollResult::SchemaChange(e) => println!("[warmup] schema change: {:?}", e.changes.len()),
+            PollResult::SchemaChange(e) => {
+                println!("[warmup] schema change: {:?}", e.changes.len())
+            }
             PollResult::Empty => {}
             PollResult::EOF => {
                 println!("[warmup] EOF");

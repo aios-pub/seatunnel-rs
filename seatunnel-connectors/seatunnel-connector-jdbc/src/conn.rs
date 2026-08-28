@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::dialect::JdbcDialectKind;
 use crate::url::JdbcUrl;
-use crate::value::{mysql_value_to_sql, SqlValue};
+use crate::value::{SqlValue, mysql_value_to_sql};
 
 /// Query result: column names + rows of driver-neutral values.
 #[derive(Debug, Clone)]
@@ -269,8 +269,7 @@ impl DbEndpoint {
         match self {
             DbEndpoint::MySql(pool) => {
                 let mut conn = pool.get_conn().await?;
-                let values: Vec<mysql_async::Value> =
-                    params.iter().map(|p| p.into()).collect();
+                let values: Vec<mysql_async::Value> = params.iter().map(|p| p.into()).collect();
                 conn.exec_drop(sql, values).await?;
                 Ok(0)
             }
@@ -308,8 +307,7 @@ impl DbEndpoint {
         match self {
             DbEndpoint::MySql(pool) => {
                 let mut conn = pool.get_conn().await?;
-                let values: Vec<mysql_async::Value> =
-                    params.iter().map(|p| p.into()).collect();
+                let values: Vec<mysql_async::Value> = params.iter().map(|p| p.into()).collect();
                 let result: Vec<mysql_async::Row> = conn.exec(sql, values).await?;
                 let columns = result
                     .first()
@@ -345,12 +343,7 @@ impl DbEndpoint {
                 let rows = client.query(sql, &refs).await?;
                 let columns = rows
                     .first()
-                    .map(|r| {
-                        r.columns()
-                            .iter()
-                            .map(|c| c.name().to_string())
-                            .collect()
-                    })
+                    .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
                     .unwrap_or_default();
                 let mut out = Vec::with_capacity(rows.len());
                 for row in &rows {
@@ -377,12 +370,36 @@ fn pg_cell_to_sql(
 ) -> SqlValue {
     use tokio_postgres::types::Type;
     match *ty {
-        Type::BOOL => row.try_get::<_, Option<bool>>(idx).ok().flatten().map(SqlValue::Bool),
-        Type::INT2 => row.try_get::<_, Option<i16>>(idx).ok().flatten().map(|v| SqlValue::Int(v as i64)),
-        Type::INT4 => row.try_get::<_, Option<i32>>(idx).ok().flatten().map(|v| SqlValue::Int(v as i64)),
-        Type::INT8 => row.try_get::<_, Option<i64>>(idx).ok().flatten().map(SqlValue::Int),
-        Type::FLOAT4 => row.try_get::<_, Option<f32>>(idx).ok().flatten().map(|v| SqlValue::Float(v as f64)),
-        Type::FLOAT8 => row.try_get::<_, Option<f64>>(idx).ok().flatten().map(SqlValue::Float),
+        Type::BOOL => row
+            .try_get::<_, Option<bool>>(idx)
+            .ok()
+            .flatten()
+            .map(SqlValue::Bool),
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| SqlValue::Int(v as i64)),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| SqlValue::Int(v as i64)),
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(idx)
+            .ok()
+            .flatten()
+            .map(SqlValue::Int),
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| SqlValue::Float(v as f64)),
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)
+            .ok()
+            .flatten()
+            .map(SqlValue::Float),
         Type::BYTEA => row
             .try_get::<_, Option<Vec<u8>>>(idx)
             .ok()

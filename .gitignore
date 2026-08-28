@@ -30,3 +30,6 @@ examples/**/*.toml.backup
 /.zcode/
 /CLAUDE.md
 book/
+
+# Leptos frontend build cache (trunk/wasm)
+seatunnel-web/ui/target

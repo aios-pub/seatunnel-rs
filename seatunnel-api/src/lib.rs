@@ -41,7 +41,7 @@ pub use execution::{Engine, ExecutionMode};
 pub use factory::{Factory, FactoryContext};
 pub use row::{ColumnType, Field, Row, RowKind};
 pub use schema::{
-    ColumnDef, DatabaseDialect, SchemaChange, SchemaChangeEvent, SchemaChangeError,
+    ColumnDef, DatabaseDialect, SchemaChange, SchemaChangeError, SchemaChangeEvent,
     SchemaDiscoverer, TableSchema,
 };
 pub use sink::{Sink, SinkCommitter, SinkWriter};

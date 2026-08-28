@@ -1,0 +1,22 @@
+# Streaming demo: unbounded FakeSource → Console, for the web console.
+#
+# Run it from the console (Jobs → Submit job) or:
+#   seatunnel run -m local -c examples/web-streaming-demo.yaml
+#
+# `row.num: -1` = unbounded stream; `sleep.ms: 10` paces it to ~100 rec/s
+# so throughput, idle time, checkpoints and live logs are all observable.
+# Cancel the job when done.
+
+env:
+  job.name: streaming-demo
+  parallelism: 1
+  checkpoint:
+    interval: 10000
+
+source:
+  FakeSource:
+    row.num: -1
+    sleep.ms: 10
+
+sink:
+  Console: {}
