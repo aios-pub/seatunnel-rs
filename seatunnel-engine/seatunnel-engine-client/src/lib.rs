@@ -7,6 +7,10 @@
 //!
 //! Provides gRPC client for job submission and REST API for monitoring.
 
+pub mod update;
+
+pub use update::{UpdateOptions, UpdateOutcome, update_job};
+
 use reqwest::Client as HttpClient;
 use seatunnel_engine_comm::{
     CancelJobRequest, ClientServiceClient, ClusterInfo, JobCheckpointHistory, JobList, JobLogs,

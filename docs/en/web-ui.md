@@ -197,3 +197,28 @@ the leader line shows the fencing term and node role. The same signals
 are exported as Prometheus gauges (`seatunnel_worker_load_score`,
 `seatunnel_worker_overloaded`, `seatunnel_worker_lag_ms`,
 `seatunnel_worker_mem_ratio`).
+
+## Job detail — edit and restart
+
+The job detail page carries an **编辑配置并重启 (Edit & restart)** button
+(**以同 ID 重新提交** for terminal jobs). It opens an editor pre-filled
+with the job configuration EXACTLY as submitted (stored verbatim at
+submission time and returned by the status API).
+
+Confirming runs the update flow — identical to `seatunnel job update`:
+
+1. cancel the running incarnation (its cancel path takes the automatic
+   exit checkpoint: final sink flush + source position);
+2. wait for CANCELLED; on timeout the update ABORTS without resubmitting
+   (old and new never run in parallel);
+3. resubmit the edited config under the same job id — tasks restore from
+   their latest checkpoint and continue from the exact source position
+   (at-least-once; exactly-once with transactional sinks).
+
+The request may take up to the cancel timeout (~seconds normally); the
+page shows the progress message while it runs and the status panel
+refreshes automatically afterwards.
+
+`POST /api/v1/jobs/{job_id}/update` with
+`{"config_text": "<edited JSON>", "cancel_timeout_secs": 60}` is the
+backing API.

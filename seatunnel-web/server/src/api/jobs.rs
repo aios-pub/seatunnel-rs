@@ -12,7 +12,7 @@ use axum::Json;
 use uuid::Uuid;
 
 use crate::api::error_response;
-use crate::dto::{CheckpointHistoryDto, SubmitJobDto};
+use crate::dto::{CheckpointHistoryDto, SubmitJobDto, UpdateJobDto};
 use crate::{AppState, EngineError};
 
 /// `GET /api/v1/jobs` — all jobs, newest first.
@@ -125,6 +125,58 @@ pub async fn submit_job(
 }
 
 /// `POST /api/v1/jobs/{job_id}/cancel` — cancel a running job.
+/// `POST /api/v1/jobs/{job_id}/update` — edit-and-restart with the same
+/// job id (checkpoint restore). Long-running by design (≤ cancel timeout).
+pub async fn update_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(body): Json<UpdateJobDto>,
+) -> Response {
+    // The edit basis is the JSON returned by job detail; accept only JSON
+    // (other formats are submit-time concerns).
+    let format = body.format.as_deref().unwrap_or("json");
+    if format != "json" {
+        return error_response(&EngineError::Invalid(
+            "update accepts JSON config text (as returned by the job detail's job_config)"
+                .to_string(),
+        ));
+    }
+    let config_bytes = match body.config_text.trim() {
+        "" => {
+            return error_response(&EngineError::Invalid(
+                "config_text must not be empty".to_string(),
+            ))
+        }
+        text => serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|e| EngineError::Invalid(format!("invalid JSON config: {}", e)))
+            .and_then(|v| serde_json::to_vec(&v).map_err(|e| EngineError::Invalid(e.to_string())))
+            .and_then(|b| Ok(b)),
+    };
+    let config_bytes = match config_bytes {
+        Ok(b) => b,
+        Err(e) => return error_response(&e),
+    };
+    // Default the name to the job id stem when not provided.
+    let job_name = body
+        .job_name
+        .clone()
+        .unwrap_or_else(|| job_id.clone());
+    match state
+        .engine
+        .update_job(
+            &job_id,
+            &job_name,
+            config_bytes,
+            body.parallelism.unwrap_or(0),
+            body.cancel_timeout_secs,
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
 pub async fn cancel_job(State(state): State<AppState>, Path(job_id): Path<String>) -> Response {
     match state.engine.cancel_job(&job_id).await {
         Ok(()) => (

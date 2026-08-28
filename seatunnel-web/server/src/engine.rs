@@ -12,13 +12,13 @@
 use async_trait::async_trait;
 use seatunnel_engine_client::EngineClient;
 use seatunnel_engine_comm::{
-    CheckpointEntry, ClusterInfo, JobCheckpointHistory, JobList, JobLogs, JobStatus, JobSummary,
+    CheckpointEntry, ClusterInfo, JobCheckpointHistory, JobList, JobStatus, JobSummary,
 };
 
 use crate::dto::{
     CheckpointEntryDto, CheckpointHistoryDto, ClusterInfoDto, JobLogsDto, JobStatusDto,
     JobSummaryDto, SubmitJobDto, SubmitResultDto, TaskCheckpointDto, TaskLogsDto, TaskStatusDto,
-    WorkerDto,
+    UpdateResultDto, WorkerDto,
 };
 
 /// Engine operation failures, mapped to HTTP statuses by the handlers.
@@ -101,6 +101,15 @@ pub trait EngineOps: Send + Sync {
     async fn submit_job(&self, job: SubmitJobDto, job_id: String, config_bytes: Vec<u8>)
         -> Result<SubmitResultDto, EngineError>;
     async fn cancel_job(&self, job_id: &str) -> Result<(), EngineError>;
+    /// Edit-and-restart: cancel (exit checkpoint) → resubmit same id.
+    async fn update_job(
+        &self,
+        job_id: &str,
+        job_name: &str,
+        config_bytes: Vec<u8>,
+        parallelism: i32,
+        cancel_timeout_secs: u64,
+    ) -> Result<UpdateResultDto, EngineError>;
     async fn cluster_info(&self) -> Result<ClusterInfoDto, EngineError>;
     async fn job_checkpoints(&self, job_id: &str) -> Result<CheckpointHistoryDto, EngineError>;
     async fn job_logs(&self, job_id: &str) -> Result<JobLogsDto, EngineError>;
@@ -126,6 +135,7 @@ fn status_dto(s: JobStatus) -> JobStatusDto {
         error_message: s.error_message,
         checkpoint_interval_ms: s.checkpoint_interval_ms,
         checkpoints_completed: s.checkpoints_completed,
+        job_config: s.job_config,
         tasks: s
             .tasks
             .into_iter()
@@ -231,6 +241,40 @@ impl EngineOps for EngineClient {
         EngineClient::cancel_job(self, job_id)
             .await
             .map_err(EngineError::from_client)
+    }
+
+    async fn update_job(
+        &self,
+        job_id: &str,
+        job_name: &str,
+        config_bytes: Vec<u8>,
+        parallelism: i32,
+        cancel_timeout_secs: u64,
+    ) -> Result<UpdateResultDto, EngineError> {
+        // The shared flow (also used by `seatunnel job update`): cancel
+        // with exit checkpoint → wait CANCELLED → settle → resubmit the
+        // SAME id (checkpoint restore). Aborts without resubmitting on
+        // cancel timeout (never run old and new in parallel).
+        let options = seatunnel_engine_client::UpdateOptions {
+            cancel_timeout_secs,
+            ..Default::default()
+        };
+        let outcome = seatunnel_engine_client::update_job(
+            self,
+            job_id,
+            job_name,
+            config_bytes,
+            parallelism,
+            &options,
+        )
+        .await
+        .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        Ok(UpdateResultDto {
+            job_id: outcome.job_id,
+            cancelled: outcome.cancelled,
+            cancel_wait_ms: outcome.cancel_wait_ms as u64,
+            message: outcome.message,
+        })
     }
 
     async fn cluster_info(&self) -> Result<ClusterInfoDto, EngineError> {

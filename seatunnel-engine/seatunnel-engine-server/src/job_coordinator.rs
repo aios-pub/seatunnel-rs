@@ -162,6 +162,9 @@ pub struct JobDto {
     /// snapshot must continue after it, never behind.
     #[serde(default = "one")]
     pub next_checkpoint_id: u64,
+    /// The job config exactly as submitted (JSON), for edit-and-restart.
+    #[serde(default)]
+    pub raw_config: String,
     pub tasks: Vec<TaskInfoDto>,
 }
 
@@ -303,6 +306,8 @@ pub struct RunningJob {
     pub next_checkpoint_id: u64,
     /// Epoch-ms of the last coordinated trigger (volatile, not exported).
     pub last_checkpoint_trigger_ms: i64,
+    /// The job config exactly as submitted (JSON), for edit-and-restart.
+    pub raw_config: String,
 }
 
 /// Job coordinator managing the lifecycle of all submitted jobs.
@@ -714,6 +719,7 @@ impl JobCoordinator {
             );
         }
 
+        let raw_config = serde_json::to_string(config).unwrap_or_default();
         let job_dto = JobDto {
             job_id: job_id.to_string(),
             job_name: job_name.to_string(),
@@ -725,6 +731,7 @@ impl JobCoordinator {
             checkpoint_interval_ms: checkpoint_interval,
             checkpoints_completed: 0,
             next_checkpoint_id: 1,
+            raw_config: raw_config.clone(),
             tasks: task_infos
                 .values()
                 .map(|t| TaskInfoDto {
@@ -800,6 +807,7 @@ impl JobCoordinator {
             checkpoints_completed: job.checkpoints_completed,
             next_checkpoint_id: job.next_checkpoint_id,
             last_checkpoint_trigger_ms: 0,
+            raw_config: job.raw_config.clone(),
         };
         self.jobs.write().insert(running.job_id.clone(), running);
         let mut all = self.all_tasks.write();
@@ -1068,6 +1076,7 @@ impl JobCoordinator {
                     checkpoint_interval_ms: job.checkpoint_interval_ms,
                     checkpoints_completed: job.checkpoints_completed,
                     next_checkpoint_id: job.next_checkpoint_id,
+                    raw_config: job.raw_config.clone(),
                     tasks: job
                         .tasks
                         .values()
@@ -1112,39 +1121,8 @@ impl JobCoordinator {
     /// Merge a replication snapshot: only fill gaps — local state always
     /// wins (the live master receives the authoritative reports).
     pub async fn import_state(&self, snapshot: &serde_json::Value) {
-        use serde::Deserialize;
-        #[derive(Deserialize)]
-        struct TaskInfoDto {
-            task_id: String,
-            stage_id: String,
-            worker_id: String,
-            state: String,
-            processed_records: u64,
-            error: Option<String>,
-        }
-        fn one() -> u64 {
-            1
-        }
-        #[derive(Deserialize)]
-        struct JobDto {
-            job_id: String,
-            job_name: String,
-            state: String,
-            parallelism: usize,
-            start_time: i64,
-            end_time: Option<i64>,
-            #[serde(default)]
-            error_message: Option<String>,
-            #[serde(default)]
-            checkpoint_interval_ms: u64,
-            #[serde(default)]
-            checkpoints_completed: u64,
-            /// Checkpoint id counter from the exporting master; take the
-            /// max with local so ids never rewind after failover.
-            #[serde(default = "one")]
-            next_checkpoint_id: u64,
-            tasks: Vec<TaskInfoDto>,
-        }
+        // Uses the module-level DTOs (with serde defaults for pre-raw_config
+        // snapshots).
         // The fencing term never regresses: a standby that imported a
         // higher-term snapshot (a successor took over) keeps that term.
         if let Some(seen) = snapshot.get("term").and_then(|v| v.as_u64()) {
@@ -1188,6 +1166,7 @@ impl JobCoordinator {
                     RunningJob {
                         next_checkpoint_id: dto.next_checkpoint_id,
                         last_checkpoint_trigger_ms: 0,
+                        raw_config: dto.raw_config.clone(),
                         job_id: dto.job_id,
                         job_name: dto.job_name,
                         state: JobState::from(dto.state.as_str()),
@@ -1526,6 +1505,20 @@ impl JobCoordinator {
                 drop(jobs);
                 self.queue_preemption(worker_id, task_id);
                 let _ = owner;
+                return;
+            }
+            if new_state.is_terminal()
+                && matches!(task.state, JobState::Created | JobState::Scheduled)
+            {
+                // Stale by definition: a task never dispatched in THIS job
+                // incarnation cannot have completed/failed/cancelled. This
+                // is the guard that makes same-job-id resubmission (job
+                // update) safe against late terminal reports from the
+                // previous incarnation.
+                warn!(
+                    "Task {}: stale terminal report ({:?}) while undispatched; ignored",
+                    task_id, new_state
+                );
                 return;
             }
             task.state = new_state;
@@ -2244,6 +2237,61 @@ mod tests {
             ]),
         );
         assert!(claimed.iter().all(|t| t.task_id != task_id));
+    }
+
+    #[test]
+    fn test_stale_terminal_report_for_undispatched_task_is_ignored() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = coordinator
+            .compile_and_install("jr", "r", &config, None, &workers(1))
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+
+        // Late terminal report from a PREVIOUS incarnation arriving while
+        // the new incarnation's task is still Scheduled (never dispatched):
+        // must be ignored — the job must not roll to a terminal state.
+        coordinator.report_task_status("jr", &task_id, "CANCELLED", 0, None);
+        let job = coordinator.get_job("jr").unwrap();
+        assert_eq!(job.tasks[&task_id].state, JobState::Scheduled);
+        assert!(!job.state.is_terminal());
+
+        // After dispatch the same report is legitimate (job-level
+        // Cancelled comes from cancel_job, not from task reports).
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+        coordinator.report_task_status("jr", &task_id, "CANCELLED", 0, None);
+        let job = coordinator.get_job("jr").unwrap();
+        assert_eq!(job.tasks[&task_id].state, JobState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_raw_config_roundtrip_through_submit_and_snapshot() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "job.name": "editable", "parallelism": 1 },
+            "source": { "Fake": { "row.num": 1 } },
+            "sink": { "Console": {} }
+        });
+        coordinator
+            .compile_and_install("jedit", "editable", &config, None, &workers(1))
+            .unwrap();
+        // The stored config matches the submission exactly.
+        let job = coordinator.get_job("jedit").unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&job.raw_config).unwrap();
+        assert_eq!(stored, config);
+
+        // It travels with the HA snapshot.
+        let snapshot = coordinator.export_state().await;
+        let standby = JobCoordinator::new();
+        standby.import_state(&snapshot).await;
+        assert_eq!(
+            standby.get_job("jedit").unwrap().raw_config,
+            job.raw_config
+        );
     }
 
     #[test]

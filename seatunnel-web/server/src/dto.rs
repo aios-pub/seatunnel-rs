@@ -52,6 +52,39 @@ pub struct JobStatusDto {
     pub checkpoint_interval_ms: i64,
     pub checkpoints_completed: i64,
     pub tasks: Vec<TaskStatusDto>,
+    /// The job config exactly as submitted (JSON) — the edit basis for
+    /// update-and-restart.
+    #[serde(default)]
+    pub job_config: String,
+}
+
+/// Request body for `POST /api/v1/jobs/{job_id}/update`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateJobDto {
+    /// Edited job config (JSON text, as returned by job_config).
+    pub config_text: String,
+    /// Config format: "json" (default; the edit basis is JSON).
+    pub format: Option<String>,
+    /// Optional display name override.
+    pub job_name: Option<String>,
+    /// Optional parallelism override; 0 = keep config value.
+    pub parallelism: Option<i32>,
+    /// Max seconds to wait for the old job to cancel before aborting.
+    #[serde(default = "default_cancel_timeout")]
+    pub cancel_timeout_secs: u64,
+}
+
+fn default_cancel_timeout() -> u64 {
+    60
+}
+
+/// Result of an update-and-restart.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateResultDto {
+    pub job_id: String,
+    pub cancelled: bool,
+    pub cancel_wait_ms: u64,
+    pub message: String,
 }
 
 /// Request body for `POST /api/v1/jobs`.

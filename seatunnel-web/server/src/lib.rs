@@ -62,6 +62,7 @@ pub fn build_router(state: AppState) -> Router {
             )
             .route("/api/v1/jobs/{job_id}", get(api::jobs::job_detail))
             .route("/api/v1/jobs/{job_id}/cancel", axum::routing::post(api::jobs::cancel_job))
+            .route("/api/v1/jobs/{job_id}/update", axum::routing::post(api::jobs::update_job))
             .route(
                 "/api/v1/jobs/{job_id}/checkpoints",
                 get(api::jobs::job_checkpoints),

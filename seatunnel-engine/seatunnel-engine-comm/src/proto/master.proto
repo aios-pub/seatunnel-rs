@@ -229,6 +229,9 @@ message JobStatus {
   repeated TaskStatusInfo tasks = 7;
   int64 checkpoint_interval_ms = 8;
   int64 checkpoints_completed = 9;
+  // The job config exactly as submitted (JSON) — the edit basis for the
+  // update flow (edit-and-restart with the same job id).
+  string job_config = 10;
 }
 
 message TaskStatusInfo {

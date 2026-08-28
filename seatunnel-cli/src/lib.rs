@@ -80,11 +80,40 @@ pub enum JobCommand {
         /// Explicit job name (defaults to env.job.name or the file stem)
         #[arg(long)]
         name: Option<String>,
+        /// Stable job identity (defaults to a fresh random id). Use the
+        /// SAME id on resubmission to restore from the latest checkpoint.
+        #[arg(short = 'i', long)]
+        job_id: Option<String>,
         /// Parallelism override
         #[arg(long)]
         parallelism: Option<usize>,
         /// Follow the job until it reaches a terminal state
         #[arg(long, default_value_t = false)]
+        watch: bool,
+    },
+    /// Replace a RUNNING job's configuration: cancel (exit checkpoint)
+    /// then resubmit with the same job id (checkpoint restore).
+    Update {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The job id to update (required — restore is keyed by it)
+        #[arg(short = 'i', long)]
+        job_id: String,
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
+        address: String,
+        /// Explicit job name override
+        #[arg(long)]
+        name: Option<String>,
+        /// Parallelism override (keep the current value unless you
+        /// understand the restore implications)
+        #[arg(long)]
+        parallelism: Option<usize>,
+        /// Max seconds to wait for the old job to cancel before aborting
+        /// (an aborted update NEVER resubmits — no parallel old/new).
+        #[arg(long, default_value_t = 60)]
+        cancel_timeout_secs: u64,
+        /// Follow the resubmitted job until it reaches RUNNING
+        #[arg(long, default_value_t = true)]
         watch: bool,
     },
     /// List all jobs
@@ -137,13 +166,43 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 config,
                 address,
                 name,
+                job_id,
                 parallelism,
                 watch,
             } => {
-                let job_id = submit_config(&config, &address, name.as_deref(), parallelism).await?;
+                let job_id = submit_config_with_id(
+                    &config,
+                    &address,
+                    name.as_deref(),
+                    parallelism,
+                    job_id.as_deref(),
+                )
+                .await?;
                 println!("Submitted job {}", job_id);
                 if watch {
                     watch_job(&address, &job_id).await?;
+                }
+            }
+            JobCommand::Update {
+                config,
+                job_id,
+                address,
+                name,
+                parallelism,
+                cancel_timeout_secs,
+                watch,
+            } => {
+                let new_id = update_job_cli(
+                    &config,
+                    &job_id,
+                    &address,
+                    name.as_deref(),
+                    parallelism,
+                    cancel_timeout_secs,
+                )
+                .await?;
+                if watch {
+                    wait_until_running(&address, &new_id).await?;
                 }
             }
             JobCommand::List { address } => list_jobs(&address).await?,
@@ -612,6 +671,16 @@ async fn submit_config(
     name_override: Option<&str>,
     parallelism: Option<usize>,
 ) -> Result<String> {
+    submit_config_with_id(config_path, address, name_override, parallelism, None).await
+}
+
+async fn submit_config_with_id(
+    config_path: &PathBuf,
+    address: &str,
+    name_override: Option<&str>,
+    parallelism: Option<usize>,
+    explicit_job_id: Option<&str>,
+) -> Result<String> {
     let config = load_json_config(config_path)?;
     let job_name = name_override
         .map(str::to_string)
@@ -630,7 +699,9 @@ async fn submit_config(
                 .unwrap_or_else(|| "job".to_string())
         });
 
-    let job_id = format!("job-{}", uuid::Uuid::new_v4());
+    let job_id = explicit_job_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("job-{}", uuid::Uuid::new_v4()));
     let body = serde_json::to_vec(&config)?;
 
     let client = EngineClient::new(address);
@@ -653,6 +724,95 @@ fn state_name(code: i32) -> &'static str {
         5 => "FAILED",
         6 => "CANCELLED",
         _ => "CREATED",
+    }
+}
+
+/// `job update`: cancel (exit checkpoint) → resubmit with the same id.
+async fn update_job_cli(
+    config_path: &PathBuf,
+    job_id: &str,
+    address: &str,
+    name_override: Option<&str>,
+    parallelism: Option<usize>,
+    cancel_timeout_secs: u64,
+) -> Result<String> {
+    let config = load_json_config(config_path)?;
+    let job_name = name_override
+        .map(str::to_string)
+        .or_else(|| {
+            config
+                .get("env")
+                .and_then(|e| e.get("job"))
+                .and_then(|j| j.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            config_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "job".to_string())
+        });
+    let body = serde_json::to_vec(&config)?;
+
+    println!("Updating job {} (config: {:?})…", job_id, config_path);
+    println!("  1/3 stopping the old incarnation (exit checkpoint on cancel)");
+    let client = EngineClient::new(address);
+    let options = seatunnel_engine_client::UpdateOptions {
+        cancel_timeout_secs,
+        ..Default::default()
+    };
+    let outcome = seatunnel_engine_client::update_job(
+        &client,
+        job_id,
+        &job_name,
+        body,
+        parallelism.unwrap_or(0) as i32,
+        &options,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    if outcome.cancelled {
+        println!(
+            "  2/3 cancelled cleanly ({} ms to terminal)",
+            outcome.cancel_wait_ms
+        );
+    } else {
+        println!("  2/3 previous incarnation already terminal; resubmitting");
+    }
+    println!("  3/3 {}", outcome.message);
+    println!(
+        "Restore details appear in worker logs (\"restored checkpoint cp-N\"); \\
+         cross-worker restore requires checkpoint.storage.type s3|master"
+    );
+    Ok(outcome.job_id)
+}
+
+/// Poll until the job reaches RUNNING (or a terminal state).
+async fn wait_until_running(address: &str, job_id: &str) -> Result<()> {
+    let client = EngineClient::new(address);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if std::time::Instant::now() > deadline {
+            bail!("job {} did not reach RUNNING within 120s", job_id);
+        }
+        let status = client
+            .get_job_status(job_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        match status.state {
+            3 => {
+                println!("Job {} is RUNNING with the new configuration", job_id);
+                return Ok(());
+            }
+            4 | 5 => bail!(
+                "job {} reached an abnormal terminal state: {}",
+                job_id,
+                status.error_message
+            ),
+            6 => bail!("job {} was cancelled again before running", job_id),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+        }
     }
 }
 

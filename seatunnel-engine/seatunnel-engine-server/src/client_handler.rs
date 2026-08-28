@@ -258,6 +258,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             tasks,
             checkpoint_interval_ms: job.checkpoint_interval_ms as i64,
             checkpoints_completed: job.checkpoints_completed as i64,
+            job_config: job.raw_config.clone(),
         }))
     }
 

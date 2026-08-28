@@ -97,3 +97,35 @@ For every CDC source, restore order on job resubmission is:
 
 1. durable checkpoint state (last completed checkpoint), if present;
 2. otherwise the configured `startup.mode`.
+
+## Updating a running job's configuration
+
+Changing a RUNNING job's config is **stop-and-restart under the same job
+id** — never run old and new in parallel (they would double-consume the
+source).
+
+```bash
+# CLI: cancel (automatic exit checkpoint) → resubmit same id → restore
+seatunnel job update -c job.v2.yaml -i <job-id> [-a master] [--cancel-timeout-secs 60]
+```
+
+The same flow is available from the web console (job detail →
+**编辑配置并重启**) and as a shared library call
+(`seatunnel_engine_client::update_job`) — one implementation, three
+entry points.
+
+How data is preserved:
+
+1. cancel triggers the **exit checkpoint** (final sink flush, then source
+   position) — the de-facto savepoint;
+2. the flow waits for CANCELLED and aborts (never resubmitting) on
+   timeout — a partially-stopped job is never raced with a new one;
+3. resubmission with the same job id restores every task from its latest
+   checkpoint (`restored checkpoint cp-N` in worker logs): at-least-once,
+   exactly-once with transactional sinks (Kafka transactions, JdbcXa).
+
+Preconditions: cross-worker restore requires
+`checkpoint.storage.type: s3 | master` (localfile restores only on the
+same worker); keep the same parallelism (task ids and partition splits
+are parallelism-bound); resubmit within the clean-grace window
+(default 10 min — `job update` does it in seconds).

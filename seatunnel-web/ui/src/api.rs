@@ -87,6 +87,10 @@ pub struct JobStatus {
     pub error_message: String,
     pub checkpoint_interval_ms: i64,
     pub checkpoints_completed: i64,
+    /// The job config exactly as submitted (JSON) — edit basis for
+    /// update-and-restart.
+    #[serde(default)]
+    pub job_config: String,
     #[serde(default)]
     pub tasks: Vec<TaskStatus>,
 }
@@ -275,6 +279,37 @@ pub async fn job_logs(job_id: &str) -> Result<JobLogs, String> {
 
 pub async fn submit_job(request: SubmitJobRequest) -> Result<SubmitResult, String> {
     let resp = gloo_net::http::Request::post(&format!("{}/jobs", BASE))
+        .json(&request)
+        .map_err(|e| format!("request failed: {}", e))?
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e))?;
+    read_json(resp).await
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UpdateJobRequest {
+    pub config_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateResult {
+    pub job_id: String,
+    pub cancelled: bool,
+    pub cancel_wait_ms: u64,
+    pub message: String,
+}
+
+/// Edit-and-restart: cancel (exit checkpoint) → resubmit the same id.
+/// Long-running (up to the cancel timeout).
+pub async fn update_job(job_id: &str, request: UpdateJobRequest) -> Result<UpdateResult, String> {
+    let resp = gloo_net::http::Request::post(&format!("{}/jobs/{}/update", BASE, job_id))
         .json(&request)
         .map_err(|e| format!("request failed: {}", e))?
         .send()

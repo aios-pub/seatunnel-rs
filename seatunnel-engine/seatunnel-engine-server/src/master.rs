@@ -30,7 +30,6 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::admission::SharedSignals;
 use crate::job_coordinator::{Command, JobCoordinator, JobState, WorkerState};
 use crate::raft::WritePath;
 

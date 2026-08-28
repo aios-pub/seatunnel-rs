@@ -405,6 +405,82 @@ async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
     let _ = client.cancel_job(&job_id).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_flow_resubmits_same_id_via_shared_path() {
+    let (master_addr, _coordinator) = spawn_master().await.unwrap();
+    let _worker = spawn_worker(&master_addr).await.unwrap();
+    let client = EngineClient::new(&master_addr);
+
+    // Fixed identity: the whole update flow is keyed by it.
+    let job_id = format!("job-update-{}", uuid::Uuid::new_v4().simple());
+    // Unbounded throttled stream (row.num -1 + sleep.ms): deterministic
+    // long-running source without external brokers.
+    let config = serde_json::json!({
+        "env": {
+            "job.name": "before-edit",
+            "parallelism": 1,
+            "checkpoint": { "interval": 300 }
+        },
+        "source": { "Fake": { "row.num": -1, "sleep.ms": 5 } },
+        "sink": { "Console": {} }
+    });
+    let resp = client
+        .submit_job(&job_id, "before-edit", serde_json::to_vec(&config).unwrap(), 0)
+        .await
+        .unwrap();
+    assert!(resp.success);
+
+    // Wait until RUNNING with at least one checkpoint taken (the restore
+    // basis for the update).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "job never ran");
+        let s = client.get_job_status(&job_id).await.unwrap();
+        if s.state == 3 && s.checkpoints_completed >= 1 {
+            // The edit basis must be exactly what was submitted.
+            let stored: serde_json::Value = serde_json::from_str(&s.job_config).unwrap();
+            assert_eq!(stored, config);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Edit: different job name, same everything else.
+    let mut edited = config.clone();
+    edited["env"]["job.name"] = serde_json::json!("after-edit");
+    let options = seatunnel_engine_client::UpdateOptions {
+        cancel_timeout_secs: 30,
+        settle_ms: 500,
+    };
+    let outcome = seatunnel_engine_client::update_job(
+        &client,
+        &job_id,
+        "after-edit",
+        serde_json::to_vec(&edited).unwrap(),
+        0,
+        &options,
+    )
+    .await
+    .expect("update flow failed");
+    assert!(outcome.cancelled, "running job must have been cancelled");
+    assert_eq!(outcome.job_id, job_id, "identity preserved");
+
+    // The new incarnation runs again under the same id.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "resubmitted job never ran");
+        let s = client.get_job_status(&job_id).await.unwrap();
+        if s.state == 3 {
+            assert_eq!(s.job_name, "after-edit");
+            break;
+        }
+        assert_ne!(s.state, 5, "resubmitted job failed: {}", s.error_message);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let _ = client.cancel_job(&job_id).await;
+}
+
 #[tokio::test]
 async fn submit_without_workers_is_rejected() {
     let (master_addr, _) = spawn_master().await.unwrap();
