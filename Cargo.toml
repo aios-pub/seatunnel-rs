@@ -103,7 +103,7 @@ tikv-client = { version = "0.4", default-features = false }
 # (no rustls backend), so building them in makes every build depend on the
 # system OpenSSL version. The connector runs plaintext brokers only; if TLS
 # is ever needed, re-add "ssl-vendored" (static OpenSSL, no system dep).
-rdkafka = { version = "0.36", features = ["cmake-build", "libz-static"] }
+rdkafka = { version = "0.36", features = [ "libz-static"] }
 
 # Storage
 rust-rocksdb = "0.52"
