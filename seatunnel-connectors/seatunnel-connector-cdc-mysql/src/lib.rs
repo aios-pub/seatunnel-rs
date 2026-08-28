@@ -198,6 +198,11 @@ pub struct MySqlCdcConfig {
     pub username: String,
     pub password: String,
     pub database_name: String,
+    /// Default schema attached to pool connections. `None` unless the user
+    /// configured `database-name` (or a URL path): selector-based multi-DB
+    /// CDC must connect without a default schema, otherwise MySQL rejects
+    /// the login when it lacks grants on the placeholder schema.
+    pub connect_database: Option<String>,
     pub table_name: String,
     pub startup_mode: MySqlStartupMode,
     pub parallelism: usize,
@@ -239,6 +244,7 @@ impl Default for MySqlCdcConfig {
             username: "root".to_string(),
             password: String::new(),
             database_name: "seatunnel".to_string(),
+            connect_database: None,
             table_name: "users".to_string(),
             startup_mode: MySqlStartupMode::Initial,
             parallelism: 4,
@@ -269,13 +275,13 @@ impl MySqlCdcConfig {
             .get("url")
             .and_then(|u| parse_mysql_jdbc_url(u))
             .unwrap_or_default();
-        let database_name = {
-            let v = config.get_string("database-name", &url_db);
-            if v.is_empty() {
-                "seatunnel".to_string()
-            } else {
-                v
-            }
+        let explicit_db = config.get_string("database-name", &url_db);
+        // Placeholder for the legacy single-database selection only; it is
+        // never attached to the connection (see connect_database).
+        let database_name = if explicit_db.is_empty() {
+            "seatunnel".to_string()
+        } else {
+            explicit_db.clone()
         };
         let table_name = config.get_string("table-name", "users");
         MySqlCdcConfig {
@@ -300,6 +306,11 @@ impl MySqlCdcConfig {
             username: config.get_string("username", "root"),
             password: config.get_string("password", ""),
             database_name: database_name.clone(),
+            connect_database: if explicit_db.is_empty() {
+                None
+            } else {
+                Some(explicit_db)
+            },
             table_name: table_name.clone(),
             parallelism: config.get_int("parallelism", 4) as usize,
             startup_mode: config
@@ -524,7 +535,7 @@ impl MySqlCdcSource {
             .tcp_port(config.port)
             .user(Some(&config.username))
             .pass(Some(&config.password))
-            .db_name(Some(&config.database_name))
+            .db_name(config.connect_database.as_deref())
             .pool_opts(mysql_async::PoolOpts::new().with_constraints(constraints));
         Pool::new(opts)
     }
@@ -2300,12 +2311,18 @@ mod tests {
         assert_eq!(cfg.hostname, "db.host");
         assert_eq!(cfg.port, 3307);
         assert_eq!(cfg.database_name, "inventory");
+        assert_eq!(cfg.connect_database.as_deref(), Some("inventory"));
         // database-name overrides the URL path when both are set.
         let cfg = mk(&[
             ("url", "jdbc:mysql://db.host:3307/inventory"),
             ("database-name", "other"),
         ]);
         assert_eq!(cfg.database_name, "other");
+        assert_eq!(cfg.connect_database.as_deref(), Some("other"));
+        // Selector-based multi-DB setups (database-names, no explicit
+        // database-name) must NOT attach a default schema to connections.
+        let cfg = mk(&[("database-names", "db_a,db_b")]);
+        assert_eq!(cfg.connect_database, None);
 
         // server-id range.
         let cfg = mk(&[("server-id", "5400-5408")]);
