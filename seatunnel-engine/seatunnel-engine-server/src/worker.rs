@@ -27,17 +27,19 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use seatunnel_engine_comm::{
-    CheckpointReport, HeartbeatResponse, TaskDescriptor, TaskStatusReport,
+    CheckpointPhase, CheckpointReport, HeartbeatResponse, TaskDescriptor, TaskStatusReport,
     generated::master_service_client::MasterServiceClient,
 };
-use seatunnel_engine_core::checkpoint_listener::CheckpointListener;
 use seatunnel_engine_core::connector_factory::{
     create_sink, create_sinks, create_source, create_transforms,
+};
+use seatunnel_engine_core::local_checkpoint::{
+    CheckpointEvent, GateControl, TaskToDriver, task_gate,
 };
 use seatunnel_engine_core::state::TaskState;
 use seatunnel_engine_core::task_group::TaskGroup;
@@ -58,6 +60,16 @@ pub struct RunningTask {
 
 type SharedMasterClient = Arc<Mutex<Option<MasterServiceClient<tonic::transport::Channel>>>>;
 
+/// One task's checkpoint gate: the driver control the heartbeat loop
+/// fires triggers/resolutions on, plus the job id (task reports do not
+/// carry one — the local driver knew it, the forwarder looks it up).
+struct CheckpointGate {
+    job_id: String,
+    control: Arc<GateControl>,
+}
+
+type SharedCheckpointGates = Arc<Mutex<HashMap<String, CheckpointGate>>>;
+
 /// Worker node that executes chained pipeline tasks assigned by the master.
 pub struct WorkerNode {
     /// Auto-cleanup settings (0/None disables the cleaner).
@@ -77,6 +89,14 @@ pub struct WorkerNode {
     /// deposed master cannot disturb tasks owned by its successor.
     /// Shared with spawned task executors so their reports carry it.
     term: Arc<AtomicU64>,
+    /// Per-task checkpoint gates: the master (the remote checkpoint
+    /// driver) triggers barriers and receives prepares through these.
+    checkpoint_gates: SharedCheckpointGates,
+    /// Sender side handed to every task gate; drained by the forwarder
+    /// task that persists states and reports prepares to the master.
+    checkpoint_report_tx: mpsc::UnboundedSender<TaskToDriver>,
+    /// Receiver side, taken once when the forwarder starts.
+    checkpoint_rx: Mutex<Option<mpsc::UnboundedReceiver<TaskToDriver>>>,
 }
 
 /// Internal handle for a spawned task execution.
@@ -115,6 +135,7 @@ impl WorkerNode {
         state_store: Arc<LocalStateStore>,
         clean_config: Option<CleanConfig>,
     ) -> Self {
+        let (checkpoint_report_tx, checkpoint_rx) = mpsc::unbounded_channel();
         WorkerNode {
             worker_id: worker_id.into(),
             address: address.into(),
@@ -125,6 +146,9 @@ impl WorkerNode {
             storage_type: "localfile".to_string(),
             s3_store: None,
             term: Arc::new(AtomicU64::new(0)),
+            checkpoint_gates: Arc::new(Mutex::new(HashMap::new())),
+            checkpoint_report_tx,
+            checkpoint_rx: Mutex::new(Some(checkpoint_rx)),
         }
     }
 
@@ -138,9 +162,34 @@ impl WorkerNode {
         self.s3_store = s3_store;
     }
 
-    /// Set the gRPC client used for reporting to the master.
+    /// Set the gRPC client used for reporting to the master. The first
+    /// call also starts the checkpoint forwarder (it needs the client).
     pub async fn set_master_client(&self, client: MasterServiceClient<tonic::transport::Channel>) {
         *self.master_client.lock().await = Some(client);
+        self.start_checkpoint_forwarder().await;
+    }
+
+    /// Start (once) the task that drains checkpoint gate reports:
+    /// persist reader state locally (+ S3), then forward the prepare to
+    /// the master, which resolves it and sends phase-2 events back via
+    /// heartbeats. This is the worker side of "the master is the
+    /// checkpoint driver".
+    async fn start_checkpoint_forwarder(&self) {
+        let Some(rx) = self.checkpoint_rx.lock().await.take() else {
+            return;
+        };
+        let forwarder = CheckpointForwarder {
+            worker_id: self.worker_id.clone(),
+            master_client: Arc::clone(&self.master_client),
+            state_store: Arc::clone(&self.state_store),
+            upload_to_master: self.storage_type == "master",
+            s3_store: self.s3_store.clone(),
+            term: Arc::clone(&self.term),
+            gates: Arc::clone(&self.checkpoint_gates),
+        };
+        tokio::spawn(async move {
+            forwarder.run(rx).await;
+        });
     }
 
     pub fn state_store(&self) -> &Arc<LocalStateStore> {
@@ -193,6 +242,19 @@ impl WorkerNode {
         }
         if !response.preempted_task_ids.is_empty() {
             self.preempt_tasks(&response.preempted_task_ids).await;
+        }
+        // Coordinated checkpoints: fire due barriers, apply resolutions.
+        for trigger in &response.checkpoint_triggers {
+            self.trigger_checkpoint(&trigger.task_id, trigger.checkpoint_id)
+                .await;
+        }
+        for resolution in &response.checkpoint_resolutions {
+            self.deliver_checkpoint_resolution(
+                &resolution.task_id,
+                resolution.checkpoint_id,
+                resolution.completed,
+            )
+            .await;
         }
         if !response.pending_tasks.is_empty() {
             info!(
@@ -252,7 +314,11 @@ impl WorkerNode {
         let cleanup_task_id = task_id.clone();
         tokio::spawn(async move {
             execute_descriptor(task, ctx, cancel, Arc::clone(&worker)).await;
-            // Detach from the registry once terminal.
+            // Detach from the registry once terminal. The checkpoint gate
+            // is NOT removed here: the task's exit barrier (FINAL) report
+            // is still queued behind its Done message, and the forwarder
+            // removes the gate when it processes Done — channel order
+            // guarantees the FINAL state is persisted first.
             worker.running_tasks.lock().await.remove(&cleanup_task_id);
         });
     }
@@ -268,6 +334,68 @@ impl WorkerNode {
         if let Some(handle) = self.running_tasks.lock().await.get_mut(task_id) {
             handle.status = Some(status);
             handle.logs = Some(logs);
+        }
+    }
+
+    /// Create the checkpoint gate for a task: the TaskGroup gets the
+    /// handle (trigger/event polling + reports), the worker keeps the
+    /// control side for heartbeat-driven instructions.
+    pub async fn checkpoint_handle_for(
+        &self,
+        task_id: &str,
+        job_id: &str,
+    ) -> seatunnel_engine_core::local_checkpoint::CheckpointHandle {
+        let (handle, control) = task_gate(self.checkpoint_report_tx.clone());
+        self.checkpoint_gates.lock().await.insert(
+            task_id.to_string(),
+            CheckpointGate {
+                job_id: job_id.to_string(),
+                control: Arc::new(control),
+            },
+        );
+        handle
+    }
+
+    /// Drop a finished task's checkpoint gate. Normally driven by the
+    /// checkpoint forwarder on `TaskToDriver::Done`; kept public for
+    /// explicit shutdown paths.
+    pub async fn remove_checkpoint_gate(&self, task_id: &str) {
+        if let Some(gate) = self.checkpoint_gates.lock().await.remove(task_id) {
+            gate.control.close();
+        }
+    }
+
+    /// Fire a coordinated checkpoint barrier on one task (master-driven).
+    pub async fn trigger_checkpoint(&self, task_id: &str, checkpoint_id: u64) {
+        if let Some(gate) = self.checkpoint_gates.lock().await.get(task_id) {
+            info!(
+                "Worker {}: firing checkpoint barrier {} on task {}",
+                self.worker_id, checkpoint_id, task_id
+            );
+            gate.control.trigger(checkpoint_id);
+        } else {
+            warn!(
+                "Worker {}: checkpoint trigger for unknown task {} (id {})",
+                self.worker_id, task_id, checkpoint_id
+            );
+        }
+    }
+
+    /// Deliver a coordinated checkpoint resolution (complete → 2PC phase
+    /// 2, abort → unwind) to one task.
+    pub async fn deliver_checkpoint_resolution(
+        &self,
+        task_id: &str,
+        checkpoint_id: u64,
+        completed: bool,
+    ) {
+        if let Some(gate) = self.checkpoint_gates.lock().await.get(task_id) {
+            let event = if completed {
+                CheckpointEvent::Completed(checkpoint_id)
+            } else {
+                CheckpointEvent::Aborted(checkpoint_id)
+            };
+            gate.control.send_event(event);
         }
     }
 
@@ -700,6 +828,10 @@ async fn run_pipeline(
         create_sink(sink_plugin, &sink_config)?
     };
 
+    // Coordinated checkpoints: the master drives; this task's gate
+    // receives barrier triggers and completion events over heartbeats.
+    let checkpoint_handle = worker.checkpoint_handle_for(&task.task_id, &task.job_id).await;
+
     let context = seatunnel_engine_core::task_group::TaskContext::new(
         task.task_id.clone(),
         task.job_id.clone(),
@@ -709,13 +841,7 @@ async fn run_pipeline(
     )
     .with_cancel_token(cancel)
     .with_checkpoint_interval(checkpoint_interval)
-    .with_checkpoint_listener(Arc::new(TaskCheckpointReporter {
-        master_client: ctx.master_client.clone(),
-        state_store: ctx.state_store.clone(),
-        upload_to_master: ctx.storage_type == "master",
-        s3_store: ctx.s3_store.clone(),
-        term: Arc::clone(&ctx.term),
-    }));
+    .with_checkpoint_handle(checkpoint_handle);
 
     let mut group = TaskGroup::new(context, reader, writer).with_transforms(transforms);
     // Expose live metrics/logs to the heartbeat before the loop starts.
@@ -725,9 +851,19 @@ async fn run_pipeline(
     group.run().await
 }
 
-/// Checkpoint listener that persists state durably and reports success to the
-/// master over gRPC.
-struct TaskCheckpointReporter {
+/// Drains the task gates' reports and speaks the master-driven
+/// checkpoint protocol:
+///
+/// - `Checkpoint(report)` → durable local persist (+ S3), then forward
+///   the prepare to the master; the master resolves it and phase-2
+///   (sink commit) events come back over heartbeats. This replaces the
+///   old per-task interval listener — the worker no longer decides
+///   checkpoint ids or completion on its own.
+/// - `CheckpointFailed` → tell the master to abort the pending
+///   checkpoint.
+/// - `CommitDone` / `Done` → bookkeeping only.
+struct CheckpointForwarder {
+    worker_id: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
     /// Upload bytes to the master-backed store (storage type = master).
@@ -736,59 +872,132 @@ struct TaskCheckpointReporter {
     s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
     /// Highest master term seen (carried on the report for fencing).
     term: Arc<AtomicU64>,
+    /// task_id → gate (job id lookup for reports).
+    gates: SharedCheckpointGates,
 }
 
-impl CheckpointListener for TaskCheckpointReporter {
-    fn on_checkpoint<'a>(
-        &'a self,
-        job_id: &'a str,
-        task_id: &'a str,
-        checkpoint_id: u64,
-        timestamp: i64,
-        state: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            // 1. Durable local persistence (crash recovery).
-            if let Err(e) = self
-                .state_store
-                .save_checkpoint(job_id, task_id, checkpoint_id, &state)
-            {
-                error!(
-                    "Task {} checkpoint {}: local persist failed: {}",
-                    task_id, checkpoint_id, e
-                );
-            }
+impl CheckpointForwarder {
+    async fn job_of(&self, task_id: &str) -> Option<String> {
+        self.gates
+            .lock()
+            .await
+            .get(task_id)
+            .map(|g| g.job_id.clone())
+    }
 
-            // 2. S3 direct write (storage type = s3): Java external-storage
-            //    model — failures log and skip (local disk already holds
-            //    the state; restore falls back to it).
-            if let Some(store) = &self.s3_store {
-                store.save(job_id, task_id, checkpoint_id, &state).await;
-            }
+    async fn send_report(&self, report: CheckpointReport) {
+        let mut guard = self.master_client.lock().await;
+        let Some(client) = guard.as_mut() else {
+            warn!(
+                "Worker {}: no master client; checkpoint report for task {} dropped",
+                self.worker_id, report.task_id
+            );
+            return;
+        };
+        if let Err(e) = client
+            .report_checkpoint(tonic::Request::new(report))
+            .await
+        {
+            warn!("report_checkpoint failed: {}", e);
+        }
+    }
 
-            // 3. Master notification; bytes ride along for the
-            //    master-backed shared store (storage type = master).
-            let upload = if self.upload_to_master {
-                state.clone()
-            } else {
-                Vec::new()
-            };
-            let mut guard = self.master_client.lock().await;
-            if let Some(client) = guard.as_mut() {
-                let report = CheckpointReport {
-                    job_id: job_id.to_string(),
-                    task_id: task_id.to_string(),
-                    checkpoint_id: checkpoint_id as i64,
-                    timestamp,
-                    checkpoint_data: upload,
-                    success: true,
-                    term: self.term.load(Ordering::SeqCst),
-                };
-                if let Err(e) = client.report_checkpoint(tonic::Request::new(report)).await {
-                    warn!("report_checkpoint failed: {}", e);
+    async fn run(&self, mut rx: mpsc::UnboundedReceiver<TaskToDriver>) {
+        while let Some(message) = rx.recv().await {
+            match message {
+                TaskToDriver::Checkpoint(report) => {
+                    let Some(job_id) = self.job_of(&report.task_id).await else {
+                        warn!(
+                            "checkpoint report for task {} with no gate; dropped",
+                            report.task_id
+                        );
+                        continue;
+                    };
+                    // 1. Durable local persistence (crash recovery).
+                    if let Err(e) = self.state_store.save_checkpoint(
+                        &job_id,
+                        &report.task_id,
+                        report.checkpoint_id,
+                        &report.reader_state,
+                    ) {
+                        error!(
+                            "Task {} checkpoint {}: local persist failed: {}",
+                            report.task_id, report.checkpoint_id, e
+                        );
+                    }
+
+                    // 2. S3 direct write (storage type = s3): Java
+                    //    external-storage model — failures log and skip
+                    //    (local disk already holds the state).
+                    if let Some(store) = &self.s3_store {
+                        store
+                            .save(&job_id, &report.task_id, report.checkpoint_id, &report.reader_state)
+                            .await;
+                    }
+
+                    // 3. Forward the prepare; bytes ride along for the
+                    //    master-backed shared store (storage type =
+                    //    master). Exit-time final barriers are persisted
+                    //    by the master but never join a coordinated
+                    //    checkpoint (the task is leaving).
+                    let upload = if self.upload_to_master {
+                        report.reader_state.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    self.send_report(CheckpointReport {
+                        job_id,
+                        task_id: report.task_id.clone(),
+                        checkpoint_id: report.checkpoint_id as i64,
+                        timestamp: now_millis(),
+                        checkpoint_data: upload,
+                        success: true,
+                        term: self.term.load(Ordering::SeqCst),
+                        phase: CheckpointPhase::CheckpointPrepare as i32,
+                    })
+                    .await;
+                }
+                TaskToDriver::CheckpointFailed {
+                    task_id,
+                    checkpoint_id,
+                    error,
+                } => {
+                    warn!(
+                        "Task {} checkpoint {} failed at the barrier: {}",
+                        task_id, checkpoint_id, error
+                    );
+                    let job_id = self.job_of(&task_id).await.unwrap_or_default();
+                    if !job_id.is_empty() {
+                        self.send_report(CheckpointReport {
+                            job_id,
+                            task_id,
+                            checkpoint_id: checkpoint_id as i64,
+                            timestamp: now_millis(),
+                            checkpoint_data: Vec::new(),
+                            success: false,
+                            term: self.term.load(Ordering::SeqCst),
+                            phase: CheckpointPhase::CheckpointPrepare as i32,
+                        })
+                        .await;
+                    }
+                }
+                TaskToDriver::CommitDone {
+                    task_id,
+                    checkpoint_id,
+                } => {
+                    tracing::debug!(
+                        "Task {} checkpoint {} phase 2 committed",
+                        task_id,
+                        checkpoint_id
+                    );
+                }
+                TaskToDriver::Done { task_id } => {
+                    // Gate cleanup also happens at execution exit; this is
+                    // the task's own farewell.
+                    self.gates.lock().await.remove(&task_id);
                 }
             }
-        })
+        }
     }
 }
 
@@ -847,6 +1056,8 @@ mod tests {
             preempted_task_ids: Vec::new(),
             term: 2,
             leader_hint: String::new(),
+            checkpoint_triggers: Vec::new(),
+            checkpoint_resolutions: Vec::new(),
         };
         assert!(worker.apply_master_response(&resp).await);
         assert_eq!(worker.term(), 2);
@@ -860,6 +1071,8 @@ mod tests {
             preempted_task_ids: Vec::new(),
             term: 1,
             leader_hint: String::new(),
+            checkpoint_triggers: Vec::new(),
+            checkpoint_resolutions: Vec::new(),
         };
         assert!(!worker.apply_master_response(&stale).await);
         assert_eq!(worker.term(), 2);

@@ -131,26 +131,56 @@ impl CheckpointHandle {
 }
 
 /// Control side of one task's gate (driver-owned).
-pub(crate) struct GateControl {
+pub struct GateControl {
     shared: Arc<GateShared>,
 }
 
 impl GateControl {
-    pub(crate) fn trigger(&self, checkpoint_id: u64) {
+    /// Fire the barrier trigger for `checkpoint_id` on the task.
+    pub fn trigger(&self, checkpoint_id: u64) {
         *self.shared.pending_trigger.lock().unwrap() = Some(checkpoint_id);
         self.shared.notify.notify_waiters();
     }
 
-    pub(crate) fn send_event(&self, event: CheckpointEvent) {
+    /// Deliver a completion/abort event to the task.
+    pub fn send_event(&self, event: CheckpointEvent) {
         self.shared.pending_events.lock().unwrap().push(event);
         self.shared.notify.notify_waiters();
     }
 
-    fn close(&self) {
+    /// Mark the coordinator side as gone; the task can decide to stop
+    /// waiting for further triggers/events.
+    pub fn close(&self) {
         self.shared
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// Create a standalone (task handle, driver control) pair whose task
+/// reports flow to `report_tx`.
+///
+/// The cluster worker uses this: its tasks' real driver is the remote
+/// master, so the worker drains the channel and forwards reports over
+/// gRPC while applying triggers and completion events arriving via
+/// heartbeats — the same protocol the in-process `LocalCheckpointDriver`
+/// speaks, with the driver on the other side of the wire.
+pub fn task_gate(
+    report_tx: mpsc::UnboundedSender<TaskToDriver>,
+) -> (CheckpointHandle, GateControl) {
+    let shared = Arc::new(GateShared {
+        pending_trigger: std::sync::Mutex::new(None),
+        pending_events: std::sync::Mutex::new(Vec::new()),
+        notify: Notify::new(),
+        closed: std::sync::atomic::AtomicBool::new(false),
+    });
+    (
+        CheckpointHandle {
+            shared: Arc::clone(&shared),
+            report_tx,
+        },
+        GateControl { shared },
+    )
 }
 
 // ---------------------------------------------------------------------------

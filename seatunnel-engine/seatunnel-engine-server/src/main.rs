@@ -227,11 +227,13 @@ async fn start_master(
     });
 
     // Worker-eviction loop: hard-TTL-stale workers are removed and their
-    // tasks become claimable by live workers (failover).
+    // tasks become claimable by live workers (failover). The same tick
+    // aborts coordinated checkpoints whose prepares never arrived.
     {
         let registry = Arc::clone(&registry);
         let coordinator = Arc::clone(&coordinator);
         let timeout_ms = config.worker_timeout_ms.max(config.worker_soft_timeout_ms).max(1000);
+        let cp_timeout_ms = config.checkpoint_timeout_ms.max(1000);
         let cancel = shutdown.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(2000));
@@ -239,6 +241,14 @@ async fn start_master(
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = ticker.tick() => {
+                        let aborted = coordinator.abort_timed_out_checkpoints(cp_timeout_ms);
+                        if aborted > 0 {
+                            tracing::warn!(
+                                "coordinated checkpoints aborted (timeout {}ms): {}",
+                                cp_timeout_ms,
+                                aborted
+                            );
+                        }
                         let now = seatunnel_engine_core::now_millis();
                         let stale: Vec<String> = {
                             let reg = registry.read().unwrap();

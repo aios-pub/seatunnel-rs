@@ -113,12 +113,13 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
         let mut tick = tokio::time::interval(Duration::from_millis(150));
         loop {
             tick.tick().await;
+            let tasks = hb_worker.heartbeat_tasks().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
                     worker_id: "it-worker-1".into(),
                     address: String::new(),
                     timestamp: seatunnel_engine_core::now_millis(),
-                    tasks: vec![],
+                    tasks,
                     term: hb_worker.term(),
                     wait_ms: 0,
                 })
@@ -247,6 +248,76 @@ async fn streaming_job_cancels_to_cancelled_state() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinated_checkpoints_complete_through_cluster() {
+    let (master_addr, _coordinator) = spawn_master().await.unwrap();
+    let _worker = spawn_worker(&master_addr).await.unwrap();
+
+    let client = EngineClient::new(&master_addr);
+
+    let config = serde_json::json!({
+        "env": {
+            "job.name": "it-checkpoint",
+            "parallelism": 2,
+            "checkpoint": { "interval": 300 }
+        },
+        // Plenty of rows so the job is still running while checkpoints fire.
+        "source": { "Fake": { "row.num": 200000 } },
+        "sink": { "Console": {} }
+    });
+
+    let mut grpc =
+        seatunnel_engine_comm::generated::client_service_client::ClientServiceClient::connect(
+            format!("http://{}", master_addr),
+        )
+        .await
+        .unwrap();
+    let resp = grpc
+        .submit_job(tonic::Request::new(submit_request("it-checkpoint", config)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success, "submit failed: {}", resp.message);
+    let job_id = resp.job_id;
+
+    // The master is the checkpoint driver: wait until at least one
+    // coordinated checkpoint is triggered, prepared by every task and
+    // resolved (checkpoints_completed only increments on full resolution).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no coordinated checkpoint completed in time"
+        );
+        let status = client.get_job_status(&job_id).await.expect("status");
+        if status.checkpoints_completed >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Per-task checkpoint ids reach the console via heartbeats (throttled
+    // status publish + heartbeat cycle) — poll until visible.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let history = client.get_job_checkpoints(&job_id).await.expect("history");
+        let visible = history
+            .tasks
+            .iter()
+            .any(|t| t.entries.iter().any(|e| e.checkpoint_id > 0));
+        if visible {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no per-task checkpoint entries reported"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let _ = client.cancel_job(&job_id).await;
 }
 
 #[tokio::test]

@@ -535,7 +535,13 @@ impl TaskGroup {
             .map_err(|e| anyhow::anyhow!("reader snapshot_state failed: {}", e))?;
         self.checkpoints_completed += 1;
         self.last_checkpoint_at = Some(crate::now_millis());
-        self.last_checkpoint_meta = (checkpoint_id, reader_state.len() as u64);
+        // The exit barrier (FINAL_CHECKPOINT_ID) is a durable flush for
+        // restart, not a progress checkpoint: the progress view keeps the
+        // last coordinated id (the FINAL marker does not fit the i64
+        // heartbeat field and would zero it out after clamping).
+        if checkpoint_id != FINAL_CHECKPOINT_ID {
+            self.last_checkpoint_meta = (checkpoint_id, reader_state.len() as u64);
+        }
         self.last_commit_infos = commit_infos.clone();
         if let Some(handle) = self.context.checkpoint_handle.clone() {
             handle.report(TaskToDriver::Checkpoint(

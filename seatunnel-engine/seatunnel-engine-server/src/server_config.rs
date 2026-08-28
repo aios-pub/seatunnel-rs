@@ -128,6 +128,11 @@ pub struct EngineSection {
     /// scheduling use lands with least-loaded placement).
     #[serde(default)]
     pub slot_num: Option<u32>,
+    /// Coordinated-checkpoint timeout (ms): a triggered checkpoint that
+    /// has not collected every participating task's prepare by then is
+    /// aborted (Java `checkpoint.timeout` analogue).
+    #[serde(default)]
+    pub checkpoint_timeout_ms: Option<u64>,
     /// Master-to-master state replication period (HA standby sync).
     #[serde(default)]
     pub replication_interval_ms: Option<u64>,
@@ -228,6 +233,8 @@ pub struct EngineServerConfig {
     pub heartbeat_interval_ms: u64,
     /// Task slot budget advertised by this worker.
     pub slot_num: u32,
+    /// Coordinated-checkpoint abort timeout (ms).
+    pub checkpoint_timeout_ms: u64,
     /// Master state replication period (ms).
     pub replication_interval_ms: u64,
     /// This worker's advertised address.
@@ -273,6 +280,7 @@ impl Default for EngineServerConfig {
             worker_timeout_ms: 60_000,
             heartbeat_interval_ms: 2_000,
             slot_num: 8,
+            checkpoint_timeout_ms: 30_000,
             replication_interval_ms: 5_000,
             worker_address: "127.0.0.1:5001".to_string(),
             storage_type: "localfile".to_string(),
@@ -327,6 +335,9 @@ impl EngineServerConfig {
         }
         if let Some(slots) = engine.slot_num {
             self.slot_num = slots.max(1);
+        }
+        if let Some(ms) = engine.checkpoint_timeout_ms {
+            self.checkpoint_timeout_ms = ms.max(1_000);
         }
         if let Some(interval) = engine.checkpoint.interval {
             self.checkpoint_interval = interval.max(1);

@@ -30,6 +30,7 @@ seatunnel:
 | `seatunnel.engine.worker-timeout-ms` | 60000 | Hazelcast `max.no.heartbeat.seconds` (180s) analogue | hard eviction: silent longer than this → removed from the registry, its tasks become claimable (failover) |
 | `seatunnel.engine.heartbeat-interval-ms` | 2000 | — | worker → master heartbeat period; the master may adjust it per response (`next_interval_ms`) |
 | `seatunnel.engine.slot-num` | 8 | `slot-num` | task slot budget this worker advertises |
+| `seatunnel.engine.checkpoint-timeout-ms` | 30000 | `checkpoint.timeout` analogue | a coordinated checkpoint that has not collected every task's prepare by then is aborted (workers unwind) |
 | `seatunnel.engine.replication-interval-ms` | 5000 | — | master-to-master state replication period (HA standby sync) |
 | `seatunnel.engine.worker-address` | 127.0.0.1:5001 | — | this worker's advertised address |
 | `seatunnel.engine.checkpoint.interval` | 30000 | `checkpoint.interval` | engine-wide default checkpoint interval (ms); a job's `env.checkpoint.interval` overrides it per job |
@@ -77,10 +78,15 @@ Java keys with no equivalent yet (ignored if present): `backup-count`,
   `XA RECOVER` settlement). CDC checkpoints land on transaction boundaries
   (after-XID of the last fully emitted transaction). Graceful SIGINT/SIGTERM
   takes a final savepoint checkpoint before tasks are cancelled.
-- **Cluster mode** checkpoints remain per-task, interval-driven
-  flush-sinks-then-snapshot-reader (**at-least-once**); restore works for
+- **Cluster mode** checkpoints are master-driven and coordinated
+  (Stage 2): the master assigns the checkpoint id per pipeline, every
+  running task cuts the barrier (flush sink → snapshot source, prepare),
+  and only after the master collected all prepares do workers run 2PC
+  phase 2 (`SinkCommitter::commit` + reader offset commit). Failures and
+  timeouts (`checkpoint-timeout-ms`) abort and unwind. Restore works for
   all CDC sources (binlog position/GTID, TiDB resolved_ts, PG LSN) and
-  Kafka offsets.
+  Kafka offsets, always re-reading the durable stores (local disk >
+  master store / S3).
 - Watermarks: the CDC `WatermarkBuffer` exists but no connector uses it;
   there is no event-time/watermark processing in the engine
   (processing-time pass-through).

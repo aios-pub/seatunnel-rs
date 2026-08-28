@@ -168,6 +168,12 @@ pub struct RunningJob {
     pub error_message: Option<String>,
     pub checkpoint_interval_ms: u64,
     pub checkpoints_completed: u64,
+    /// Coordinated-checkpoint id counter (master-assigned). Exported with
+    /// the HA snapshot so a failover NEVER rewinds ids — a sink that sees
+    /// a repeated checkpoint id cannot fence zombie transactions.
+    pub next_checkpoint_id: u64,
+    /// Epoch-ms of the last coordinated trigger (volatile, not exported).
+    pub last_checkpoint_trigger_ms: i64,
 }
 
 /// Job coordinator managing the lifecycle of all submitted jobs.
@@ -182,6 +188,30 @@ pub struct JobCoordinator {
     /// by its successor. Replicated with the HA snapshot; becomes the
     /// Raft leader term once consensus-based HA lands.
     term: AtomicU64,
+    /// Coordinated checkpoints in flight, keyed by (job_id, stage_id):
+    /// one per pipeline. The master is the checkpoint driver — it assigns
+    /// the id, collects every participating task's prepare, then resolves
+    /// (complete → workers run 2PC phase 2, or abort).
+    pending_checkpoints: RwLock<HashMap<(String, String), PendingCheckpoint>>,
+    /// Resolution events waiting for the owning worker's next heartbeat,
+    /// keyed by worker_id.
+    checkpoint_outbox: std::sync::Mutex<HashMap<String, Vec<seatunnel_engine_comm::CheckpointResolution>>>,
+}
+
+/// One in-flight coordinated checkpoint for a pipeline.
+#[derive(Debug, Clone)]
+struct PendingCheckpoint {
+    checkpoint_id: u64,
+    stage_id: String,
+    triggered_at_ms: i64,
+    /// task_id → owning worker (for resolution delivery).
+    participants: HashMap<String, String>,
+    /// Tasks whose trigger was already handed to their worker's
+    /// heartbeat. Delivery is per-worker and must survive the interval
+    /// gate: a worker that heartbeats late still gets its trigger.
+    delivered: std::collections::HashSet<String>,
+    /// Tasks that still owe a prepare (or a failure).
+    awaiting: Vec<String>,
 }
 
 impl Default for JobCoordinator {
@@ -301,6 +331,8 @@ impl JobCoordinator {
             // Term 0 is reserved for "worker has not seen a master yet";
             // masters always operate at term >= 1.
             term: AtomicU64::new(1),
+            pending_checkpoints: RwLock::new(HashMap::new()),
+            checkpoint_outbox: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -461,6 +493,8 @@ impl JobCoordinator {
             error_message: None,
             checkpoint_interval_ms: checkpoint_interval,
             checkpoints_completed: 0,
+            next_checkpoint_id: 1,
+            last_checkpoint_trigger_ms: 0,
         };
 
         self.jobs.write().insert(job_id.to_string(), job);
@@ -691,6 +725,9 @@ impl JobCoordinator {
             error_message: Option<String>,
             checkpoint_interval_ms: u64,
             checkpoints_completed: u64,
+            /// Master-assigned checkpoint id counter — a standby importing
+            /// this snapshot must continue after it, never behind.
+            next_checkpoint_id: u64,
             tasks: Vec<TaskInfoDto>,
         }
         let job_dtos: Vec<JobDto> = {
@@ -706,6 +743,7 @@ impl JobCoordinator {
                     error_message: job.error_message.clone(),
                     checkpoint_interval_ms: job.checkpoint_interval_ms,
                     checkpoints_completed: job.checkpoints_completed,
+                    next_checkpoint_id: job.next_checkpoint_id,
                     tasks: job
                         .tasks
                         .values()
@@ -760,6 +798,9 @@ impl JobCoordinator {
             processed_records: u64,
             error: Option<String>,
         }
+        fn one() -> u64 {
+            1
+        }
         #[derive(Deserialize)]
         struct JobDto {
             job_id: String,
@@ -774,6 +815,10 @@ impl JobCoordinator {
             checkpoint_interval_ms: u64,
             #[serde(default)]
             checkpoints_completed: u64,
+            /// Checkpoint id counter from the exporting master; take the
+            /// max with local so ids never rewind after failover.
+            #[serde(default = "one")]
+            next_checkpoint_id: u64,
             tasks: Vec<TaskInfoDto>,
         }
         // The fencing term never regresses: a standby that imported a
@@ -791,8 +836,13 @@ impl JobCoordinator {
         {
             let mut jobs = self.jobs.write();
             for dto in jobs_dto {
-                if jobs.contains_key(&dto.job_id) {
-                    continue; // local wins
+                if let Some(existing) = jobs.get_mut(&dto.job_id) {
+                    // The checkpoint id counter never rewinds, even when
+                    // the local job record is otherwise kept (local wins).
+                    existing.next_checkpoint_id = existing
+                        .next_checkpoint_id
+                        .max(dto.next_checkpoint_id);
+                    continue;
                 }
                 let tasks: HashMap<String, TaskInfo> = dto
                     .tasks
@@ -812,6 +862,8 @@ impl JobCoordinator {
                 jobs.insert(
                     dto.job_id.clone(),
                     RunningJob {
+                        next_checkpoint_id: dto.next_checkpoint_id,
+                        last_checkpoint_trigger_ms: 0,
                         job_id: dto.job_id,
                         job_name: dto.job_name,
                         state: JobState::from(dto.state.as_str()),
@@ -1055,18 +1107,290 @@ impl JobCoordinator {
         }
     }
 
-    /// Cancel a job. Returns true if a running/scheduled job was cancelled.
-    pub fn cancel_job(&self, job_id: &str) -> bool {
-        let mut jobs = self.jobs.write();
-        if let Some(job) = jobs.get_mut(job_id) {
-            if !job.state.is_terminal() {
-                job.state = JobState::Cancelled;
-                job.end_time = Some(seatunnel_engine_core::now_millis());
-                info!("Job {} cancelled by user", job_id);
-                return true;
+    /// Decide and fire coordinated checkpoint triggers due on this
+    /// heartbeat, for tasks owned by `worker_id`.
+    ///
+    /// The master is the checkpoint driver (Java CheckpointCoordinator
+    /// role): a pipeline (stage) with no checkpoint in flight and whose
+    /// interval elapsed gets one master-assigned id; every Running task
+    /// of the stage participates. Ids come from the job's exported
+    /// counter, so they never rewind across failover.
+    pub fn due_checkpoint_triggers(
+        &self,
+        worker_id: &str,
+    ) -> Vec<seatunnel_engine_comm::CheckpointTrigger> {
+        let now = seatunnel_engine_core::now_millis();
+
+        // 1) Create: a Running job whose interval elapsed gets one new
+        //    pending checkpoint per pipeline (stage) that has none in
+        //    flight. Ids come from the job's exported counter, so they
+        //    never rewind across failover.
+        {
+            let mut jobs = self.jobs.write();
+            let mut pending = self.pending_checkpoints.write();
+            for job in jobs.values_mut() {
+                if job.state != JobState::Running {
+                    continue;
+                }
+                if job.last_checkpoint_trigger_ms > 0
+                    && now - job.last_checkpoint_trigger_ms < job.checkpoint_interval_ms as i64
+                {
+                    continue;
+                }
+                let mut by_stage: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for info in job.tasks.values() {
+                    if info.state == JobState::Running {
+                        by_stage
+                            .entry(info.stage_id.clone())
+                            .or_default()
+                            .push((info.task_id.clone(), info.worker_id.clone()));
+                    }
+                }
+                if by_stage.is_empty() {
+                    continue;
+                }
+                let job_id = job.job_id.clone();
+                let mut next_id = job.next_checkpoint_id;
+                let mut fired_any = false;
+                for (stage_id, tasks) in by_stage {
+                    let key = (job_id.clone(), stage_id.clone());
+                    if pending.contains_key(&key) {
+                        continue; // this pipeline still has one in flight
+                    }
+                    let checkpoint_id = next_id;
+                    next_id = next_id.saturating_add(1);
+                    fired_any = true;
+                    let mut participants = HashMap::new();
+                    let mut awaiting = Vec::new();
+                    for (task_id, owner) in &tasks {
+                        participants.insert(task_id.clone(), owner.clone());
+                        awaiting.push(task_id.clone());
+                    }
+                    info!(
+                        "Job {} pipeline {}: coordinated checkpoint {} triggered on {} task(s)",
+                        job_id,
+                        stage_id,
+                        checkpoint_id,
+                        awaiting.len()
+                    );
+                    pending.insert(
+                        key,
+                        PendingCheckpoint {
+                            checkpoint_id,
+                            stage_id,
+                            triggered_at_ms: now,
+                            participants,
+                            delivered: std::collections::HashSet::new(),
+                            awaiting,
+                        },
+                    );
+                }
+                if fired_any {
+                    job.next_checkpoint_id = next_id;
+                    job.last_checkpoint_trigger_ms = now;
+                }
             }
         }
-        false
+
+        // 2) Deliver: every pending checkpoint owes this worker a trigger
+        //    for each of its tasks that has not received one yet — even
+        //    when the interval gate blocks new creations.
+        let mut triggers = Vec::new();
+        {
+            let mut pending = self.pending_checkpoints.write();
+            for cp in pending.values_mut() {
+                for (task_id, owner) in &cp.participants {
+                    if owner == worker_id && !cp.delivered.contains(task_id) {
+                        cp.delivered.insert(task_id.clone());
+                        triggers.push(seatunnel_engine_comm::CheckpointTrigger {
+                            task_id: task_id.clone(),
+                            checkpoint_id: cp.checkpoint_id,
+                        });
+                    }
+                }
+            }
+        }
+        triggers
+    }
+
+    /// Ingest one task's prepare (or failure) for a coordinated
+    /// checkpoint; resolve the checkpoint when every participant reported.
+    /// Returns the checkpoint id when it was resolved, for logging.
+    ///
+    /// Lock order note: pending → outbox → jobs (acquired separately,
+    /// never nested with pending) — the inverse of the trigger path
+    /// (jobs → pending), so the two can never deadlock.
+    pub fn handle_checkpoint_prepare(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        checkpoint_id: u64,
+        success: bool,
+    ) -> Option<u64> {
+        let stage_id = {
+            let jobs = self.jobs.read();
+            jobs.get(job_id)?
+                .tasks
+                .get(task_id)?
+                .stage_id
+                .clone()
+        };
+        let key = (job_id.to_string(), stage_id);
+        // Resolve inside the guard scope only to decide; act after it is
+        // released (resolve() locks outbox, completion locks jobs).
+        let resolved: Option<(PendingCheckpoint, bool)> = {
+            let mut pending = self.pending_checkpoints.write();
+            let Some(cp) = pending.get_mut(&key) else {
+                tracing::debug!(
+                    "checkpoint prepare for {} but no pending checkpoint (job {})",
+                    checkpoint_id,
+                    job_id
+                );
+                return None;
+            };
+            if cp.checkpoint_id != checkpoint_id {
+                tracing::warn!(
+                    "checkpoint prepare for {} but pending is {}; ignoring",
+                    checkpoint_id,
+                    cp.checkpoint_id
+                );
+                return None;
+            }
+            if !success {
+                pending.remove(&key).map(|cp| (cp, false))
+            } else {
+                cp.awaiting.retain(|id| id != task_id);
+                if cp.awaiting.is_empty() {
+                    pending.remove(&key).map(|cp| (cp, true))
+                } else {
+                    None
+                }
+            }
+        };
+        let (cp, completed) = resolved?;
+        if completed {
+            info!(
+                "Job {} pipeline {} checkpoint {} complete: {} task(s) prepared",
+                job_id, cp.stage_id, cp.checkpoint_id, cp.participants.len()
+            );
+        } else {
+            warn!(
+                "Job {} pipeline {} checkpoint {} failed at task {}; aborting",
+                job_id, cp.stage_id, checkpoint_id, task_id
+            );
+        }
+        self.resolve(&cp, completed);
+        if completed {
+            let mut jobs = self.jobs.write();
+            if let Some(job) = jobs.get_mut(job_id) {
+                job.checkpoints_completed += 1;
+                // Surface the resolved id on every participant instantly —
+                // visibility must not depend on heartbeat timing.
+                for task_id in cp.participants.keys() {
+                    if let Some(info) = job.tasks.get_mut(task_id) {
+                        if cp.checkpoint_id > info.last_checkpoint_id {
+                            info.last_checkpoint_id = cp.checkpoint_id;
+                            info.last_checkpoint_size = 0;
+                        }
+                    }
+                }
+            }
+        }
+        Some(checkpoint_id)
+    }
+
+    /// Resolve a pending checkpoint: queue per-task events (complete →
+    /// workers run 2PC phase 2 / abort → unwind) for delivery on the
+    /// owning workers' next heartbeats.
+    fn resolve(&self, cp: &PendingCheckpoint, completed: bool) {
+        let mut outbox = self.checkpoint_outbox.lock().unwrap();
+        for (task_id, worker_id) in &cp.participants {
+            outbox
+                .entry(worker_id.clone())
+                .or_default()
+                .push(seatunnel_engine_comm::CheckpointResolution {
+                    task_id: task_id.clone(),
+                    checkpoint_id: cp.checkpoint_id,
+                    completed,
+                });
+        }
+    }
+
+    /// Take the resolution events queued for a worker's heartbeat.
+    pub fn drain_checkpoint_resolutions(
+        &self,
+        worker_id: &str,
+    ) -> Vec<seatunnel_engine_comm::CheckpointResolution> {
+        self.checkpoint_outbox
+            .lock()
+            .unwrap()
+            .remove(worker_id)
+            .unwrap_or_default()
+    }
+
+    /// Abort coordinated checkpoints whose prepares did not arrive in
+    /// time (a stuck or dead participant). Returns how many were aborted.
+    pub fn abort_timed_out_checkpoints(&self, timeout_ms: u64) -> usize {
+        let now = seatunnel_engine_core::now_millis();
+        let mut pending = self.pending_checkpoints.write();
+        let expired: Vec<(String, String)> = pending
+            .iter()
+            .filter(|(_, cp)| now - cp.triggered_at_ms > timeout_ms as i64)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = expired.len();
+        for key in expired {
+            if let Some(cp) = pending.remove(&key) {
+                warn!(
+                    "Job {} pipeline {} checkpoint {} timed out ({} task(s) unreported); aborting",
+                    key.0,
+                    cp.stage_id,
+                    cp.checkpoint_id,
+                    cp.awaiting.len()
+                );
+                self.resolve(&cp, false);
+            }
+        }
+        count
+    }
+
+    /// Drop in-flight checkpoints of a job (cancel/terminal cleanup).
+    pub fn drop_pending_checkpoints(&self, job_id: &str) {
+        let mut pending = self.pending_checkpoints.write();
+        let keys: Vec<(String, String)> = pending
+            .keys()
+            .filter(|(j, _)| j == job_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(cp) = pending.remove(&key) {
+                self.resolve(&cp, false);
+            }
+        }
+    }
+
+    /// Cancel a job. Returns true if a running/scheduled job was cancelled.
+    pub fn cancel_job(&self, job_id: &str) -> bool {
+        let cancelled = {
+            let mut jobs = self.jobs.write();
+            if let Some(job) = jobs.get_mut(job_id) {
+                if !job.state.is_terminal() {
+                    job.state = JobState::Cancelled;
+                    job.end_time = Some(seatunnel_engine_core::now_millis());
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            info!("Job {} cancelled by user", job_id);
+            // Abort any in-flight coordinated checkpoint (workers unwind).
+            self.drop_pending_checkpoints(job_id);
+        }
+        cancelled
     }
 }
 
@@ -1317,6 +1641,153 @@ mod tests {
         assert_eq!(job.tasks[&task_id].state, JobState::Running);
         let claimed = coordinator.claim_tasks_for_worker("worker-1", "a", &|_| true);
         assert!(claimed.iter().all(|t| t.task_id != task_id));
+    }
+
+    #[test]
+    fn test_coordinated_checkpoint_lifecycle() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 2, "checkpoint": { "interval": 300000 } },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (job_id, tasks) = coordinator
+            .compile_and_schedule("jcc", "cc", &config, None, &workers(2))
+            .unwrap();
+        // Both tasks Running on their assigned workers.
+        for (i, t) in tasks.iter().enumerate() {
+            let owner = format!("worker-{}", i);
+            coordinator.mark_tasks_dispatched(std::slice::from_ref(&t.task_id), &owner);
+            coordinator.report_task_status(&job_id, &t.task_id, "RUNNING", 0, None);
+        }
+        let t0 = &tasks[0].task_id;
+        let t1 = &tasks[1].task_id;
+        // Heartbeat of worker-0 triggers the pipeline: it sees its own
+        // task's trigger; worker-1 gets its own on its heartbeat, with
+        // the SAME coordinated checkpoint id.
+        let tr0 = coordinator.due_checkpoint_triggers("worker-0");
+        let tr1 = coordinator.due_checkpoint_triggers("worker-1");
+        assert_eq!(tr0.len(), 1);
+        assert_eq!(tr1.len(), 1);
+        assert_eq!(tr0[0].task_id, *t0);
+        assert_eq!(tr1[0].task_id, *t1);
+        let cp_id = tr0[0].checkpoint_id;
+        assert_eq!(tr1[0].checkpoint_id, cp_id);
+
+        // Interval gating: no further triggers until the interval elapses.
+        assert!(coordinator.due_checkpoint_triggers("worker-0").is_empty());
+
+        // First prepare: not resolved yet, no resolutions delivered.
+        assert_eq!(
+            coordinator.handle_checkpoint_prepare(&job_id, t0, cp_id, true),
+            None
+        );
+        assert!(coordinator.drain_checkpoint_resolutions("worker-0").is_empty());
+        assert!(coordinator.drain_checkpoint_resolutions("worker-1").is_empty());
+
+        // Second prepare resolves: completed events for both workers.
+        assert_eq!(
+            coordinator.handle_checkpoint_prepare(&job_id, t1, cp_id, true),
+            Some(cp_id)
+        );
+        for w in ["worker-0", "worker-1"] {
+            let rs = coordinator.drain_checkpoint_resolutions(w);
+            assert_eq!(rs.len(), 1);
+            assert!(rs[0].completed);
+            assert_eq!(rs[0].checkpoint_id, cp_id);
+        }
+        let job = coordinator.get_job(&job_id).unwrap();
+        assert_eq!(job.checkpoints_completed, 1);
+        // Id counter advanced past the resolved checkpoint.
+        assert!(job.next_checkpoint_id > cp_id);
+    }
+
+    #[test]
+    fn test_coordinated_checkpoint_failure_and_timeout_abort() {
+        // Failure path: one task's barrier fails → abort for everyone.
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 2, "checkpoint": { "interval": 300000 } },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (job_id, tasks) = coordinator
+            .compile_and_schedule("jcf", "f", &config, None, &workers(2))
+            .unwrap();
+        for (i, t) in tasks.iter().enumerate() {
+            coordinator.report_task_status(
+                &job_id,
+                &t.task_id,
+                "RUNNING",
+                0,
+                None,
+            );
+            let _ = i;
+        }
+        let tr = coordinator.due_checkpoint_triggers("worker-0");
+        assert_eq!(tr.len(), 1);
+        let cp_id = tr[0].checkpoint_id;
+        assert_eq!(
+            coordinator.handle_checkpoint_prepare(&job_id, &tasks[0].task_id, cp_id, false),
+            Some(cp_id)
+        );
+        for w in ["worker-0", "worker-1"] {
+            let rs = coordinator.drain_checkpoint_resolutions(w);
+            assert_eq!(rs.len(), 1);
+            assert!(!rs[0].completed, "failure must abort, not complete");
+        }
+
+        // Timeout path: prepares never arrive → sweep aborts.
+        {
+            // Rewind the volatile interval gate so the next round fires.
+            let mut jobs = coordinator.jobs.write();
+            jobs.get_mut(&job_id).unwrap().last_checkpoint_trigger_ms = 0;
+        }
+        let tr2 = coordinator.due_checkpoint_triggers("worker-0");
+        assert_eq!(tr2.len(), 1);
+        // The strict deadline comparison needs the trigger to age at
+        // least one millisecond (production timeouts are 30s+).
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let aborted = coordinator.abort_timed_out_checkpoints(0);
+        assert_eq!(aborted, 1);
+        let rs = coordinator.drain_checkpoint_resolutions("worker-0");
+        assert_eq!(rs.len(), 1);
+        assert!(!rs[0].completed);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_ids_never_rewind_across_ha_snapshot() {
+        let primary = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1, "checkpoint": { "interval": 300000 } },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (job_id, tasks) = primary
+            .compile_and_schedule("jha", "ha", &config, None, &workers(1))
+            .unwrap();
+        primary.report_task_status(&job_id, &tasks[0].task_id, "RUNNING", 0, None);
+        // Consume two coordinated checkpoint ids on the primary. The
+        // interval gate must be rewound between rounds (volatile field).
+        for _ in 0..2 {
+            primary.jobs.write().get_mut(&job_id).unwrap().last_checkpoint_trigger_ms = 0;
+            let tr = primary.due_checkpoint_triggers("worker-0");
+            assert_eq!(tr.len(), 1);
+            let cp = tr[0].checkpoint_id;
+            primary.handle_checkpoint_prepare(&job_id, &tasks[0].task_id, cp, true);
+        }
+        let snapshot = primary.export_state().await;
+
+        // A standby that already holds the job with a LOWER counter must
+        // never rewind below the primary's allocation.
+        let standby = JobCoordinator::new();
+        standby
+            .compile_and_schedule("jha", "ha", &config, None, &workers(1))
+            .unwrap();
+        standby.import_state(&snapshot).await;
+        let imported_next = standby.get_job("jha").unwrap().next_checkpoint_id;
+        let primary_next = primary.get_job("jha").unwrap().next_checkpoint_id;
+        assert!(imported_next >= primary_next);
     }
 
     #[test]

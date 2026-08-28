@@ -30,12 +30,13 @@ pub use generated::master_service_server::MasterService;
 pub use generated::replication_service_client::ReplicationServiceClient;
 pub use generated::replication_service_server::{ReplicationService, ReplicationServiceServer};
 pub use generated::{
-    CancelJobRequest, CheckpointEntry, CheckpointReport, ClusterInfo, Empty,
-    FetchCheckpointRequest, FetchCheckpointResponse, HeartbeatRequest, HeartbeatResponse,
-    JobCheckpointHistory, JobList, JobLogs, JobStatus, JobStatusRequest, JobSummary,
-    PullStateRequest, StateSnapshot, SubmitJobRequest, SubmitJobResponse, TaskCheckpointHistory,
-    TaskDescriptor, TaskHeartbeat, TaskLogs, TaskStatusInfo, TaskStatusReport,
-    UnregisterWorkerRequest, WorkerInfo, WorkerRegistration, WorkerRegistrationResponse,
+    CancelJobRequest, CheckpointEntry, CheckpointPhase, CheckpointReport, CheckpointResolution,
+    CheckpointTrigger, ClusterInfo, Empty, FetchCheckpointRequest, FetchCheckpointResponse,
+    HeartbeatRequest, HeartbeatResponse, JobCheckpointHistory, JobList, JobLogs, JobStatus,
+    JobStatusRequest, JobSummary, PullStateRequest, StateSnapshot, SubmitJobRequest,
+    SubmitJobResponse, TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs,
+    TaskStatusInfo, TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
+    WorkerRegistrationResponse,
 };
 
 use generated::{JobState as ProtoJobState, TaskState as ProtoTaskState};

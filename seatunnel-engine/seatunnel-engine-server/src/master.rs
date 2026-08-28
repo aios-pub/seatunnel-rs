@@ -214,6 +214,8 @@ impl MasterService for MasterHandler {
                 preempted_task_ids: Vec::new(),
                 term: self.coordinator.term(),
                 leader_hint: String::new(),
+                checkpoint_triggers: Vec::new(),
+                checkpoint_resolutions: Vec::new(),
             }));
         }
 
@@ -315,6 +317,16 @@ impl MasterService for MasterHandler {
             }
         }
 
+        // Coordinated checkpoints: fire due triggers on this worker's
+        // tasks (the master is the checkpoint driver) and deliver
+        // resolutions queued for it.
+        let checkpoint_triggers = if soft_stale {
+            Vec::new()
+        } else {
+            self.coordinator.due_checkpoint_triggers(&worker_id)
+        };
+        let checkpoint_resolutions = self.coordinator.drain_checkpoint_resolutions(&worker_id);
+
         // Push cancellations so workers stop their local tasks promptly.
         let cancel_jobs = self.coordinator.cancelled_job_ids();
 
@@ -335,6 +347,8 @@ impl MasterService for MasterHandler {
             term: self.coordinator.term(),
             // Empty hint = this node is the active master.
             leader_hint: String::new(),
+            checkpoint_triggers,
+            checkpoint_resolutions,
         }))
     }
 
@@ -382,10 +396,11 @@ impl MasterService for MasterHandler {
     ) -> Result<Response<Empty>, Status> {
         let report = request.into_inner();
         tracing::debug!(
-            "Checkpoint {} for job {} task {} success={} ({} bytes)",
+            "Checkpoint {} for job {} task {} phase={:?} success={} ({} bytes)",
             report.checkpoint_id,
             report.job_id,
             report.task_id,
+            report.phase,
             report.success,
             report.checkpoint_data.len()
         );
@@ -402,12 +417,29 @@ impl MasterService for MasterHandler {
                 )
                 .await;
         }
-        self.coordinator.report_checkpoint(
-            &report.job_id,
-            &report.task_id,
-            report.checkpoint_id.max(0) as u64,
-            report.success,
-        );
+        // Exit-time final barriers are pure state flushes (the task is
+        // leaving); they never join a coordinated checkpoint.
+        let is_final = report.checkpoint_id as u64
+            == seatunnel_engine_core::local_checkpoint::FINAL_CHECKPOINT_ID;
+        if !is_final
+            && report.phase == seatunnel_engine_comm::CheckpointPhase::CheckpointPrepare as i32
+        {
+            self.coordinator.handle_checkpoint_prepare(
+                &report.job_id,
+                &report.task_id,
+                report.checkpoint_id.max(0) as u64,
+                report.success,
+            );
+        } else if !is_final {
+            // Legacy interval-path report (pre-coordination senders):
+            // count it so dashboards keep working.
+            self.coordinator.report_checkpoint(
+                &report.job_id,
+                &report.task_id,
+                report.checkpoint_id.max(0) as u64,
+                report.success,
+            );
+        }
         Ok(Response::new(Empty {}))
     }
 

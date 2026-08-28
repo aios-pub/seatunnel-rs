@@ -95,6 +95,28 @@ message HeartbeatResponse {
   // Address of the currently active master; empty when this node is active.
   // Workers may use it to retry against the right master.
   string leader_hint = 7;
+  // Coordinated checkpoint barriers to fire on this worker's tasks (the
+  // master is the checkpoint driver; ids are master-assigned and never
+  // rewind across failover).
+  repeated CheckpointTrigger checkpoint_triggers = 8;
+  // Resolutions of coordinated checkpoints: run 2PC phase 2 (sink commit)
+  // on completed, unwind on aborted.
+  repeated CheckpointResolution checkpoint_resolutions = 9;
+}
+
+/// Master → worker: fire the barrier for this checkpoint on one task.
+message CheckpointTrigger {
+  string task_id = 1;
+  uint64 checkpoint_id = 2;
+}
+
+/// Master → worker: a coordinated checkpoint's resolution for one task.
+message CheckpointResolution {
+  string task_id = 1;
+  uint64 checkpoint_id = 2;
+  // true = durably collected, run phase 2 (committer commit + reader
+  // offset commit); false = aborted, unwind prepared commits.
+  bool completed = 3;
 }
 
 message TaskHeartbeat {
@@ -138,6 +160,17 @@ message CheckpointReport {
   bool success = 6;
   // Fencing term the report was produced under.
   uint64 term = 7;
+  // 2PC phase (default PREPARE keeps old senders on the prepare path):
+  // PREPARE — phase 1 done (sink flushed, source state captured); the
+  // master collects these and resolves the checkpoint.
+  CheckpointPhase phase = 8;
+}
+
+enum CheckpointPhase {
+  // Barrier cut finished; awaiting the coordinator's resolution.
+  CHECKPOINT_PREPARE = 0;
+  // Phase 2 (sink commit) finished after a Completed resolution.
+  CHECKPOINT_PHASE2_DONE = 1;
 }
 
 // --- Client API ---

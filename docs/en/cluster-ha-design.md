@@ -57,8 +57,9 @@ the split and replaces the mitigation with mechanism.
 | Stale-master fencing | None (only a node-local scheduler epoch) | Monotonic `term` carried on every master↔worker message; workers reject dispatch/cancel/preempt from a lower term (a deposed master cannot disturb tasks) | ✅ Stage 1 (wire protocol + worker-side rejection; term source becomes the Raft leader term in Stage 3) |
 | Failover speed vs. false positives | 180 s tolerance chosen to avoid false splits (slow by design) | Quorum makes fast failover safe (~1 s election); worker liveness uses separate soft/hard timeouts (soft: no new assignments; hard: eviction) | ✅ Stage 1 (timeouts); 📋 Stage 3 (election) |
 | State healing after a partition | Hazelcast IMap last-write-wins merge, no engine callback — divergent state can silently win or lose | Single replicated log (Raft); no divergent branches exist to merge | 📋 Stage 3 |
-| Checkpoint after a master switch | In-memory `latestCompletedCheckpoint` is null until the next checkpoint completes; a pipeline restarting in that window starts from empty state | Recovery always re-reads the latest persisted checkpoint from storage — no empty-state window | 📋 Stage 2 |
-| Checkpoint ID uniqueness across failover | Persisted IMap counter, `setCount(id + 1)` on restore (good design) | Same semantics, persisted in the consensus-replicated coordinator state | 📋 Stage 2 |
+| Checkpoint after a master switch | In-memory `latestCompletedCheckpoint` is null until the next checkpoint completes; a pipeline restarting in that window starts from empty state | Checkpoint state lives in the durable stores at prepare time; the master only decides ids and resolution — no empty-state window after any switch | ✅ Stage 2 |
+| Checkpoint ID uniqueness across failover | Persisted IMap counter, `setCount(id + 1)` on restore (good design) | Same semantics: per-job counter exported with the HA snapshot, `max()` on import so ids never rewind | ✅ Stage 2 |
+| Cluster-mode checkpoint semantics | Per-pipeline CheckpointCoordinator with barrier injection through real DAG edges | Master-driven coordinated checkpoints reusing the exact local-mode 2PC (prepare → master persists/collects → complete → sink commit); no data-plane barriers because tasks are fully chained | ✅ Stage 2 |
 | Single-machine deployment | Hazelcast cluster semantics and role config even for one node | Three tiers: `seatunnel run -m local` (zero server), single-voter Raft (local commit, no network), `--role hybrid` (one process = full cluster) | ✅ Stage 1 (`--role hybrid`); 📋 Stage 3 (single-voter Raft) |
 | Operational identity | `ClusterInfo` leader is effectively hardcoded | Real advertise address, role, and term in `ClusterInfo`; masters never guess `127.0.0.1` for HA sync | ✅ Stage 1 |
 
@@ -73,13 +74,17 @@ semantics, adapted to the pull-based protocol:
   This mirrors Java's `deployTask` dedupe + `CheckTaskGroupIsExecuting`
   probe. ✅ Stage 1.
 - **Checkpoint IDs never rewind.** Java's `StateStoreCheckpointIDCounter`
-  → per-pipeline monotonic counter in coordinator state (replicated, so
-  failover cannot reissue an id). 📋 Stage 2.
+  → per-job monotonic counter in coordinator state (replicated, so
+  failover cannot reissue an id). ✅ Stage 2.
 - **Sink two-phase commit.** Java's `prepareCommit` → coordinator
   persists `CompletedCheckpoint` → `notifyCheckpointComplete` commits →
   our coordinated per-pipeline checkpoint protocol reuses the existing
   `SinkCommitter`/`execute_barrier` machinery for the same semantics.
-  📋 Stage 2.
+  ✅ Stage 2.
+- **"Alignment" without barrier injection.** All parallel subtasks of a
+  pipeline cut at one master-assigned checkpoint id; resolution (phase 2)
+  happens only after every participant prepared — the meaningful form of
+  alignment for fully-chained tasks. ✅ Stage 2.
 - **Conservative worker eviction.** Soft (30 s, no new assignments) and
   hard (60 s, evict + reclaim) thresholds, both configurable — the same
   lesson the Java post-mortem taught, encoded as two levels instead of
@@ -141,8 +146,10 @@ two writable masters; it was documented as a known limitation).
   adopt-before-preempt; dead-code removal (the superseded
   `leader_election`/`job_manager`/`resource_manager` stubs and unused
   checkpoint backends).
-- **Stage 2** — coordinated per-pipeline checkpoint two-phase commit with
-  master-assigned monotonic IDs; restore always re-reads storage.
+- **Stage 2 (done)** — coordinated per-pipeline checkpoint two-phase
+  commit with master-assigned monotonic IDs; triggers and resolutions
+  ride heartbeats; abort on failure/timeout (`checkpoint-timeout-ms`);
+  exit barriers now persist resumable state in cluster mode too.
 - **Stage 3** — openraft takes over HA: coordinator state becomes a Raft
   state machine (snapshot = the existing `export_state` JSON); the Raft
   leader term becomes the wire fencing term; snapshot-polling
