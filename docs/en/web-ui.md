@@ -32,6 +32,36 @@ state. Ports/login can be overridden (`WEB_LISTEN`, `MASTER_ADDR`,
 > The demo script (or a `--role hybrid` node, which embeds a worker)
 > fixes it.
 
+### Embedded in the engine server (`--web`)
+
+The console (SPA + REST API + `/metrics`) is compiled into the
+`seatunnel-engine-server` binary as well; pass `--web` to serve it from the
+engine process itself — one binary, one command for the whole stack:
+
+```bash
+seatunnel-engine-server --role hybrid --addr 0.0.0.0:5800 --web
+```
+
+Without `--web` no HTTP port is opened. Extra flags:
+
+> A nohup wrapper for exactly this layout lives in
+> `scripts/start-hybrid-web.sh` (`start|stop|status|restart`, password via
+> `WEB_PASSWORD` / `SEATUNNEL_WEB_PASSWORD`).
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--web` | — | off | Serve the embedded console |
+| `--web-listen` | — | `0.0.0.0:8080` | HTTP listen address |
+| `--web-master` | — | own gRPC endpoint | Engine endpoint(s) the console proxies to (comma separated) |
+| `--web-auth-user` | `SEATUNNEL_WEB_USER` | `admin` | Login username |
+| `--web-auth-password` | `SEATUNNEL_WEB_PASSWORD` | `admin` (+warning) | Login password |
+| `--web-auth-disable` | — | off | Disable auth (local dev only) |
+
+By default the console targets this node's own gRPC endpoint (master/hybrid)
+or the `--master` list (worker role); sessions last 12 hours. For every
+other knob (refresh interval, session TTL) run the standalone `seatunnel-web`
+binary instead.
+
 ### Manual startup
 
 Start a cluster node, then the console:

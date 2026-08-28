@@ -34,6 +34,14 @@ COPY seatunnel-connectors/ ./seatunnel-connectors/
 COPY seatunnel-transforms/ ./seatunnel-transforms/
 COPY seatunnel-cli/ ./seatunnel-cli/
 COPY seatunnel-macros/ ./seatunnel-macros/
+# seatunnel-web/server is a workspace member the engine server embeds
+# (--web); its ../ui/dist assets are compiled into the binary, so the
+# whole crate (committed dist included) must be present. seatunnel-e2e
+# and seatunnel-benchmarks are members too — cargo refuses to load the
+# workspace when any member manifest is missing.
+COPY seatunnel-web/ ./seatunnel-web/
+COPY seatunnel-e2e/ ./seatunnel-e2e/
+COPY seatunnel-benchmarks/ ./seatunnel-benchmarks/
 
 RUN cargo build --release --bin seatunnel --bin seatunnel-engine-server
 
@@ -59,8 +67,9 @@ ENV SEATUNNEL_STATE_DIR=/opt/seatunnel/state
 
 USER seatunnel
 
-# Master gRPC (workers/CLI) and worker port.
-EXPOSE 5800 5001
+# Master gRPC (workers/CLI), worker port and the embedded web console
+# (--web).
+EXPOSE 5800 5001 8080
 
 # Default: run a hybrid node (coordinator + worker in one process).
 # Multi-node: give every container the same member-list config (odd voter
@@ -68,5 +77,7 @@ EXPOSE 5800 5001
 # To join an existing cluster as a pure worker instead, override with:
 #   docker run seatunnel-rs seatunnel-engine-server --role worker \
 #     --master <master>:5800 --worker-id w1
+# Add --web to serve the management console from the same process
+# (listen address defaults to 0.0.0.0:8080).
 ENTRYPOINT ["seatunnel-engine-server"]
 CMD ["--role", "hybrid", "--addr", "0.0.0.0:5800"]

@@ -25,6 +25,9 @@
 //! `hybrid` runs the coordinator and a worker executor in one process —
 //! the recommended single-machine form (Java `MASTER_AND_WORKER` parity)
 //! and the building block of symmetric multi-node deployments.
+//!
+//! The web management console is compiled into this binary; pass `--web`
+//! to also serve it (see the `--web-*` flags).
 
 use clap::Parser;
 use seatunnel_engine_comm::{
@@ -91,6 +94,62 @@ struct Args {
     /// over --debug; RUST_LOG is used when neither is given).
     #[arg(long, env = "SEATUNNEL_LOG")]
     log_level: Option<String>,
+
+    /// Serve the embedded web management console (SPA + REST API +
+    /// /metrics) from this process.
+    #[arg(long)]
+    web: bool,
+
+    /// HTTP listen address of the embedded web console (requires --web).
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    web_listen: String,
+
+    /// Engine endpoint(s) the console proxies to, comma separated
+    /// (failover order). Defaults to this server's own gRPC endpoint
+    /// (master/hybrid) or the --master list (worker role).
+    #[arg(long)]
+    web_master: Option<String>,
+
+    /// Web console login username.
+    #[arg(long, env = "SEATUNNEL_WEB_USER", default_value = "admin")]
+    web_auth_user: String,
+
+    /// Web console login password; falls back to "admin" with a startup
+    /// warning when unset.
+    #[arg(long, env = "SEATUNNEL_WEB_PASSWORD")]
+    web_auth_password: Option<String>,
+
+    /// Disable web console authentication (local development only).
+    #[arg(long)]
+    web_auth_disable: bool,
+}
+
+/// Options of the embedded web console, gathered from the `--web-*` flags.
+#[derive(Debug, Clone)]
+struct WebConsoleArgs {
+    listen: String,
+    /// Engine endpoint override; `None` derives it from the node role.
+    master: Option<String>,
+    auth_user: String,
+    auth_password: Option<String>,
+    auth_disable: bool,
+}
+
+/// Console auth from the `--web-auth-*` flags; mirrors the standalone
+/// `seatunnel-web` binary's defaults (admin / "admin" with a warning).
+fn web_auth(web: &WebConsoleArgs) -> seatunnel_web::AuthConfig {
+    if web.auth_disable {
+        tracing::warn!("web console authentication disabled (--web-auth-disable)");
+        return seatunnel_web::AuthConfig::disabled();
+    }
+    let password = web.auth_password.clone().unwrap_or_else(|| {
+        tracing::warn!(
+            "no web console password (--web-auth-password / SEATUNNEL_WEB_PASSWORD); \
+             using the default \"admin\" — change it for anything beyond local use"
+        );
+        "admin".to_string()
+    });
+    seatunnel_web::AuthConfig::new(web.auth_user.clone(), password, 12 * 3600)
 }
 
 #[tokio::main]
@@ -140,11 +199,19 @@ async fn main() -> anyhow::Result<()> {
         engine_config.history_job_expire_minutes
     );
 
+    let web = args.web.then(|| WebConsoleArgs {
+        listen: args.web_listen.clone(),
+        master: args.web_master.clone(),
+        auth_user: args.web_auth_user.clone(),
+        auth_password: args.web_auth_password.clone(),
+        auth_disable: args.web_auth_disable,
+    });
+
     match args.role.as_str() {
-        "master" => run_master(&args.addr, &args.advertise_addr, engine_config).await?,
+        "master" => run_master(&args.addr, &args.advertise_addr, engine_config, web).await?,
         "worker" => {
             let master_list = resolve_master_list(&args.master, &engine_config)?;
-            run_worker(&args.addr, master_list, &args.worker_id, engine_config).await?;
+            run_worker(&args.addr, master_list, &args.worker_id, engine_config, web).await?;
         }
         "hybrid" => {
             run_hybrid(
@@ -152,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
                 &args.advertise_addr,
                 &args.worker_id,
                 engine_config,
+                web,
             )
             .await?
         }
@@ -503,6 +571,7 @@ async fn run_master(
     addr: &str,
     advertise: &Option<String>,
     config: EngineServerConfig,
+    web: Option<WebConsoleArgs>,
 ) -> anyhow::Result<()> {
     // Port resolution: CLI --addr > hazelcast port (bind all interfaces)
     // > default 5800.
@@ -515,6 +584,13 @@ async fn run_master(
     };
 
     let (serving, server) = start_master(&bind_addr, advertise, config, "master").await?;
+    if let Some(web) = web {
+        let endpoint = web
+            .master
+            .clone()
+            .unwrap_or_else(|| advertise_address(advertise, &serving.local_addr));
+        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web));
+    }
     let shutdown = serving.shutdown;
     tokio::select! {
         _ = server => {},
@@ -532,6 +608,7 @@ async fn run_hybrid(
     advertise: &Option<String>,
     worker_id: &str,
     config: EngineServerConfig,
+    web: Option<WebConsoleArgs>,
 ) -> anyhow::Result<()> {
     let bind_addr = if addr != "0.0.0.0:5800" {
         addr.to_string()
@@ -543,6 +620,16 @@ async fn run_hybrid(
 
     let (serving, server) = start_master(&bind_addr, advertise, config.clone(), "hybrid").await?;
     let advertise_addr = advertise_address(advertise, &serving.local_addr);
+    if let Some(web) = web {
+        // The console proxies to this node's own coordinator (loopback
+        // always works even when the advertise address is not routable
+        // from this process yet).
+        let endpoint = web
+            .master
+            .clone()
+            .unwrap_or_else(|| format!("127.0.0.1:{}", serving.local_addr.port()));
+        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web));
+    }
     tracing::info!(
         "Hybrid node: coordinator at {} + in-process worker '{}'",
         advertise_addr,
@@ -557,7 +644,8 @@ async fn run_hybrid(
     master_list.retain(|m| m != &advertise_addr);
     master_list.insert(0, advertise_addr);
     let worker_bind_addr = format!("127.0.0.1:{}", serving.local_addr.port());
-    let worker_fut = run_worker(&worker_bind_addr, master_list, worker_id, config);
+    // web = None: the console (if any) was already spawned above.
+    let worker_fut = run_worker(&worker_bind_addr, master_list, worker_id, config, None);
 
     tokio::select! {
         _ = server => {},
@@ -615,10 +703,18 @@ async fn run_worker(
     master_list: Vec<String>,
     worker_id: &str,
     engine_config: EngineServerConfig,
+    web: Option<WebConsoleArgs>,
 ) -> anyhow::Result<()> {
     let master = master_list.first().cloned().ok_or_else(|| {
         anyhow::anyhow!("no master address (use --master or the config member-list)")
     })?;
+
+    // Embedded console (--web on a worker node): point it at the master
+    // list so it fails over together with the heartbeat loop.
+    if let Some(web) = web {
+        let endpoint = web.master.clone().unwrap_or_else(|| master_list.join(","));
+        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web));
+    }
 
     // Worker advertise address: --addr > config worker.address > default.
     let addr = if addr_arg != "127.0.0.1:5001" {

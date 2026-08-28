@@ -87,6 +87,44 @@ pub fn build_router(state: AppState) -> Router {
     )
 }
 
+/// Launch the console as a detached task: app state, metrics poller and
+/// `axum::serve` on `listen`, proxying to the engine at `master`
+/// (host:port, comma separated for failover). Used by `--web` on the
+/// engine server binary; the standalone `seatunnel-web` binary wires the
+/// same pieces itself to expose every knob (refresh interval, session
+/// TTL). A bind failure only logs an error — the host process keeps
+/// running.
+pub fn spawn_console(
+    listen: String,
+    master: String,
+    auth: AuthConfig,
+) -> tokio::task::JoinHandle<()> {
+    let state = AppState {
+        engine: Arc::new(seatunnel_engine_client::EngineClient::new(&master)),
+        metrics: Arc::new(Metrics::new()),
+        master_label: master.clone(),
+        auth: Arc::new(auth),
+        task_samples: Arc::default(),
+    };
+    spawn_poller(state.clone(), std::time::Duration::from_secs(5));
+    let app = build_router(state);
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(&listen).await {
+            Ok(listener) => {
+                tracing::info!(
+                    "web console listening on http://{} (engine: {})",
+                    listen,
+                    master
+                );
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!("web console stopped: {}", e);
+                }
+            }
+            Err(e) => tracing::error!("web console cannot bind {}: {}", listen, e),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

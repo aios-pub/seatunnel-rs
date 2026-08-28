@@ -39,6 +39,7 @@ seatunnel-connector-kafka = { path = "../../seatunnel-connectors/seatunnel-conne
 seatunnel-formats = { path = "../../seatunnel-formats", optional = true }
 
 seatunnel-connector-common = { path = "../../seatunnel-connectors/seatunnel-connector-common" }
+seatunnel-web = { path = "../../seatunnel-web/server" }
 openraft = { version = "0.9", features = ["serde", "storage-v2", "generic-snapshot-data"] }
 sysinfo = "0.39.6"
 

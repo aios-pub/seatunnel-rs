@@ -152,6 +152,15 @@ WASM UI + REST API + Prometheus `/metrics`) for a running cluster:
 seatunnel-web --master 127.0.0.1:5800 --listen 0.0.0.0:8080
 ```
 
+The same console is compiled into `seatunnel-engine-server` — pass `--web`
+to serve it from the engine process itself (no second binary):
+
+```bash
+seatunnel-engine-server --role hybrid --addr 0.0.0.0:5800 --web
+# or the nohup helper (background start/stop/status):
+WEB_PASSWORD=secret ./scripts/start-hybrid-web.sh
+```
+
 It supports job listing/detail/submit/cancel, checkpoint history, cluster
 worker views and health monitoring, behind a configurable username/password
 login (`--auth-user`, `--auth-password` / `SEATUNNEL_WEB_PASSWORD`).

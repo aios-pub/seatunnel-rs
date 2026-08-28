@@ -1,0 +1,5 @@
+# Keep cargo build caches out of the build context; the committed
+# seatunnel-web/ui/dist must stay (it is compiled into the binary).
+.git/
+target/
+**/target/
