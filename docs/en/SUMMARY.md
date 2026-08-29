@@ -1,7 +1,6 @@
 # Summary
 
 - [Quickstart](quickstart.md)
-- [Architecture](architecture.md)
 - [Cluster HA Design (vs. Java Zeta)](cluster-ha-design.md)
 - [Engine Configuration (seatunnel.yaml)](engine-config.md)
 - [Production Readiness](production-readiness.md)

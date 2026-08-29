@@ -16,6 +16,35 @@ worker execution → Kafka sink → periodic checkpoints, exercised continuously
 - **11 Data Formats**: JSON, Text, Canal JSON, Debezium JSON, Compatible Debezium, Kafka Connect, OGG JSON, Maxwell JSON, Avro, Protobuf, Native
 - **Type-Safe Data Model**: Field enum, Row, ColumnType, TableSchema
 
+## Highlights
+
+- **HA by consensus, not timeouts**: openraft quorum election (1/3/5 voters) with
+  monotonic fencing `term`s on every master↔worker message — a split brain is
+  impossible by construction, not mitigated by long timeouts. Measured leader
+  failover in ~2–4 s with exactly one term bump; the Java engine ships a 180 s
+  heartbeat tolerance precisely because without a quorum, fast failover is unsafe.
+- **Verified exactly-once checkpointing**: the full coordinator protocol —
+  globally aligned cuts, atomically durable checkpoint envelopes
+  (`tmp + fsync + rename`), two-phase commit. MySQL XA is implemented in pure SQL
+  (`XA PREPARE`/`XA RECOVER` reconciliation incl. zombie-session cleanup); the
+  Kafka sink aligns transactions to checkpoints. Proven by a fault-injection
+  matrix (crash at every 2PC stage, repeated ×5) and real `kill -9` e2e runs:
+  240/240 records delivered, zero lost.
+- **Honest CDC offsets**: source snapshot state captures the last *fully emitted*
+  transaction boundary rather than the decoder's read-ahead position — a class of
+  silent row loss on restore that was found here under kill -9 testing and fixed.
+- **Measured, visible resource admission**: no memory-sliced slots. Workers report
+  event-loop lag and a memory watermark on every heartbeat; overloaded workers
+  receive nothing new and pending tasks are stolen by healthy peers. The verdict
+  is visible in the web console and as Prometheus gauges.
+- **Fast data plane**: p50 82 ms / p99 328 ms end-to-end at a sustained
+  2,000 rows/s (MySQL CDC → Kafka, 500 tables, 100% delivery, one laptop);
+  ~3,400 rows/s whole-stack capacity; millions of rows/s in the engine core.
+  Raw numbers: `seatunnel-benchmarks/stress/results/`.
+- **One static binary, zero JVM**: engine + embedded web console (Leptos WASM) +
+  CLI in a single OpenSSL-free binary; Kafka via KRaft (no ZooKeeper), cluster
+  metadata via Raft (no Hazelcast).
+
 ## Project Structure
 
 ```
@@ -126,6 +155,34 @@ Source (MySQL CDC / Kafka / TiDB / PostgreSQL)
 Each subtask chains all three stages in one TaskGroup; parallelism splits the
 source (e.g. disjoint MySQL id ranges) across subtasks distributed over workers.
 
+## Differences from the Java Version
+
+This project re-implements Apache SeaTunnel's engine and connector model in Rust.
+It keeps the Java designs that are proven — the `prepareCommit`/commit two-phase
+sink contract, never-rewinding checkpoint ID counters, worker-side task dedupe on
+master failover — and replaces the places where the Java engine relies on
+mitigation with mechanism:
+
+| Dimension | Java SeaTunnel (Zeta) | seatunnel-rs |
+|---|---|---|
+| Runtime | JVM + Hazelcast for cluster membership | One static Rust binary; tokio + tonic gRPC |
+| Master election | Hazelcast oldest-member rule, 100 ms polling; no quorum — each partition elects its own master | openraft majority-quorum election; dual masters impossible by construction |
+| Split-brain | No protection in-engine; mitigated with 180 s heartbeat timeouts and GC tuning | Raft quorum guards all durable state; a minority side cannot commit |
+| Stale-master fencing | Only a node-local scheduler epoch | Monotonic `term` on every master↔worker message; workers reject dispatch/cancel from a lower term |
+| Checkpoint alignment | Barriers injected through real DAG edges | Tasks are fully chained per subtask (no inter-task data edges), so checkpoints are master-coordinated per-pipeline two-phase cuts — barrier propagation would be complexity with zero benefit |
+| Checkpoint across master switch | `latestCompletedCheckpoint` is in-memory only → restart-from-empty window until the next checkpoint completes | Checkpoint state is durable at prepare time; no empty-state window after any switch |
+| Resource model | Memory-sliced slots; masters block waiting for allocation | Measured admission (event-loop lag + memory watermark with hysteresis); tasks queue as SCHEDULED instead of blocking |
+| Dispatch | Hazelcast push operations | Worker-initiated pull with a long-poll fast path (~0 dispatch latency, NAT/firewall-friendly) |
+| Kafka exactly-once | Resumes producer transactions via reflection | rdkafka exposes no `resumeTransaction` → commit-at-prepare (1.5PC) + stable `transactional.id` fencing; duplicate window is milliseconds, absorbed by keyed upserts |
+| Membership changes | Dynamic Hazelcast membership | Static voter list (1/3/5 voters; two rejected at startup); scaling = config change + rolling restart |
+
+Scope differences, stated plainly: ~12 connectors (vs 100+ in Java); transforms
+are Filter / Map / Fanout / Rename / Select (no SQL transform); local mode is
+exactly-once while cluster mode is at-least-once; internal gRPC has no TLS/auth
+yet. The source-level Java analysis behind this table:
+[Cluster HA Design](docs/en/cluster-ha-design.md); verified capabilities and
+remaining gaps: [Production Readiness](docs/en/production-readiness.md).
+
 ## Connectors
 
 | Connector | Type | Features |
@@ -180,9 +237,14 @@ See [Web UI docs](docs/en/web-ui.md).
 ## Documentation
 
 - [Quick Start](docs/en/quickstart.md)
-- [Architecture](docs/en/architecture.md)
+- [Cluster HA Design (vs. Java Zeta)](docs/en/cluster-ha-design.md)
+- [Engine Configuration](docs/en/engine-config.md)
+- [Production Readiness](docs/en/production-readiness.md)
 - [Web Console](docs/en/web-ui.md)
 - [Kafka Connector](docs/en/connectors/kafka.md)
+
+Connector guides, multi-pipeline jobs, startup modes and schema evolution live in
+the mdbook under `docs/en/` (`mdbook build` renders it per `book.toml`).
 
 ## License
 
