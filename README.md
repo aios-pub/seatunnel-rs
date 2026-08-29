@@ -157,8 +157,13 @@ to serve it from the engine process itself (no second binary):
 
 ```bash
 seatunnel-engine-server --role hybrid --addr 0.0.0.0:5800 --web
-# or the nohup helper (background start/stop/status):
-WEB_PASSWORD=secret ./scripts/start-hybrid-web.sh
+# nohup helpers (background start/stop/status/restart) — the crate's
+# build.rs also copies them into target/<profile> next to the binaries:
+WEB_PASSWORD=secret ./scripts/start-hybrid-web.sh           # 1 node, info logs
+WEB_PASSWORD=secret ./scripts/start-hybrid-web-debug.sh     # 1 node, debug logs
+WEB_PASSWORD=secret ./scripts/start-cluster-web.sh          # 3-node cluster, console per node
+# release package flow: build, then run self-contained from target/release
+cargo build --release && cd target/release && WEB_PASSWORD=secret ./start-cluster-web.sh start
 ```
 
 It supports job listing/detail/submit/cancel, checkpoint history, cluster

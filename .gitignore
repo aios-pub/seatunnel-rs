@@ -47,3 +47,6 @@ scripts/bench/*_load.csv
 scripts/bench/*.mysql.err
 scripts/bench/bench_schema.json
 scripts/bench/init_bench_schema.sql
+
+# Binaries staged by scripts/start-hybrid-web-debug.sh
+/bin/

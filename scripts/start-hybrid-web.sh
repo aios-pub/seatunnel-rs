@@ -17,17 +17,40 @@
 #   BIN_DIR       binary directory             (default ./target/debug)
 #   NO_BUILD      set to 1 to skip cargo build
 #
+# Package mode: when this script sits NEXT TO the release binaries (copied
+# into target/release by scripts/package-release.sh), it runs them from
+# its own directory — fully self-contained, no cargo or repo needed.
+#
 # The state dir is KEPT across stop/start so resubmitted jobs resume from
 # their latest checkpoint. Logs append to $STATE_DIR/server.log.
+#
+# Two run modes:
+#   repo mode     — script inside a checkout: builds (unless NO_BUILD=1)
+#                   and runs ./target/debug by default;
+#   package mode  — script sits NEXT TO the binaries (the crate's build.rs
+#                   copies it into target/<profile>): fully self-contained,
+#                   all paths relative (./) — run it from the package dir.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PACKAGE_MODE=0
+if [[ -x "$SCRIPT_DIR/seatunnel-engine-server" ]]; then
+  # Package mode: binaries live beside this script (the build drops the
+  # scripts into target/<profile>). Everything stays relative to the
+  # CURRENT directory — run the script from the package dir (./).
+  PACKAGE_MODE=1
+  BIN_DIR=${BIN_DIR:-.}
+  NO_BUILD=1
+else
+  cd "$SCRIPT_DIR/.."
+  BIN_DIR=${BIN_DIR:-./target/debug}
+fi
 
 ADDR=${HYBRID_ADDR:-127.0.0.1:5800}
 WEB_LISTEN=${WEB_LISTEN:-0.0.0.0:8080}
 WEB_USER=${WEB_USER:-${SEATUNNEL_WEB_USER:-admin}}
 WEB_PASSWORD=${WEB_PASSWORD:-${SEATUNNEL_WEB_PASSWORD:-}}
 STATE_DIR=${STATE_DIR:-.seatunnel-state/hybrid-web}
-BIN_DIR=${BIN_DIR:-./target/debug}
 PID_FILE="$STATE_DIR/hybrid-web.pid"
 LOG_FILE="$STATE_DIR/server.log"
 ACTION=${1:-start}
@@ -94,10 +117,14 @@ do_start() {
     echo "==> building engine server (debug; NO_BUILD=1 + BIN_DIR to override)"
     cargo build -p seatunnel-engine-server
   fi
-  [[ -x "$BIN_DIR/seatunnel-engine-server" ]] || {
-    echo "error: $BIN_DIR/seatunnel-engine-server not found — build first or set BIN_DIR" >&2
+  if [[ ! -x "$BIN_DIR/seatunnel-engine-server" ]]; then
+    if [[ "$PACKAGE_MODE" == "1" ]]; then
+      echo "error: ./seatunnel-engine-server not found — run the script from the package directory" >&2
+    else
+      echo "error: $BIN_DIR/seatunnel-engine-server not found — build first or set BIN_DIR" >&2
+    fi
     exit 1
-  }
+  fi
 
   if [[ -z "$WEB_PASSWORD" ]]; then
     WEB_PASSWORD=admin

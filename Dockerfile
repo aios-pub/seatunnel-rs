@@ -34,6 +34,9 @@ COPY seatunnel-connectors/ ./seatunnel-connectors/
 COPY seatunnel-transforms/ ./seatunnel-transforms/
 COPY seatunnel-cli/ ./seatunnel-cli/
 COPY seatunnel-macros/ ./seatunnel-macros/
+# build.rs copies the startup scripts into target/<profile>; it needs them
+# in the build context.
+COPY scripts/ ./scripts/
 # seatunnel-web/server is a workspace member the engine server embeds
 # (--web); its ../ui/dist assets are compiled into the binary, so the
 # whole crate (committed dist included) must be present. seatunnel-e2e

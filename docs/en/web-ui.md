@@ -44,9 +44,17 @@ seatunnel-engine-server --role hybrid --addr 0.0.0.0:5800 --web
 
 Without `--web` no HTTP port is opened. Extra flags:
 
-> A nohup wrapper for exactly this layout lives in
-> `scripts/start-hybrid-web.sh` (`start|stop|status|restart`, password via
-> `WEB_PASSWORD` / `SEATUNNEL_WEB_PASSWORD`).
+> Nohup wrappers (`start|stop|status|restart`, password via `WEB_PASSWORD` /
+> `SEATUNNEL_WEB_PASSWORD`): `scripts/start-hybrid-web.sh` (single node,
+> info logs), `scripts/start-hybrid-web-debug.sh` (single node,
+> `SEATUNNEL_LOG=debug` — the log level, not the build profile) and
+> `scripts/start-cluster-web.sh` (N-node cluster, one console per node on
+> ports `WEB_LISTEN`+i).
+>
+> The crate's `build.rs` copies all three next to the compiled binaries,
+> so `cargo build --release` turns `target/release` into a self-contained
+> package: `cd target/release && WEB_PASSWORD=secret ./start-cluster-web.sh start`.
+> Package mode needs no cargo and no repo (state lands in `./.seatunnel-state`).
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
