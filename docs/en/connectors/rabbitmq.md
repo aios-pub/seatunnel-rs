@@ -23,6 +23,7 @@ source:
     password: guest
     queue-name: events
     exchange: ""                     # optional: bind queue to an exchange
+    exchange-type: direct            # direct | fanout | topic | headers
     routing-key: ""                  # optional binding key
     prefetch-count: 250
     format: json                     # any seatunnel-formats format
@@ -51,6 +52,7 @@ sink:
     password: guest
     queue-name: events_out           # durable; declared (and bound) on open
     exchange: ""                     # or an existing exchange + routing-key
+    exchange-type: direct            # used only when the exchange must be created
     routing-key: ""
     persistent: true                 # delivery_mode = 2
     publisher-confirm: true
@@ -58,3 +60,13 @@ sink:
     max-batch-size: 100
     batch.timeout.ms: 100
 ```
+
+## Topology declaration
+
+Exchanges and queues are declared **passive-first**: when the entity
+already exists on the broker it is left untouched — its type, durability
+and flags may differ from the connector defaults without failing the job
+(RabbitMQ rejects a mismatched active redeclare with
+`PRECONDITION_FAILED`). `exchange-type` (default `direct`) only applies
+when the exchange does not exist and has to be created. The queue binding
+is applied afterwards and is idempotent.

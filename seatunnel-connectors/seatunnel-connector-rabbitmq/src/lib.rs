@@ -40,9 +40,11 @@ use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
     ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
+use lapin::protocol::{AMQPErrorKind, AMQPSoftError};
 use lapin::types::FieldTable;
 use lapin::{
-    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ErrorKind,
+    ExchangeKind,
 };
 use seatunnel_api::row::{Row, RowKind};
 use seatunnel_api::schema::TableSchema;
@@ -73,6 +75,9 @@ pub struct RabbitMqConfig {
     /// Exchange to publish to (sink); empty = default exchange, which
     /// routes straight to the queue named by the routing key.
     pub exchange: String,
+    /// Type used when the exchange has to be created; ignored when the
+    /// exchange already exists broker-side (it is then never redeclared).
+    pub exchange_type: ExchangeKind,
     /// Routing key for publishes and for the queue binding.
     pub routing_key: String,
     /// Consumer prefetch window (unacked messages per consumer).
@@ -108,6 +113,7 @@ impl Default for RabbitMqConfig {
             password: "guest".to_string(),
             queue_name: "seatunnel".to_string(),
             exchange: String::new(),
+            exchange_type: ExchangeKind::Direct,
             routing_key: String::new(),
             prefetch_count: 250,
             persistent: true,
@@ -138,9 +144,24 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// Parse an AMQP exchange type. Unknown values are rejected instead of
+/// silently degrading to the default: the type decides broker-side routing
+/// semantics for every future declare.
+fn parse_exchange_kind(s: &str) -> anyhow::Result<ExchangeKind> {
+    match s.trim().to_lowercase().as_str() {
+        "direct" => Ok(ExchangeKind::Direct),
+        "fanout" => Ok(ExchangeKind::Fanout),
+        "topic" => Ok(ExchangeKind::Topic),
+        "headers" => Ok(ExchangeKind::Headers),
+        other => Err(anyhow::anyhow!(
+            "invalid exchange-type '{other}' (expected direct, fanout, topic or headers)"
+        )),
+    }
+}
+
 impl RabbitMqConfig {
-    pub fn from_config(config: &ConnectorConfig) -> Self {
-        RabbitMqConfig {
+    pub fn from_config(config: &ConnectorConfig) -> anyhow::Result<Self> {
+        Ok(RabbitMqConfig {
             host: config.get_string("host", "127.0.0.1"),
             port: config.get_int("port", 5672).clamp(1, 65_535) as u16,
             virtual_host: config
@@ -150,6 +171,10 @@ impl RabbitMqConfig {
             queue_name: config
                 .get_string("queue-name", &config.get_string("queue_name", "seatunnel")),
             exchange: config.get_string("exchange", ""),
+            exchange_type: parse_exchange_kind(&config.get_string(
+                "exchange-type",
+                &config.get_string("exchange_type", "direct"),
+            ))?,
             routing_key: config.get_string("routing-key", &config.get_string("routing_key", "")),
             prefetch_count: config.get_int("prefetch-count", 250).clamp(0, 65_535) as u16,
             persistent: config.get_bool("persistent", true),
@@ -172,7 +197,7 @@ impl RabbitMqConfig {
             poll_timeout_ms: config.get_int("poll.timeout.ms", 250).max(10) as u64,
             pipeline: config.get_string("pipeline.name", "p0"),
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
-        }
+        })
     }
 
     /// Effective routing key: an explicit one, else the queue name (the
@@ -349,6 +374,121 @@ fn decode_payload(format: MessageFormat, payload: &[u8], schema: Option<&TableSc
 }
 
 // ---------------------------------------------------------------------------
+// Topology declaration (passive-first, shared by source and sink)
+// ---------------------------------------------------------------------------
+
+/// True when `err` is the AMQP NOT-FOUND (404) soft error raised by a
+/// passive declare of a missing exchange/queue. Any soft error closes the
+/// channel, so the caller must recreate it before issuing more RPCs.
+fn is_not_found(err: &lapin::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ProtocolError(e)
+            if matches!(e.kind(), AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND))
+    )
+}
+
+/// Declare `exchange` only when it does not already exist. A passive
+/// declare checks existence only — type and durability are ignored — so an
+/// exchange created elsewhere (e.g. by the canal deployment) is never
+/// redeclared: RabbitMQ rejects a mismatched active redeclare with
+/// PRECONDITION_FAILED and closes the channel, and the configured `kind`
+/// only applies to exchanges this connector creates itself. When the
+/// passive probe reports NOT_FOUND the channel is recreated (the 404
+/// closed it) and the exchange is actively declared with `kind`/durable.
+async fn ensure_exchange(
+    connection: &Connection,
+    channel: &mut Channel,
+    exchange: &str,
+    kind: ExchangeKind,
+) -> anyhow::Result<()> {
+    let probe = channel
+        .exchange_declare(
+            exchange.into(),
+            kind.clone(),
+            ExchangeDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await;
+    match probe {
+        Ok(_) => {
+            tracing::debug!("exchange '{exchange}' already exists, skipping declare");
+            Ok(())
+        }
+        Err(e) if is_not_found(&e) => {
+            tracing::info!("exchange '{exchange}' not found, declaring it ({kind:?}, durable)");
+            *channel = connection
+                .create_channel()
+                .await
+                .map_err(|e| anyhow::anyhow!("RabbitMQ channel failed: {}", e))?;
+            channel
+                .exchange_declare(
+                    exchange.into(),
+                    kind,
+                    ExchangeDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("exchange_declare failed: {}", e))?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("exchange_declare failed: {}", e)),
+    }
+}
+
+/// Same passive-first policy as `ensure_exchange` for queues: skip when the
+/// queue exists (whatever its durability), declare a durable one when it
+/// does not.
+async fn ensure_queue(
+    connection: &Connection,
+    channel: &mut Channel,
+    queue: &str,
+) -> anyhow::Result<()> {
+    let probe = channel
+        .queue_declare(
+            queue.into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await;
+    match probe {
+        Ok(_) => {
+            tracing::debug!("queue '{queue}' already exists, skipping declare");
+            Ok(())
+        }
+        Err(e) if is_not_found(&e) => {
+            tracing::info!("queue '{queue}' not found, declaring it (durable)");
+            *channel = connection
+                .create_channel()
+                .await
+                .map_err(|e| anyhow::anyhow!("RabbitMQ channel failed: {}", e))?;
+            channel
+                .queue_declare(
+                    queue.into(),
+                    QueueDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("queue_declare failed: {}", e))?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("queue_declare failed: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Source
 // ---------------------------------------------------------------------------
 
@@ -422,41 +562,24 @@ impl SourceReader for RabbitMqSourceReader {
             let connection = Connection::connect(uri.as_str(), ConnectionProperties::default())
                 .await
                 .map_err(|e| anyhow::anyhow!("RabbitMQ connect failed: {}", e))?;
-            let channel = connection
+            let mut channel = connection
                 .create_channel()
                 .await
                 .map_err(|e| anyhow::anyhow!("RabbitMQ channel failed: {}", e))?;
-            channel
-                .basic_qos(self.config.prefetch_count, BasicQosOptions::default())
-                .await
-                .map_err(|e| anyhow::anyhow!("basic_qos failed: {}", e))?;
-            // Declare (or verify) a durable queue; binds it to the exchange
-            // when both an exchange and a routing key are configured.
-            channel
-                .queue_declare(
-                    self.config.queue_name.as_str().into(),
-                    QueueDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("queue_declare failed: {}", e))?;
+            // Topology is declared passive-first: entities that already
+            // exist broker-side are left untouched (their type/durability
+            // may differ from the connector defaults). basic_qos follows
+            // the declares because a NOT_FOUND probe recreates the channel.
+            ensure_queue(&connection, &mut channel, &self.config.queue_name).await?;
             if !self.config.exchange.is_empty() {
                 // The exchange must exist before the queue can bind to it.
-                channel
-                    .exchange_declare(
-                        self.config.exchange.as_str().into(),
-                        ExchangeKind::Direct,
-                        ExchangeDeclareOptions {
-                            durable: true,
-                            ..Default::default()
-                        },
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("exchange_declare failed: {}", e))?;
+                ensure_exchange(
+                    &connection,
+                    &mut channel,
+                    &self.config.exchange,
+                    self.config.exchange_type.clone(),
+                )
+                .await?;
                 let routing_key = self.config.effective_routing_key();
                 channel
                     .queue_bind(
@@ -469,6 +592,10 @@ impl SourceReader for RabbitMqSourceReader {
                     .await
                     .map_err(|e| anyhow::anyhow!("queue_bind failed: {}", e))?;
             }
+            channel
+                .basic_qos(self.config.prefetch_count, BasicQosOptions::default())
+                .await
+                .map_err(|e| anyhow::anyhow!("basic_qos failed: {}", e))?;
             let tag = format!(
                 "seatunnel-{}-{}",
                 self.config.pipeline, self.config.subtask_index
@@ -704,45 +831,26 @@ impl RabbitMqSinkWriter {
         let connection = Connection::connect(uri.as_str(), ConnectionProperties::default())
             .await
             .map_err(|e| anyhow::anyhow!("RabbitMQ connect failed: {}", e))?;
-        let channel = connection
+        let mut channel = connection
             .create_channel()
             .await
             .map_err(|e| anyhow::anyhow!("RabbitMQ channel failed: {}", e))?;
-        if self.config.publisher_confirm {
-            channel
-                .confirm_select(ConfirmSelectOptions::default())
-                .await
-                .map_err(|e| anyhow::anyhow!("confirm_select failed: {}", e))?;
-        }
         // Publish topology: the exchange, queue and binding must EXIST
         // before the first basic.publish — publishing to a missing
-        // exchange kills the channel with a 404. Idempotent declares.
+        // exchange kills the channel with a 404. Declared passive-first:
+        // entities that already exist are left untouched (a mismatched
+        // active redeclare is rejected with PRECONDITION_FAILED).
         if !self.config.exchange.is_empty() {
-            channel
-                .exchange_declare(
-                    self.config.exchange.as_str().into(),
-                    ExchangeKind::Direct,
-                    ExchangeDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("exchange_declare failed: {}", e))?;
+            ensure_exchange(
+                &connection,
+                &mut channel,
+                &self.config.exchange,
+                self.config.exchange_type.clone(),
+            )
+            .await?;
         }
         if !self.config.queue_name.is_empty() {
-            channel
-                .queue_declare(
-                    self.config.queue_name.as_str().into(),
-                    QueueDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("queue_declare failed: {}", e))?;
+            ensure_queue(&connection, &mut channel, &self.config.queue_name).await?;
             if !self.config.exchange.is_empty() {
                 channel
                     .queue_bind(
@@ -755,6 +863,14 @@ impl RabbitMqSinkWriter {
                     .await
                     .map_err(|e| anyhow::anyhow!("queue_bind failed: {}", e))?;
             }
+        }
+        if self.config.publisher_confirm {
+            // Confirm mode follows the topology declares: a NOT_FOUND probe
+            // recreates the channel, which would otherwise lose the mode.
+            channel
+                .confirm_select(ConfirmSelectOptions::default())
+                .await
+                .map_err(|e| anyhow::anyhow!("confirm_select failed: {}", e))?;
         }
         self.connection = Some(connection);
         self.channel = Some(channel);
@@ -969,7 +1085,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        RabbitMqConfig::from_config(&ConnectorConfig::new(props))
+        RabbitMqConfig::from_config(&ConnectorConfig::new(props)).expect("valid connector config")
     }
 
     #[test]
@@ -1017,6 +1133,24 @@ mod tests {
     }
 
     #[test]
+    fn test_exchange_type_parsing() {
+        let config = config_from(&[("exchange", "ex1"), ("exchange-type", "Topic")]);
+        assert_eq!(config.exchange_type, ExchangeKind::Topic);
+        let config = config_from(&[("exchange_type", "fanout")]);
+        assert_eq!(config.exchange_type, ExchangeKind::Fanout);
+        // Default keeps the historical direct-exchange behavior.
+        let config = config_from(&[]);
+        assert_eq!(config.exchange_type, ExchangeKind::Direct);
+        let props: std::collections::HashMap<String, String> = [("exchange-type", "directx")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let err = RabbitMqConfig::from_config(&ConnectorConfig::new(props))
+            .expect_err("unknown exchange types must fail the config parse");
+        assert!(err.to_string().contains("invalid exchange-type 'directx'"));
+    }
+
+    #[test]
     fn test_encode_row_text_and_json() {
         let mut row = Row::new(RowKind::Insert, 3);
         row.set(0, Field::Int64(7));
@@ -1041,5 +1175,18 @@ mod tests {
         let rows = decode_payload(MessageFormat::Text, b"hello", None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), &Field::String("hello".into()));
+    }
+
+    #[test]
+    fn test_is_not_found_matches_amqp_404_only() {
+        let protocol_error = |code| {
+            lapin::Error::from(ErrorKind::ProtocolError(
+                lapin::protocol::AMQPError::from_id(code, "boom".into()).unwrap(),
+            ))
+        };
+        assert!(is_not_found(&protocol_error(404)));
+        // PRECONDITION_FAILED (406): a mismatched redeclare, not a miss —
+        // it must propagate instead of triggering a fresh declare.
+        assert!(!is_not_found(&protocol_error(406)));
     }
 }

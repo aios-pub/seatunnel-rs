@@ -842,7 +842,7 @@ pub fn create_source(
             #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_rabbitmq::{RabbitMqConfig, RabbitMqSourceReader};
-                let cfg = RabbitMqConfig::from_config(&conn);
+                let cfg = RabbitMqConfig::from_config(&conn)?;
                 tracing::info!(
                     "factory: RabbitMQ source queue={} at {}:{} vhost={}",
                     cfg.queue_name,
@@ -1098,7 +1098,7 @@ pub fn create_sink_with_restore(
             #[cfg(feature = "connectors")]
             {
                 use seatunnel_connector_rabbitmq::{RabbitMqConfig, RabbitMqSinkWriter};
-                let cfg = RabbitMqConfig::from_config(&conn);
+                let cfg = RabbitMqConfig::from_config(&conn)?;
                 tracing::info!(
                     "factory: RabbitMQ sink exchange='{}' routing_key='{}' at {}:{} (confirm={})",
                     cfg.exchange,
