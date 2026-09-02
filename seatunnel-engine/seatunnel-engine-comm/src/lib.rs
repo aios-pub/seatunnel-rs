@@ -33,9 +33,9 @@ pub use generated::{
     CancelJobRequest, CheckpointEntry, CheckpointPhase, CheckpointReport, CheckpointResolution,
     CheckpointTrigger, ClusterInfo, Empty, FetchCheckpointRequest, FetchCheckpointResponse,
     HeartbeatRequest, HeartbeatResponse, JobCheckpointHistory, JobList, JobLogs, JobStatus,
-    JobStatusRequest, JobSummary, SinkMetricsStats, SubmitJobRequest, SubmitJobResponse,
-    TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs, TaskStatusInfo,
-    TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
+    JobStatusRequest, JobSummary, RestartJobRequest, SinkMetricsStats, SubmitJobRequest,
+    SubmitJobResponse, TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs,
+    TaskStatusInfo, TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
     WorkerRegistrationResponse,
 };
 

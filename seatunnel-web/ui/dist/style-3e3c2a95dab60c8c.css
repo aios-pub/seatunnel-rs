@@ -315,3 +315,92 @@ a:hover { text-decoration: underline; }
 .log-head h2 { margin-bottom: 8px; }
 .log-autoscroll { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; }
 .log-autoscroll input { width: auto; }
+
+/* --- Dynamic admission (cluster view) --- */
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.ok {
+  background: rgba(46, 160, 67, 0.16);
+  color: #2ea043;
+}
+.badge.bad {
+  background: rgba(248, 81, 73, 0.16);
+  color: #f85149;
+}
+tr.row-overloaded td {
+  background: rgba(248, 81, 73, 0.06);
+}
+.loadbar {
+  display: inline-block;
+  vertical-align: middle;
+  width: 90px;
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(110, 118, 129, 0.2);
+  overflow: hidden;
+  margin-right: 6px;
+}
+.loadbar-fill {
+  height: 100%;
+  border-radius: 4px;
+}
+.loadbar-fill.tone-muted {
+  background: #58a6ff;
+}
+.loadbar-fill.tone-running {
+  background: #d29922;
+}
+.loadbar-fill.tone-failed {
+  background: #f85149;
+}
+.mono.small {
+  font-size: 11px;
+}
+.panel .hint {
+  margin: 10px 0 0;
+  color: #8b949e;
+  font-size: 12px;
+}
+
+/* --- Job edit-and-restart --- */
+.job-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(110, 118, 129, 0.4);
+  background: #21262d;
+  color: #e6edf3;
+  cursor: pointer;
+  font-size: 13px;
+}
+.btn:hover:not(:disabled) { background: #30363d; }
+.btn:disabled { opacity: 0.5; cursor: wait; }
+.btn.primary { background: #238636; border-color: #2ea043; }
+.btn.primary:hover:not(:disabled) { background: #2ea043; }
+.update-msg { color: #8b949e; font-size: 12px; }
+.editor-panel textarea.config-editor {
+  width: 100%;
+  min-height: 320px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: #0d1117;
+  color: #e6edf3;
+  border: 1px solid rgba(110, 118, 129, 0.4);
+  border-radius: 6px;
+  padding: 10px;
+  box-sizing: border-box;
+  resize: vertical;
+  white-space: pre;
+}

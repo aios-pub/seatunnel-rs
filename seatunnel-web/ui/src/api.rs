@@ -357,3 +357,13 @@ pub async fn cancel_job(job_id: &str) -> Result<(), String> {
         Err(extract_error(&text).unwrap_or_else(|| format!("HTTP {}", status)))
     }
 }
+
+/// Restart a historical job with its retained config (same id, checkpoint
+/// restore). Long-running (up to the server-side cancel timeout).
+pub async fn restart_job(job_id: &str) -> Result<SubmitResult, String> {
+    let resp = gloo_net::http::Request::post(&format!("{}/jobs/{}/restart", BASE, job_id))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e))?;
+    read_json(resp).await
+}

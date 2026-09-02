@@ -36,6 +36,10 @@ message RaftSnapshotResponse { bytes payload = 1; }
 service ClientService {
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
   rpc CancelJob(CancelJobRequest) returns (Empty);
+  // Restart a historical job (same id, retained raw config): cancels it
+  // first when still non-terminal, then resubmits; tasks resume from
+  // their last checkpoint where one exists.
+  rpc RestartJob(RestartJobRequest) returns (SubmitJobResponse);
   rpc GetJobStatus(JobStatusRequest) returns (JobStatus);
   rpc GetClusterInfo(Empty) returns (ClusterInfo);
   rpc ListJobs(Empty) returns (JobList);
@@ -237,6 +241,10 @@ message SubmitJobResponse {
 }
 
 message CancelJobRequest {
+  string job_id = 1;
+}
+
+message RestartJobRequest {
   string job_id = 1;
 }
 

@@ -14,7 +14,7 @@ pub use update::{UpdateOptions, UpdateOutcome, update_job};
 use reqwest::Client as HttpClient;
 use seatunnel_engine_comm::{
     CancelJobRequest, ClientServiceClient, ClusterInfo, JobCheckpointHistory, JobList, JobLogs,
-    JobStatus, JobStatusRequest, SubmitJobRequest, SubmitJobResponse,
+    JobStatus, JobStatusRequest, RestartJobRequest, SubmitJobRequest, SubmitJobResponse,
 };
 use tonic::Request;
 use tracing::info;
@@ -184,6 +184,34 @@ impl EngineClient {
         .await?;
         info!("Job {} cancelled", job_id);
         Ok(())
+    }
+
+    /// Restart a historical job with the same id and its retained config.
+    /// Follows the leader hint like `submit_job`; long-running by design
+    /// (cancels a non-terminal job first — up to the server-side cancel
+    /// timeout — then resubmits; tasks resume from their last checkpoint).
+    pub async fn restart_job(
+        &self,
+        job_id: &str,
+    ) -> Result<SubmitJobResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let request = RestartJobRequest {
+            job_id: job_id.to_string(),
+        };
+        let response = self
+            .with_leader_follow(
+                "restart",
+                job_id,
+                request,
+                |mut client, request| async move {
+                    client
+                        .restart_job(Request::new(request))
+                        .await
+                        .map(|r| r.into_inner())
+                },
+            )
+            .await?;
+        info!("Job {} restarted: {}", job_id, response.message);
+        Ok(response)
     }
 
     /// Run a mutating RPC against the configured masters, following the

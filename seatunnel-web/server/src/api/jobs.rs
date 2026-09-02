@@ -188,6 +188,16 @@ pub async fn cancel_job(State(state): State<AppState>, Path(job_id): Path<String
     }
 }
 
+/// `POST /api/v1/jobs/{job_id}/restart` — restart a historical job with
+/// its retained config (same id, checkpoint restore). Long-running by
+/// design (≤ the server-side cancel timeout).
+pub async fn restart_job(State(state): State<AppState>, Path(job_id): Path<String>) -> Response {
+    match state.engine.restart_job(&job_id).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
 /// `GET /api/v1/jobs/{job_id}/checkpoints` — checkpoint history.
 pub async fn job_checkpoints(
     State(state): State<AppState>,

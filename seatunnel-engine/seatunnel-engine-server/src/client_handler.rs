@@ -25,12 +25,20 @@ use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot_admission};
 use crate::raft::WritePath;
 use seatunnel_engine_comm::{
     CancelJobRequest, CheckpointEntry, ClusterInfo, Empty, JobCheckpointHistory, JobList, JobLogs,
-    JobStatus, JobStatusRequest, JobSummary, SubmitJobRequest, SubmitJobResponse,
-    TaskCheckpointHistory, TaskLogs, WorkerInfo,
+    JobStatus, JobStatusRequest, JobSummary, RestartJobRequest, SubmitJobRequest,
+    SubmitJobResponse, TaskCheckpointHistory, TaskLogs, WorkerInfo,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
+
+/// Max seconds to wait for a non-terminal job to settle after the cancel
+/// before a restart aborts (mirrors the client update flow's safety
+/// default: never run the old and new incarnations in parallel).
+const RESTART_CANCEL_TIMEOUT_SECS: u64 = 60;
+/// Quiet period after the job settles, draining in-flight terminal
+/// reports from the old incarnation.
+const RESTART_SETTLE_MS: u64 = 2_000;
 
 /// Client service handler backed by shared coordinator + worker registry.
 #[derive(Clone)]
@@ -226,6 +234,118 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
         self.wake.notify_waiters();
         Ok(Response::new(Empty {}))
+    }
+
+    async fn restart_job(
+        &self,
+        request: Request<RestartJobRequest>,
+    ) -> Result<Response<SubmitJobResponse>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+        tracing::info!("Restarting job {}", job_id);
+
+        // Same leader gate as submission, same retry hint protocol.
+        self.require_leader()?;
+
+        // The retained raw config is the restart basis; resubmitting with
+        // the SAME id makes workers restore from the latest checkpoint of
+        // (job_id, task_id) instead of cold-starting.
+        let job = self
+            .coordinator
+            .get_job(&job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        if job.raw_config.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "job {} has no retained config to restart from",
+                job_id
+            )));
+        }
+        let job_name = job.job_name.clone();
+        let config: serde_json::Value = serde_json::from_str(&job.raw_config).map_err(|e| {
+            Status::failed_precondition(format!("retained job config unreadable: {}", e))
+        })?;
+
+        // Non-terminal: cancel first — the cancel path takes the exit
+        // checkpoint (final sink flush + source position), the de-facto
+        // savepoint. Wait until no task is actively sitting on a worker
+        // (`Running`/`Deploying`); never-dispatched `Created`/`Scheduled`
+        // tasks of a terminal job are inert and safe to replace.
+        if !job.state.is_terminal() {
+            let cmd = Command::CancelJob {
+                job_id: job_id.clone(),
+                at_ms: seatunnel_engine_core::now_millis(),
+            };
+            self.writes
+                .propose(cmd)
+                .await
+                .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
+            self.wake.notify_waiters();
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(RESTART_CANCEL_TIMEOUT_SECS);
+            loop {
+                let settled = self
+                    .coordinator
+                    .get_job(&job_id)
+                    .map(|j| {
+                        j.state.is_terminal()
+                            && j.tasks.values().all(|t| {
+                                !matches!(
+                                    t.state,
+                                    crate::job_coordinator::JobState::Running
+                                        | crate::job_coordinator::JobState::Deploying
+                                )
+                            })
+                    })
+                    .unwrap_or(true);
+                if settled {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::failed_precondition(format!(
+                        "job {} did not cancel within {}s; restart ABORTED without resubmitting \
+                         (the old incarnation may still be consuming; inspect it with job status \
+                         and retry)",
+                        job_id, RESTART_CANCEL_TIMEOUT_SECS
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            // Drain in-flight terminal reports from the old incarnation.
+            tokio::time::sleep(std::time::Duration::from_millis(RESTART_SETTLE_MS)).await;
+        }
+
+        // Resubmit with the same id from the retained config; parallelism
+        // re-derives from the config's env block.
+        let workers = registry_snapshot_admission(&self.workers);
+        let (job, descriptors, _tasks) = self
+            .coordinator
+            .plan_job(&job_id, &job_name, &config, None, &workers)
+            .map_err(|e| {
+                tracing::error!("Job {} restart rejected: {}", job_id, e);
+                Status::failed_precondition(e.to_string())
+            })?;
+        let task_count = descriptors.len();
+        let cmd = Command::SubmitJob { job, descriptors };
+        self.writes
+            .propose(cmd)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("consensus write: {}", e)))?;
+        self.wake.notify_waiters();
+
+        tracing::info!(
+            "Job {} restarted: {} chained task(s) across {} worker(s)",
+            job_id,
+            task_count,
+            workers.len()
+        );
+        Ok(Response::new(SubmitJobResponse {
+            success: true,
+            job_id,
+            message: format!(
+                "job '{}' restarted with {} task(s); workers restore from the latest checkpoint",
+                job_name, task_count
+            ),
+        }))
     }
 
     async fn get_job_status(

@@ -92,6 +92,32 @@ pub fn JobDetail() -> impl IntoView {
         }
     };
 
+    // Restart-as-is: same id + the config retained at submission time; the
+    // engine cancels a running incarnation first, then resubmits (tasks
+    // restore from their latest checkpoint).
+    let restart_as_is = {
+        let job_id = job_id.clone();
+        move || {
+            let job_id = job_id.clone();
+            set_updating.set(true);
+            set_update_msg.set(Some(
+                "Restarting with the retained config (cancelling the old incarnation first)…"
+                    .to_string(),
+            ));
+            spawn_local(async move {
+                match api::restart_job(&job_id).await {
+                    Ok(result) => {
+                        set_update_msg.set(Some(format!("Restarted: {}", result.message)));
+                    }
+                    Err(err) => {
+                        set_update_msg.set(Some(format!("Restart failed: {}", err)));
+                    }
+                }
+                set_updating.set(false);
+            });
+        }
+    };
+
     let poll_id = job_id.clone();
     spawn_local(async move {
         loop {
@@ -123,6 +149,7 @@ pub fn JobDetail() -> impl IntoView {
             // closures capture locals, not this closure's environment.
             let confirm_update = confirm_update.clone();
             let open_editor = open_editor.clone();
+            let restart_as_is = restart_as_is.clone();
             let set_editor_open = set_editor_open.clone();
             let set_editor_text = set_editor_text.clone();
             status
@@ -182,6 +209,22 @@ pub fn JobDetail() -> impl IntoView {
                                         }
                                     }}
                                 </button>
+                                <button
+                                    class="btn"
+                                    disabled=move || updating.get()
+                                    on:click={
+                                        let restart_as_is = restart_as_is.clone();
+                                        move |_| restart_as_is()
+                                    }
+                                >
+                                    {move || {
+                                        if updating.get() {
+                                            "Restarting…".to_string()
+                                        } else {
+                                            "重启 (Restart)".to_string()
+                                        }
+                                    }}
+                                </button>
                                 {move || {
                                     update_msg
                                         .get()
@@ -189,7 +232,7 @@ pub fn JobDetail() -> impl IntoView {
                                 }}
                             </div>
                             <div class="hint">
-                                "Update = cancel (automatic exit checkpoint) then resubmit with the SAME job id: workers resume from the latest checkpoint (at-least-once; exactly-once with transactional sinks). Cross-worker restore requires s3/master checkpoint storage."
+                                "Update = cancel (automatic exit checkpoint) then resubmit with the SAME job id: workers resume from the latest checkpoint (at-least-once; exactly-once with transactional sinks). Cross-worker restore requires s3/master checkpoint storage. Restart = same flow with the ORIGINAL config, no editing."
                             </div>
                             {(!status.error_message.is_empty()).then(|| {
                                 view! {

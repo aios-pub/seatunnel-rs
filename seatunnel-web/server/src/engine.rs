@@ -105,6 +105,10 @@ pub trait EngineOps: Send + Sync {
         config_bytes: Vec<u8>,
     ) -> Result<SubmitResultDto, EngineError>;
     async fn cancel_job(&self, job_id: &str) -> Result<(), EngineError>;
+    /// Restart a historical job with its retained config (same id):
+    /// cancel (exit checkpoint) when still non-terminal → resubmit;
+    /// tasks resume from their last checkpoint.
+    async fn restart_job(&self, job_id: &str) -> Result<SubmitResultDto, EngineError>;
     /// Edit-and-restart: cancel (exit checkpoint) → resubmit same id.
     async fn update_job(
         &self,
@@ -260,6 +264,19 @@ impl EngineOps for EngineClient {
             .map_err(EngineError::from_client)
     }
 
+    async fn restart_job(&self, job_id: &str) -> Result<SubmitResultDto, EngineError> {
+        let resp = EngineClient::restart_job(self, job_id)
+            .await
+            .map_err(EngineError::from_client)?;
+        if !resp.success {
+            return Err(EngineError::Invalid(resp.message));
+        }
+        Ok(SubmitResultDto {
+            job_id: resp.job_id,
+            message: resp.message,
+        })
+    }
+
     async fn update_job(
         &self,
         job_id: &str,
@@ -383,6 +400,22 @@ impl FakeEngine {
 #[cfg(test)]
 #[async_trait]
 impl EngineOps for FakeEngine {
+    async fn restart_job(&self, job_id: &str) -> Result<SubmitResultDto, EngineError> {
+        if self.unreachable {
+            return Err(self.err());
+        }
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(job) = jobs.iter_mut().find(|j| j.job_id == job_id) else {
+            return Err(EngineError::NotFound(format!("Job {} not found", job_id)));
+        };
+        job.state = "CREATED".to_string();
+        job.end_time_ms = 0;
+        Ok(SubmitResultDto {
+            job_id: job_id.to_string(),
+            message: "restarted (fake)".to_string(),
+        })
+    }
+
     async fn update_job(
         &self,
         job_id: &str,

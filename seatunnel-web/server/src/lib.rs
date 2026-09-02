@@ -66,6 +66,10 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::post(api::jobs::cancel_job),
             )
             .route(
+                "/api/v1/jobs/{job_id}/restart",
+                axum::routing::post(api::jobs::restart_job),
+            )
+            .route(
                 "/api/v1/jobs/{job_id}/update",
                 axum::routing::post(api::jobs::update_job),
             )
@@ -204,6 +208,16 @@ mod tests {
         body: String,
         cookie: Option<&str>,
     ) -> StatusCode {
+        post_json_body(state, path, body, cookie).await.0
+    }
+
+    /// `post_json` that also returns the response body (lowercased).
+    async fn post_json_body(
+        state: &AppState,
+        path: &str,
+        body: String,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
         let mut builder = Request::builder()
             .method("POST")
             .uri(path)
@@ -215,7 +229,10 @@ mod tests {
             .oneshot(builder.body(Body::from(body)).unwrap())
             .await
             .unwrap();
-        response.status()
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        (status, body)
     }
 
     #[tokio::test]
@@ -401,6 +418,35 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn restart_unknown_job_returns_404() {
+        let state = test_state(FakeEngine::default());
+        let cookie = login_cookie(&state).await;
+        let status = post_json(
+            &state,
+            "/api/v1/jobs/missing/restart",
+            String::new(),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn restart_known_job_returns_result() {
+        let state = test_state(FakeEngine::with_running_job());
+        let cookie = login_cookie(&state).await;
+        let (status, body) = post_json_body(
+            &state,
+            "/api/v1/jobs/job-1/restart",
+            String::new(),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("restarted"), "body: {}", body);
     }
 
     #[tokio::test]
