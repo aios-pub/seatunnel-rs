@@ -325,6 +325,18 @@ pub struct RunningJob {
     pub raw_config: String,
 }
 
+/// A cancelled job's task that is still non-terminal on the master and
+/// will never report a terminal state by itself — the master
+/// synthesizes the missing CANCELLED report for it (lost-report
+/// heartbeat reconciliation, or the cancel deadline backstop).
+#[derive(Debug, Clone)]
+pub struct StuckCancelledTask {
+    pub job_id: String,
+    pub task_id: String,
+    pub worker_id: String,
+    pub processed_records: u64,
+}
+
 /// Job coordinator managing the lifecycle of all submitted jobs.
 pub struct JobCoordinator {
     jobs: RwLock<HashMap<String, RunningJob>>,
@@ -871,6 +883,79 @@ impl JobCoordinator {
             })
             .map(|j| j.job_id.clone())
             .collect()
+    }
+
+    /// Tasks of cancelled jobs that a live worker no longer runs.
+    ///
+    /// A heartbeat carries the task ids the worker currently executes,
+    /// so a `Running` task of a cancelled job that is MISSING from its
+    /// owner's heartbeat had its terminal report lost (worker restart,
+    /// dropped RPC) — the worker already stopped the task and nobody
+    /// will ever report for it. The master synthesizes the missing
+    /// CANCELLED report so [`Self::cancelled_job_ids`] stops
+    /// broadcasting the job. Only `Running` is reconciled: absence is
+    /// meaningful solely for a task the worker once confirmed running;
+    /// a `Deploying` task may simply not have started yet (dispatch
+    /// race) — the cancel deadline covers it.
+    pub fn reconcile_lost_cancelled_tasks(
+        &self,
+        worker_id: &str,
+        running_task_ids: &[String],
+    ) -> Vec<StuckCancelledTask> {
+        let jobs = self.jobs.read();
+        let mut stuck = Vec::new();
+        for job in jobs.values() {
+            if job.state != JobState::Cancelled {
+                continue;
+            }
+            for info in job.tasks.values() {
+                if info.state == JobState::Running
+                    && info.worker_id == worker_id
+                    && !running_task_ids.contains(&info.task_id)
+                {
+                    stuck.push(StuckCancelledTask {
+                        job_id: job.job_id.clone(),
+                        task_id: info.task_id.clone(),
+                        worker_id: info.worker_id.clone(),
+                        processed_records: info.processed_records,
+                    });
+                }
+            }
+        }
+        stuck
+    }
+
+    /// Non-terminal tasks of cancelled jobs whose cancel deadline passed.
+    ///
+    /// A task can ignore cancellation (hung source/sink) or sit in
+    /// `Deploying` forever after a lost dispatch; the job then stays in
+    /// the cancel broadcast indefinitely. Past the deadline the
+    /// remaining tasks are forced terminal — the truthful state for a
+    /// job that is already cancelled (its tasks can never be dispatched
+    /// or reassigned again).
+    pub fn overdue_cancelled_tasks(&self, now_ms: i64, timeout_ms: u64) -> Vec<StuckCancelledTask> {
+        let jobs = self.jobs.read();
+        let mut stuck = Vec::new();
+        for job in jobs.values() {
+            if job.state != JobState::Cancelled {
+                continue;
+            }
+            let Some(end) = job.end_time else { continue };
+            if now_ms.saturating_sub(end) <= timeout_ms as i64 {
+                continue;
+            }
+            for info in job.tasks.values() {
+                if matches!(info.state, JobState::Running | JobState::Deploying) {
+                    stuck.push(StuckCancelledTask {
+                        job_id: job.job_id.clone(),
+                        task_id: info.task_id.clone(),
+                        worker_id: info.worker_id.clone(),
+                        processed_records: info.processed_records,
+                    });
+                }
+            }
+        }
+        stuck
     }
 
     /// Pending (never-dispatched) tasks assigned to `worker_id`.
@@ -2798,6 +2883,99 @@ mod tests {
         assert!(
             coordinator.cancelled_job_ids().is_empty(),
             "fully-acknowledged cancel must stop being broadcast"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_lost_cancelled_tasks_terminalizes_missing_running() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        // Two tasks RUNNING on worker-0 when the job is cancelled.
+        let (job_id, tasks) = coordinator
+            .compile_and_install("jr", "r", &config, Some(2), &workers(2))
+            .unwrap();
+        let t0 = tasks[0].task_id.clone();
+        let t1 = tasks[1].task_id.clone();
+        coordinator.mark_tasks_dispatched(&[t0.clone(), t1.clone()], "worker-0");
+        coordinator.report_task_status(&job_id, &t0, "RUNNING", 1, None);
+        coordinator.report_task_status(&job_id, &t1, "RUNNING", 2, None);
+        assert!(coordinator.cancel_job(&job_id));
+        assert_eq!(coordinator.cancelled_job_ids(), vec![job_id.clone()]);
+
+        // worker-0's next heartbeat lists only t0: t1's terminal report
+        // was lost. Reconciliation surfaces ONLY the missing task.
+        let stuck = coordinator.reconcile_lost_cancelled_tasks("worker-0", &[t0.clone()]);
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].task_id, t1);
+        assert_eq!(stuck[0].worker_id, "worker-0");
+
+        // The master synthesizes the missing report: the task goes
+        // terminal while the job stays Cancelled and the broadcast keeps
+        // covering t0 until IT reports too.
+        coordinator.report_task_status(&job_id, &t1, "CANCELLED", 2, None);
+        assert_eq!(
+            coordinator.get_job(&job_id).unwrap().tasks[&t1].state,
+            JobState::Cancelled
+        );
+        assert_eq!(coordinator.cancelled_job_ids(), vec![job_id.clone()]);
+
+        // Another worker's heartbeat reconciles nothing: the tasks
+        // belong to worker-0.
+        assert!(
+            coordinator
+                .reconcile_lost_cancelled_tasks("worker-9", &[t0.clone()])
+                .is_empty()
+        );
+
+        // t0 also disappears (and is reconciled): the broadcast stops.
+        let stuck = coordinator.reconcile_lost_cancelled_tasks("worker-0", &[]);
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].task_id, t0);
+        coordinator.report_task_status(&job_id, &t0, "CANCELLED", 1, None);
+        assert!(
+            coordinator.cancelled_job_ids().is_empty(),
+            "reconciled job stops being broadcast"
+        );
+    }
+
+    #[test]
+    fn test_overdue_cancelled_tasks_forces_stuck_tasks() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (job_id, tasks) = coordinator
+            .compile_and_install("jo", "o", &config, Some(2), &workers(2))
+            .unwrap();
+        let t0 = tasks[0].task_id.clone();
+        let t1 = tasks[1].task_id.clone();
+        coordinator.mark_tasks_dispatched(&[t0.clone(), t1.clone()], "worker-0");
+        // t0 confirmed RUNNING (then hangs on cancellation); t1 never got
+        // past Deploying (lost dispatch).
+        coordinator.report_task_status(&job_id, &t0, "RUNNING", 1, None);
+        assert!(coordinator.cancel_job(&job_id));
+        let end = coordinator.get_job(&job_id).unwrap().end_time.unwrap();
+
+        // Before the deadline nothing is overdue.
+        assert!(coordinator.overdue_cancelled_tasks(end, 60_000).is_empty());
+
+        // Past the deadline both the hung Running task and the stuck
+        // Deploying task are surfaced for a synthesized report.
+        let stuck = coordinator.overdue_cancelled_tasks(end + 61_000, 60_000);
+        let mut ids: Vec<String> = stuck.iter().map(|s| s.task_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![t0.clone(), t1.clone()]);
+
+        // Applying the synthesized reports stops the broadcast.
+        coordinator.report_task_status(&job_id, &t0, "CANCELLED", 1, None);
+        coordinator.report_task_status(&job_id, &t1, "CANCELLED", 0, None);
+        assert!(
+            coordinator.cancelled_job_ids().is_empty(),
+            "deadline-forced job stops being broadcast"
         );
     }
 

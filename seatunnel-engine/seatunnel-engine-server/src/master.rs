@@ -149,6 +149,10 @@ pub struct MasterHandler {
     /// Max tasks handed to one worker per heartbeat (rate fuse for the
     /// admission-signal blind window; 0 = unlimited). NOT a slot count.
     dispatch_batch_limit: u32,
+    /// Cancel deadline: a cancelled job's tasks still non-terminal after
+    /// this long are forced CANCELLED (stops the endless cancel
+    /// re-broadcast when a task hangs or its terminal report is lost).
+    cancel_force_timeout_ms: u64,
 }
 
 impl MasterHandler {
@@ -170,6 +174,7 @@ impl MasterHandler {
             heartbeat_interval_ms: heartbeat_interval_ms.clamp(250, 60_000),
             worker_soft_timeout_ms: worker_soft_timeout_ms.max(1_000),
             dispatch_batch_limit: 16,
+            cancel_force_timeout_ms: 300_000,
         }
     }
 
@@ -177,6 +182,17 @@ impl MasterHandler {
     pub fn with_dispatch_batch_limit(mut self, limit: u32) -> Self {
         self.dispatch_batch_limit = limit;
         self
+    }
+
+    /// Override the cancel deadline (see [`Self::cancel_force_timeout_ms`]).
+    pub fn with_cancel_force_timeout(mut self, ms: u64) -> Self {
+        self.cancel_force_timeout_ms = ms.max(30_000);
+        self
+    }
+
+    /// The configured cancel deadline.
+    pub fn cancel_force_timeout_ms(&self) -> u64 {
+        self.cancel_force_timeout_ms
     }
 
     /// Wake every parked long-poll heartbeat (new work may exist).
@@ -370,6 +386,34 @@ impl MasterHandler {
                 task.last_checkpoint_size_bytes.max(0) as u64,
                 task.sink_metrics.as_ref().map(|m| m.into()),
             );
+        }
+
+        // Cancel reconciliation: the heartbeat task list is the set the
+        // worker actually runs, so a cancelled job's `Running` task that
+        // is absent from its owner's heartbeat had its terminal report
+        // lost — synthesize the CANCELLED report so the cancel broadcast
+        // stops instead of riding every heartbeat forever.
+        let reported: Vec<String> = hb.tasks.iter().map(|t| t.task_id.clone()).collect();
+        for stuck in self
+            .coordinator
+            .reconcile_lost_cancelled_tasks(&worker_id, &reported)
+        {
+            info!(
+                "Cancel reconcile: task {} of cancelled job {} no longer on worker {} — \
+                 synthesizing CANCELLED report",
+                stuck.task_id, stuck.job_id, stuck.worker_id
+            );
+            let cmd = Command::TaskStatus {
+                job_id: stuck.job_id,
+                task_id: stuck.task_id,
+                worker_id: stuck.worker_id,
+                state: "CANCELLED".to_string(),
+                records: stuck.processed_records,
+                error: None,
+            };
+            if let Err(e) = self.writes.propose(cmd).await {
+                warn!("cancel reconcile: TaskStatus proposal failed: {}", e);
+            }
         }
 
         // Refresh liveness + admission signals; a worker returning from a

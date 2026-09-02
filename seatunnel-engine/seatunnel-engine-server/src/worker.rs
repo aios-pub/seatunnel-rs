@@ -23,9 +23,9 @@
 //! transitions back to the master and persists checkpoint state locally so a
 //! restarted worker resumes from the last binlog position / offset.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -73,6 +73,11 @@ type SharedCheckpointGates = Arc<Mutex<HashMap<String, CheckpointGate>>>;
 pub struct WorkerNode {
     /// Auto-cleanup settings (0/None disables the cleaner).
     clean_config: Option<CleanConfig>,
+    /// Job ids whose cancelled-state cleanup is already scheduled. The
+    /// master re-broadcasts a job in every heartbeat response until it
+    /// sees all tasks terminal, so without this guard each heartbeat
+    /// would arm another delayed delete for the same job.
+    cancel_cleanups: StdMutex<HashSet<String>>,
     /// Checkpoint storage backend: localfile | master | s3.
     storage_type: String,
     /// S3 store when storage_type = s3.
@@ -145,6 +150,7 @@ impl WorkerNode {
             master_client: Arc::new(Mutex::new(None)),
             state_store,
             running_tasks: Mutex::new(HashMap::new()),
+            cancel_cleanups: StdMutex::new(HashSet::new()),
             clean_config,
             storage_type: "localfile".to_string(),
             s3_store: None,
@@ -496,14 +502,20 @@ impl WorkerNode {
             return;
         }
         // Auto-clean: drop the cancelled jobs' local state after the
-        // configured grace window.
+        // configured grace window. Scheduled once per job — the master
+        // keeps re-sending the cancel list until every task reports
+        // terminal, so re-arming on each heartbeat would pile up
+        // duplicate timers and duplicate "removed" logs.
         if let Some(clean) = &self.clean_config {
+            let mut scheduled = self.cancel_cleanups.lock().unwrap();
             for job_id in job_ids {
-                schedule_cancel_cleanup(
-                    Arc::clone(&self.state_store),
-                    job_id.clone(),
-                    clean.grace_secs,
-                );
+                if scheduled.insert(job_id.clone()) {
+                    schedule_cancel_cleanup(
+                        Arc::clone(&self.state_store),
+                        job_id.clone(),
+                        clean.grace_secs,
+                    );
+                }
             }
         }
         let mut tasks = self.running_tasks.lock().await;
@@ -622,8 +634,11 @@ async fn fetch_checkpoint_from_master(
 pub fn schedule_cancel_cleanup(state_store: Arc<LocalStateStore>, job_id: String, grace_secs: u64) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(grace_secs.max(1))).await;
-        state_store.drop_job(&job_id);
-        tracing::info!("state cleaner: removed cancelled job state '{}'", job_id);
+        if state_store.drop_job(&job_id) {
+            tracing::info!("state cleaner: removed cancelled job state '{}'", job_id);
+        } else {
+            tracing::debug!("state cleaner: no state left for job '{}'", job_id);
+        }
     });
 }
 
@@ -1177,5 +1192,37 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         worker.cancel_jobs(&["j-c".to_string()]).await;
         assert!(worker.running_task_count().await <= 1);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_cleanup_scheduled_once_per_job() {
+        // A generous grace keeps the delayed delete from firing during
+        // the test; only the scheduling dedup is under test here.
+        let clean = CleanConfig {
+            grace_secs: 3600,
+            interval_secs: 60,
+            ttl_secs: 3600,
+        };
+        let worker = Arc::new(WorkerNode::new_with_clean(
+            "w1",
+            "127.0.0.1:5001",
+            tmp_store("dedup"),
+            Some(clean),
+        ));
+
+        // The master re-broadcasts the cancel on every heartbeat while
+        // the job still has non-terminal tasks; repeated broadcasts must
+        // not arm more than one delayed cleanup per job.
+        worker.cancel_jobs(&["j-a".into(), "j-b".into()]).await;
+        worker.cancel_jobs(&["j-a".to_string()]).await;
+        worker
+            .cancel_jobs(&["j-a".into(), "j-b".into(), "j-c".into()])
+            .await;
+
+        let scheduled = worker.cancel_cleanups.lock().unwrap();
+        assert_eq!(scheduled.len(), 3, "one entry per distinct job");
+        for id in ["j-a", "j-b", "j-c"] {
+            assert!(scheduled.contains(id));
+        }
     }
 }

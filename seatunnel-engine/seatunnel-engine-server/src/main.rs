@@ -459,7 +459,8 @@ async fn start_master(
         config.worker_soft_timeout_ms,
         writes.clone(),
     )
-    .with_dispatch_batch_limit(config.dispatch_batch_limit);
+    .with_dispatch_batch_limit(config.dispatch_batch_limit)
+    .with_cancel_force_timeout(config.cancel_force_timeout_ms);
     let client_handler = ClientHandler::new(
         coordinator.clone(),
         registry.clone(),
@@ -490,6 +491,7 @@ async fn start_master(
             .max(config.worker_soft_timeout_ms)
             .max(1000);
         let cp_timeout_ms = config.checkpoint_timeout_ms.max(1000);
+        let cancel_force_ms = config.cancel_force_timeout_ms;
         let cancel = shutdown.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(2000));
@@ -590,6 +592,41 @@ async fn start_master(
                             }
                         } else {
                             missing_since.clear();
+                        }
+
+                        // Cancel deadline (leader only): a cancelled job
+                        // whose tasks are still non-terminal past the
+                        // deadline has a hung task or a lost terminal
+                        // report — force them CANCELLED so the cancel
+                        // broadcast stops riding every heartbeat.
+                        if writes.is_leader() {
+                            for stuck in
+                                coordinator.overdue_cancelled_tasks(now, cancel_force_ms)
+                            {
+                                tracing::info!(
+                                    "Cancel deadline ({}ms) passed for job {} — forcing \
+                                     task {} CANCELLED",
+                                    cancel_force_ms,
+                                    stuck.job_id,
+                                    stuck.task_id
+                                );
+                                let cmd =
+                                    seatunnel_engine_server::job_coordinator::Command::TaskStatus {
+                                        job_id: stuck.job_id,
+                                        task_id: stuck.task_id,
+                                        worker_id: stuck.worker_id,
+                                        state: "CANCELLED".to_string(),
+                                        records: stuck.processed_records,
+                                        error: None,
+                                    };
+                                if let Err(e) = writes.propose(cmd).await {
+                                    tracing::warn!(
+                                        "cancel deadline: TaskStatus proposal failed: {}",
+                                        e
+                                    );
+                                }
+                                wake.notify_waiters();
+                            }
                         }
                     }
                 }

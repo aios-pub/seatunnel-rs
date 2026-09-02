@@ -151,6 +151,12 @@ pub struct EngineSection {
     /// aborted (Java `checkpoint.timeout` analogue).
     #[serde(default)]
     pub checkpoint_timeout_ms: Option<u64>,
+    /// Cancel deadline (ms): a cancelled job's tasks still non-terminal
+    /// on the master after this long are forced CANCELLED, so the cancel
+    /// broadcast cannot ride every heartbeat forever (hung task, lost
+    /// terminal report).
+    #[serde(default)]
+    pub cancel_force_timeout_ms: Option<u64>,
     /// Master-to-master state replication period (HA standby sync).
     #[serde(default)]
     pub replication_interval_ms: Option<u64>,
@@ -284,6 +290,10 @@ pub struct EngineServerConfig {
     pub dispatch_batch_limit: u32,
     /// Coordinated-checkpoint abort timeout (ms).
     pub checkpoint_timeout_ms: u64,
+    /// Cancel deadline (ms): a cancelled job's tasks still non-terminal
+    /// on the master after this long are forced CANCELLED (stops the
+    /// endless cancel re-broadcast).
+    pub cancel_force_timeout_ms: u64,
     /// Master state replication period (ms).
     pub replication_interval_ms: u64,
     /// This worker's advertised address.
@@ -387,6 +397,7 @@ impl Default for EngineServerConfig {
             overload_cooldown_secs: 10,
             dispatch_batch_limit: 16,
             checkpoint_timeout_ms: 30_000,
+            cancel_force_timeout_ms: 300_000,
             replication_interval_ms: 5_000,
             worker_address: "127.0.0.1:5001".to_string(),
             storage_type: "localfile".to_string(),
@@ -469,6 +480,11 @@ impl EngineServerConfig {
         }
         if let Some(ms) = engine.checkpoint_timeout_ms {
             self.checkpoint_timeout_ms = ms.max(1_000);
+        }
+        if let Some(ms) = engine.cancel_force_timeout_ms {
+            // Kept well above the heartbeat cadence so a healthy cancel
+            // (which reports terminal within seconds) is never forced.
+            self.cancel_force_timeout_ms = ms.max(30_000);
         }
         if let Some(interval) = engine.checkpoint.interval {
             self.checkpoint_interval = interval.max(1);
@@ -607,6 +623,32 @@ mod tests {
         assert_eq!(config.memory_watermark_percent, 75);
         assert_eq!(config.overload_cooldown_secs, 10);
         assert_eq!(config.dispatch_batch_limit, 16);
+        assert_eq!(config.cancel_force_timeout_ms, 300_000);
+    }
+
+    #[test]
+    fn cancel_force_timeout_is_clamped() {
+        let yaml = "
+seatunnel:
+  engine:
+    cancel-force-timeout-ms: 5000
+";
+        let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let mut config = EngineServerConfig::default();
+        config.apply_file(&file);
+        // Lifted to the floor: a healthy cancel reports terminal within
+        // seconds and must never be forced.
+        assert_eq!(config.cancel_force_timeout_ms, 30_000);
+
+        let yaml = "
+seatunnel:
+  engine:
+    cancel-force-timeout-ms: 120000
+";
+        let file: ServerConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let mut config = EngineServerConfig::default();
+        config.apply_file(&file);
+        assert_eq!(config.cancel_force_timeout_ms, 120_000);
     }
 
     #[test]

@@ -121,9 +121,19 @@ impl LocalStateStore {
         }
     }
 
-    /// Remove all stored state for a job.
-    pub fn drop_job(&self, job_id: &str) {
-        let _ = fs::remove_dir_all(self.root.join(sanitize(job_id)));
+    /// Remove all stored state for a job. Returns `true` when state was
+    /// actually present (and deleted); `false` when there was nothing
+    /// to remove (already cleaned or never written).
+    pub fn drop_job(&self, job_id: &str) -> bool {
+        let dir = self.root.join(sanitize(job_id));
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!("drop_job '{}': {}", job_id, e);
+                false
+            }
+        }
     }
 
     /// Store root directory.
@@ -395,7 +405,8 @@ mod tests {
         let store = tmp_store("drop");
         store.save_checkpoint("j", "t", 1, b"x").unwrap();
         assert!(store.load_latest_checkpoint("j", "t").unwrap().is_some());
-        store.drop_job("j");
+        assert!(store.drop_job("j"), "existing state reports removed");
         assert!(store.load_latest_checkpoint("j", "t").unwrap().is_none());
+        assert!(!store.drop_job("j"), "nothing left to remove");
     }
 }
