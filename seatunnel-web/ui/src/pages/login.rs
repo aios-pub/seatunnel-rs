@@ -5,6 +5,7 @@
 
 use crate::api;
 use crate::app::AuthState;
+use crate::i18n::t;
 use crate::ui::ErrorBanner;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -45,9 +46,9 @@ pub fn Login() -> impl IntoView {
         <div class="login-wrap">
             <form class="login-card" on:submit=on_submit>
                 <div class="brand">"⬡ SeaTunnel"</div>
-                <div class="hint">"Sign in to the management console"</div>
+                <div class="hint">{t("login.hint")}</div>
                 <div class="field">
-                    <label>"Username"</label>
+                    <label>{t("login.username")}</label>
                     <input
                         type="text"
                         autocomplete="username"
@@ -56,7 +57,7 @@ pub fn Login() -> impl IntoView {
                     />
                 </div>
                 <div class="field">
-                    <label>"Password"</label>
+                    <label>{t("login.password")}</label>
                     <input
                         type="password"
                         autocomplete="current-password"
@@ -66,7 +67,7 @@ pub fn Login() -> impl IntoView {
                 </div>
                 <ErrorBanner message=Signal::derive(move || error.get()) />
                 <button class="primary" type="submit" disabled=move || busy.get()>
-                    {move || if busy.get() { "Signing in…".to_string() } else { "Sign in".to_string() }}
+                    {move || if busy.get() { t("login.signing_in") } else { t("login.sign_in") }}
                 </button>
             </form>
         </div>

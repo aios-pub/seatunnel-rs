@@ -1,12 +1,13 @@
 // Licensed to the Apache Software Foundation (ASF) under one or more
 // contributor license agreements.
 
-//! Job list with submit dialog and cancel action.
+//! Job list with submit dialog and stop action.
 
 use crate::api;
-use crate::app::{poll_interval, RefreshControl};
+use crate::app::{mark_refreshed, use_polling};
 use crate::fmt::{fmt_duration, fmt_time};
-use crate::ui::{ErrorBanner, Modal, StateTag, SuccessBanner};
+use crate::i18n::{lang, t, tf};
+use crate::ui::{push_toast, ConfirmDialog, ErrorBanner, Modal, StateTag, ToastKind};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_navigate;
@@ -32,21 +33,18 @@ sink:
 pub fn Jobs() -> impl IntoView {
     let (jobs, set_jobs) = RwSignal::new_local(Vec::<api::JobSummary>::new()).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
-    let refresh = expect_context::<RefreshControl>();
 
-    spawn_local(async move {
-        loop {
-            if refresh.0.get_untracked() {
-                match api::jobs().await {
-                    Ok(value) => {
-                        set_jobs.set(value);
-                        set_error.set(None);
-                    }
-                    Err(err) => set_error.set(Some(err)),
+    use_polling(move || {
+        spawn_local(async move {
+            match api::jobs().await {
+                Ok(value) => {
+                    set_jobs.set(value);
+                    set_error.set(None);
+                    mark_refreshed();
                 }
+                Err(err) => set_error.set(Some(err)),
             }
-            gloo_timers::future::TimeoutFuture::new(poll_interval()).await;
-        }
+        })
     });
 
     let show_submit = RwSignal::new(false);
@@ -55,19 +53,21 @@ pub fn Jobs() -> impl IntoView {
     view! {
         <ErrorBanner message=Signal::derive(move || error.get()) />
         <div class="toolbar">
-            <button class="primary" on:click=move |_| show_submit.set(true)>"Submit job"</button>
-            <span class="muted">{move || jobs.get().len().to_string()}" jobs"</span>
+            <button class="primary" on:click=move |_| show_submit.set(true)>
+                {move || t("jobs.submit")}
+            </button>
+            <span class="muted">{move || tf("jobs.count", &[&jobs.get().len().to_string()])}</span>
         </div>
         <div class="panel">
             <table>
                 <thead>
                     <tr>
-                        <th>"Job"</th>
-                        <th>"Job ID"</th>
-                        <th>"State"</th>
-                        <th>"Started"</th>
-                        <th>"Duration"</th>
-                        <th>"Actions"</th>
+                        <th>{move || t("jobs.col.job")}</th>
+                        <th>{move || t("jobs.col.job_id")}</th>
+                        <th>{move || t("jobs.col.state")}</th>
+                        <th>{move || t("jobs.col.started")}</th>
+                        <th>{move || t("jobs.col.duration")}</th>
+                        <th>{move || t("jobs.col.actions")}</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -112,32 +112,52 @@ pub fn Jobs() -> impl IntoView {
     }
 }
 
-/// Cancel button with a confirm dialog; refreshes nothing itself (the
-/// polling loop picks up the state change).
+/// Stop button with a confirm dialog (stop = final checkpoint, savepoint
+/// semantics); errors surface as toasts.
 #[component]
 fn CancelJobButton(job_id: String) -> impl IntoView {
     let busy = RwSignal::new(false);
-    let (error, set_error) = RwSignal::new_local(None::<String>).split();
-    let id = job_id.clone();
+    let confirm_open = RwSignal::new(false);
+    let message = Signal::derive({
+        let job_id = job_id.clone();
+        move || tf("jobs.cancel_confirm", &[job_id.as_str()])
+    });
+    let stop = {
+        let job_id = job_id.clone();
+        Callback::new(move |_| {
+            busy.set(true);
+            let job_id = job_id.clone();
+            spawn_local(async move {
+                if let Err(err) = api::cancel_job(&job_id).await {
+                    push_toast(ToastKind::Error, format!("{}: {}", t("jobs.cancel_failed"), err));
+                }
+                busy.set(false);
+            });
+        })
+    };
 
     view! {
         <button
             class="danger"
             disabled=move || busy.get()
-            on:click=move |_| {
-                let id = id.clone();
-                if window().confirm_with_message(&format!("Cancel job {}?", id)).unwrap_or(false) {
-                    busy.set(true);
-                    spawn_local(async move {
-                        if let Err(err) = api::cancel_job(&id).await {
-                            set_error.set(Some(err));
-                        }
-                        busy.set(false);
-                    });
-                }
+            on:click=move |_| confirm_open.set(true)
+        >{move || t("jobs.cancel")}</button>
+        {move || {
+            // Re-created here so the labels follow a language switch; the
+            // open/busy state lives in signals and survives re-creation.
+            let _ = lang().get();
+            let title = tf("jobs.cancel_title", &[job_id.as_str()]);
+            view! {
+                <ConfirmDialog
+                    show=confirm_open
+                    title=title
+                    message=message
+                    confirm_label=t("jobs.cancel")
+                    danger=true
+                    on_confirm=stop.clone()
+                />
             }
-        >"Cancel"</button>
-        {move || error.get().map(|err| view! { <span class="muted">{err}</span> })}
+        }}
     }
 }
 
@@ -150,18 +170,24 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
     let parallelism = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
-    let (success, set_success) = RwSignal::new_local(None::<String>).split();
 
     let on_submit = move |_| {
         if busy.get_untracked() {
             return;
         }
-        let parallelism = parallelism
-            .get_untracked()
-            .trim()
-            .parse::<i32>()
-            .ok()
-            .filter(|value| *value > 0);
+        // Surface an invalid parallelism instead of silently dropping it.
+        let raw_parallelism = parallelism.get_untracked().trim().to_string();
+        let parallelism = if raw_parallelism.is_empty() {
+            None
+        } else {
+            match raw_parallelism.parse::<i32>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => {
+                    set_error.set(Some(t("jobs.parallelism_invalid")));
+                    return;
+                }
+            }
+        };
         let request = api::SubmitJobRequest {
             config_text: config_text.get_untracked(),
             format: format.get_untracked(),
@@ -176,21 +202,22 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
         spawn_local(async move {
             match api::submit_job(request).await {
                 Ok(result) => {
-                    set_success.set(Some(format!("Job {} submitted: {}", result.job_id, result.message)));
+                    push_toast(ToastKind::Success, tf("jobs.submitted", &[&result.job_id]));
                     show.set(false);
                 }
-                Err(err) => set_error.set(Some(err)),
+                Err(err) => {
+                    set_error.set(Some(format!("{}: {}", t("jobs.submit_failed"), err)));
+                }
             }
             busy.set(false);
         });
     };
 
     view! {
-        <Modal show title="Submit job">
-            <SuccessBanner message=Signal::derive(move || success.get()) />
+        <Modal show title=Signal::derive(move || t("jobs.dialog_title"))>
             <ErrorBanner message=Signal::derive(move || error.get()) />
             <div class="field">
-                <label>"Job config"</label>
+                <label>{move || t("jobs.config")}</label>
                 <textarea
                     prop:value=move || config_text.get()
                     on:input=move |event| config_text.set(event_target_value(&event))
@@ -198,7 +225,7 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
             </div>
             <div class="form-row">
                 <div class="field">
-                    <label>"Format"</label>
+                    <label>{move || t("jobs.format")}</label>
                     <select on:change=move |event| format.set(event_target_value(&event))>
                         <option value="yaml" selected=true>"yaml"</option>
                         <option value="toml">"toml"</option>
@@ -206,7 +233,7 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
                     </select>
                 </div>
                 <div class="field">
-                    <label>"Job name (optional)"</label>
+                    <label>{move || t("jobs.name_opt")}</label>
                     <input
                         type="text"
                         prop:value=move || job_name.get()
@@ -214,7 +241,7 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
                     />
                 </div>
                 <div class="field">
-                    <label>"Parallelism (optional)"</label>
+                    <label>{move || t("jobs.parallelism_opt")}</label>
                     <input
                         type="number"
                         min="1"
@@ -224,9 +251,9 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
                 </div>
             </div>
             <div class="modal-footer">
-                <button on:click=move |_| show.set(false)>"Close"</button>
+                <button on:click=move |_| show.set(false)>{move || t("jobs.close")}</button>
                 <button class="primary" disabled=move || busy.get() on:click=on_submit>
-                    {move || if busy.get() { "Submitting…".to_string() } else { "Submit".to_string() }}
+                    {move || if busy.get() { t("jobs.submitting") } else { t("jobs.submit_btn") }}
                 </button>
             </div>
         </Modal>

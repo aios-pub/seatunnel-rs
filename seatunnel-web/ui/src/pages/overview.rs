@@ -4,8 +4,9 @@
 //! Dashboard: job counts, cluster summary and per-state breakdown.
 
 use crate::api;
-use crate::app::{poll_interval, RefreshControl};
+use crate::app::{mark_refreshed, use_polling};
 use crate::fmt::fmt_count;
+use crate::i18n::t;
 use crate::ui::{ErrorBanner, StatCard};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -14,21 +15,18 @@ use leptos::task::spawn_local;
 pub fn Overview() -> impl IntoView {
     let (data, set_data) = RwSignal::new_local(None::<api::Overview>).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
-    let refresh = expect_context::<RefreshControl>();
 
-    spawn_local(async move {
-        loop {
-            if refresh.0.get_untracked() {
-                match api::overview().await {
-                    Ok(value) => {
-                        set_data.set(Some(value));
-                        set_error.set(None);
-                    }
-                    Err(err) => set_error.set(Some(err)),
+    use_polling(move || {
+        spawn_local(async move {
+            match api::overview().await {
+                Ok(value) => {
+                    set_data.set(Some(value));
+                    set_error.set(None);
+                    mark_refreshed();
                 }
+                Err(err) => set_error.set(Some(err)),
             }
-            gloo_timers::future::TimeoutFuture::new(poll_interval()).await;
-        }
+        })
     });
 
     view! {
@@ -39,37 +37,37 @@ pub fn Overview() -> impl IntoView {
                     let cluster = &overview.cluster;
                     view! {
                         <div class="cards">
-                            <StatCard label="Running jobs" value=fmt_count(overview.jobs_running) tone="running" />
-                            <StatCard label="Pending" value=fmt_count(overview.jobs_pending) tone="muted" />
-                            <StatCard label="Completed" value=fmt_count(overview.jobs_completed) tone="completed" />
-                            <StatCard label="Failed" value=fmt_count(overview.jobs_failed) tone="failed" />
-                            <StatCard label="Cancelled" value=fmt_count(overview.jobs_cancelled) tone="muted" />
-                            <StatCard label="Total jobs" value=fmt_count(overview.jobs_total) />
-                            <StatCard label="Workers" value=fmt_count(cluster.available_workers as i64) />
-                            <StatCard label="Running tasks" value=fmt_count(cluster.running_tasks as i64) tone="running" />
+                            <StatCard label=t("ov.running_jobs") value=fmt_count(overview.jobs_running) tone="running" />
+                            <StatCard label=t("ov.pending") value=fmt_count(overview.jobs_pending) tone="muted" />
+                            <StatCard label=t("ov.completed") value=fmt_count(overview.jobs_completed) tone="completed" />
+                            <StatCard label=t("ov.failed") value=fmt_count(overview.jobs_failed) tone="failed" />
+                            <StatCard label=t("ov.cancelled") value=fmt_count(overview.jobs_cancelled) tone="muted" />
+                            <StatCard label=t("ov.total_jobs") value=fmt_count(overview.jobs_total) />
+                            <StatCard label=t("ov.workers") value=fmt_count(cluster.available_workers as i64) />
+                            <StatCard label=t("ov.running_tasks") value=fmt_count(cluster.running_tasks as i64) tone="running" />
                         </div>
                         <div class="panel">
-                            <h2>"Cluster"</h2>
+                            <h2>{t("ov.cluster")}</h2>
                             <div class="kv-grid">
                                 <div class="kv">
-                                    <div class="kv-label">"Leader"</div>
+                                    <div class="kv-label">{t("ov.leader")}</div>
                                     <div class="kv-value mono">{cluster.leader_id.clone()}</div>
                                 </div>
                                 <div class="kv">
-                                    <div class="kv-label">"Workers"</div>
+                                    <div class="kv-label">{t("ov.workers")}</div>
                                     <div class="kv-value">{cluster.available_workers}</div>
                                 </div>
                                 <div class="kv">
-                                    <div class="kv-label">"Tasks total / running"</div>
+                                    <div class="kv-label">{t("ov.tasks_total_running")}</div>
                                     <div class="kv-value">{format!("{} / {}", cluster.total_tasks, cluster.running_tasks)}</div>
                                 </div>
                             </div>
                         </div>
                         <div class="panel">
-                            <h2>"Jobs by state"</h2>
+                            <h2>{t("ov.jobs_by_state")}</h2>
                             <table>
                                 <thead>
-                                    <tr><th>"State"</th><th>"Jobs"</th></tr>
+                                    <tr><th>{t("ov.state")}</th><th>{t("ov.jobs")}</th></tr>
                                 </thead>
                                 <tbody>
                                     {overview
@@ -90,7 +88,13 @@ pub fn Overview() -> impl IntoView {
                     }
                     .into_any()
                 })
-                .unwrap_or_else(|| view! { <div class="loading">"Loading…"</div> }.into_any())
+                .unwrap_or_else(|| {
+                    if error.get().is_some() {
+                        view! { <div class="muted">{t("misc.no_data")}</div> }.into_any()
+                    } else {
+                        view! { <div class="loading">{t("misc.loading")}</div> }.into_any()
+                    }
+                })
         }}
     }
 }

@@ -2,15 +2,18 @@
 // contributor license agreements.
 
 //! Application shell: session gate, sidebar navigation, health indicator
-//! and routes.
+//! and routes. Also hosts the console-wide reactive singletons (refresh
+//! controls, last-update stamp) and the shared polling helper.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::path;
 
+use crate::i18n;
+use crate::i18n::Lang;
 use crate::pages::{cluster::Cluster, job_detail::JobDetail, jobs::Jobs, login::Login, overview::Overview};
-use crate::ui::StateTag;
+use crate::ui::{push_toast, StateTag, ToastHost, ToastKind};
 
 /// Session state shared with every page.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,9 +32,96 @@ pub struct AuthState(pub RwSignal<AuthStatus>);
 
 const POLL_INTERVAL_MS: u32 = 5_000;
 
-/// Polling interval used by every page.
-pub fn poll_interval() -> u32 {
-    POLL_INTERVAL_MS
+// --- Console-wide singletons -------------------------------------------------
+// Root-owned signals created once per page load and reachable from anywhere,
+// so the login page and the shell share state without context plumbing.
+
+thread_local! {
+    static AUTO_REFRESH: std::cell::OnceCell<RwSignal<bool>> = const { std::cell::OnceCell::new() };
+    static REFRESH_BUMP: std::cell::OnceCell<RwSignal<u64>> = const { std::cell::OnceCell::new() };
+    static LAST_UPDATE: std::cell::OnceCell<RwSignal<Option<f64>>> = const { std::cell::OnceCell::new() };
+}
+
+/// Create every console-wide root signal BEFORE the app mounts. Signals
+/// created lazily during a render end up owned by that render's reactive
+/// scope and are disposed with it (the Show fallback scope is torn down on
+/// the first transition), so they must be rooted here instead.
+pub fn init_globals() {
+    let _ = auto_refresh();
+    let _ = refresh_bump();
+    let _ = last_update();
+    let _ = i18n::lang();
+    crate::ui::init_toasts();
+}
+
+/// Global auto-refresh toggle (bound to the topbar checkbox).
+pub fn auto_refresh() -> RwSignal<bool> {
+    AUTO_REFRESH.with(|cell| *cell.get_or_init(|| RwSignal::new(true)))
+}
+
+/// Monotonic counter bumped by "Refresh now".
+pub fn refresh_bump() -> RwSignal<u64> {
+    REFRESH_BUMP.with(|cell| *cell.get_or_init(|| RwSignal::new(0)))
+}
+
+/// Epoch-ms of the last successful data refresh, for the topbar stamp.
+pub fn last_update() -> RwSignal<Option<f64>> {
+    LAST_UPDATE.with(|cell| *cell.get_or_init(|| RwSignal::new(None)))
+}
+
+/// Request an immediate refresh of every mounted page.
+pub fn request_refresh() {
+    refresh_bump().update(|value| *value += 1);
+}
+
+/// Record a successful data refresh (called by page fetch closures).
+pub fn mark_refreshed() {
+    last_update().set(Some(js_sys::Date::now()));
+}
+
+/// Poll-loop helper with the lifecycle the pages used to hand-roll: fetches
+/// once on mount and again whenever auto-refresh is on or the user pressed
+/// "Refresh now"; pauses while the tab is hidden; stops when the component
+/// unmounts (the old ad-hoc loops leaked one loop per page visit).
+pub fn use_polling(fetch: impl Fn() + Clone + 'static) {
+    let auto = auto_refresh();
+    let bump = refresh_bump();
+
+    // Immediate fetch on mount plus on every "Refresh now".
+    Effect::new({
+        let fetch = fetch.clone();
+        move || {
+            let _tick = bump.get();
+            fetch();
+        }
+    });
+
+    let (dead, set_dead) = RwSignal::new_local(false).split();
+    spawn_local(async move {
+        let mut seen_bump = bump.get_untracked();
+        loop {
+            gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
+            if dead.get_untracked() {
+                return;
+            }
+            let hidden = window()
+                .document()
+                .map(|doc| doc.visibility_state() == web_sys::VisibilityState::Hidden)
+                .unwrap_or(false);
+            if hidden {
+                continue;
+            }
+            let tick = bump.get_untracked();
+            let manual = tick != seen_bump;
+            if manual {
+                seen_bump = tick;
+            }
+            if manual || auto.get_untracked() {
+                fetch();
+            }
+        }
+    });
+    on_cleanup(move || set_dead.set(true));
 }
 
 #[component]
@@ -51,7 +141,7 @@ pub fn App() -> impl IntoView {
         <Router>
             <Show
                 when=move || auth.get() != AuthStatus::Unknown
-                fallback=|| view! { <div class="loading">"Loading…"</div> }
+                fallback=|| view! { <div class="loading">{i18n::t("misc.loading")}</div> }
             >
                 <Show
                     when=move || matches!(auth.get(), AuthStatus::User(_))
@@ -64,21 +154,28 @@ pub fn App() -> impl IntoView {
     }
 }
 
-/// Authenticated application chrome: sidebar, topbar (identity + logout)
-/// and the routed pages.
+/// Authenticated application chrome: sidebar, topbar (refresh controls,
+/// health, language, identity) and the routed pages.
 #[component]
 fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
-    let auto_refresh = RwSignal::new(true);
-    provide_context(RefreshControl(auto_refresh));
-
     let (health, set_health) = RwSignal::new_local(None::<crate::api::Health>).split();
-    spawn_local(async move {
-        loop {
-            if auto_refresh.get_untracked() {
-                set_health.set(crate::api::health().await.ok());
+    // Toast "master unreachable" once per degradation, not once per poll.
+    let (degraded, set_degraded) = RwSignal::new_local(false).split();
+
+    use_polling(move || {
+        spawn_local(async move {
+            match crate::api::health().await {
+                Ok(value) => {
+                    let is_degraded = value.status != "ok";
+                    if is_degraded && !degraded.get_untracked() {
+                        push_toast(ToastKind::Error, i18n::t("topbar.health_degraded"));
+                    }
+                    set_degraded.set(is_degraded);
+                    set_health.set(Some(value));
+                }
+                Err(_) => set_health.set(None),
             }
-            gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
-        }
+        })
     });
 
     let on_logout = move |_| {
@@ -89,6 +186,8 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
         });
     };
 
+    let on_toggle_lang = move |_| i18n::toggle_lang();
+
     view! {
         // The Router renders an anonymous wrapper div; the shell flex layout
         // keeps sidebar and content side by side inside it.
@@ -96,25 +195,33 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
             <div class="sidebar">
                 <div class="brand">"⬡ SeaTunnel"</div>
                 <nav>
-                    <A href="/">"Overview"</A>
-                    <A href="/jobs">"Jobs"</A>
-                    <A href="/cluster">"Cluster"</A>
+                    <A href="/">{move || i18n::t("nav.overview")}</A>
+                    <A href="/jobs">{move || i18n::t("nav.jobs")}</A>
+                    <A href="/cluster">{move || i18n::t("nav.cluster")}</A>
                 </nav>
             </div>
             <div class="content">
                 <div class="topbar">
-                    <h1>"Management Console"</h1>
+                    <h1>{move || i18n::t("topbar.title")}</h1>
                     <div class="controls">
+                        <button title=move || i18n::t("topbar.refresh_now") on:click=move |_| request_refresh()>
+                            "⟳"
+                        </button>
                         <label>
                             <input
                                 type="checkbox"
-                                prop:checked=move || auto_refresh.get()
+                                prop:checked=move || auto_refresh().get()
                                 on:change=move |event| {
-                                    auto_refresh.set(event_target_checked(&event));
+                                    auto_refresh().set(event_target_checked(&event));
                                 }
                             />
-                            " auto-refresh (5s)"
+                            {move || i18n::t("topbar.auto_refresh")}
                         </label>
+                        {move || {
+                            last_update()
+                                .get()
+                                .map(|ms| i18n::tf("topbar.updated", &[&crate::fmt::fmt_time(ms as i64)]))
+                        }}
                         {move || {
                             health
                                 .get()
@@ -128,14 +235,18 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
                                     .into_any()
                                 })
                                 .unwrap_or_else(|| {
-                                    view! { <span class="muted">"connecting…"</span> }.into_any()
+                                    view! { <span class="muted">{i18n::t("topbar.connecting")}</span> }
+                                        .into_any()
                                 })
                         }}
+                        <button on:click=on_toggle_lang>
+                            {move || i18n::lang().get().toggle_label()}
+                        </button>
                         {move || {
                             match auth.get() {
                                 AuthStatus::User(user) => view! {
                                     <span class="muted">"👤 "{user}</span>
-                                    <button on:click=on_logout>"Logout"</button>
+                                    <button on:click=on_logout>{move || i18n::t("topbar.logout")}</button>
                                 }
                                     .into_any(),
                                 _ => ().into_any(),
@@ -144,18 +255,31 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
                     </div>
                 </div>
                 <Routes fallback=|| {
-                    view! { <leptos_router::components::Redirect path="/" /> }.into_view()
+                    view! { <NotFound /> }.into_view()
                 }>
                     <Route path=path!("/") view=Overview />
                     <Route path=path!("/jobs") view=Jobs />
                     <Route path=path!("/jobs/:id") view=JobDetail />
                     <Route path=path!("/cluster") view=Cluster />
+                    <Route path=path!("/*any") view=NotFound />
                 </Routes>
             </div>
+        </div>
+        <ToastHost />
+    }
+}
+
+/// Shown for any URL no route matches (replaces the old silent redirect).
+#[component]
+fn NotFound() -> impl IntoView {
+    view! {
+        <div class="panel">
+            <h2>{move || i18n::t("nf.title")}</h2>
+            <a href="/">{move || i18n::t("nf.back")}</a>
         </div>
     }
 }
 
-/// Context flag shared with all pages: auto-refresh on/off.
-#[derive(Clone, Copy)]
-pub struct RefreshControl(pub RwSignal<bool>);
+/// Language currently selected — re-exported so pages can match on it.
+#[allow(unused)]
+fn _lang_type_use(_: Lang) {}

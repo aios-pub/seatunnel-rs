@@ -215,6 +215,33 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-heig
 .modal-body { overflow: auto; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
 
+/* Compact variant for confirmation dialogs. */
+.modal-confirm { width: min(520px, 92vw); }
+.modal-confirm .modal-body { color: var(--text); line-height: 1.6; }
+
+/* Toast notifications (bottom-right stack, auto-dismissed). */
+.toast-stack {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 200;
+  max-width: 380px;
+}
+.toast {
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #fff;
+  box-shadow: 0 6px 24px rgba(16, 24, 40, 0.25);
+  word-break: break-word;
+}
+.toast-success { background: #15803d; }
+.toast-error   { background: #b91c1c; }
+.toast-info    { background: #1f2937; }
+
 /* Misc */
 .error-banner {
   background: #fee2e2;

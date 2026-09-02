@@ -4,8 +4,9 @@
 //! Cluster view: workers and their heartbeats.
 
 use crate::api;
-use crate::app::{poll_interval, RefreshControl};
+use crate::app::{mark_refreshed, use_polling};
 use crate::fmt::fmt_time;
+use crate::i18n::{t, tf};
 use crate::ui::ErrorBanner;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -14,21 +15,18 @@ use leptos::task::spawn_local;
 pub fn Cluster() -> impl IntoView {
     let (data, set_data) = RwSignal::new_local(None::<api::ClusterInfo>).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
-    let refresh = expect_context::<RefreshControl>();
 
-    spawn_local(async move {
-        loop {
-            if refresh.0.get_untracked() {
-                match api::cluster().await {
-                    Ok(value) => {
-                        set_data.set(Some(value));
-                        set_error.set(None);
-                    }
-                    Err(err) => set_error.set(Some(err)),
+    use_polling(move || {
+        spawn_local(async move {
+            match api::cluster().await {
+                Ok(value) => {
+                    set_data.set(Some(value));
+                    set_error.set(None);
+                    mark_refreshed();
                 }
+                Err(err) => set_error.set(Some(err)),
             }
-            gloo_timers::future::TimeoutFuture::new(poll_interval()).await;
-        }
+        })
     });
 
     view! {
@@ -36,6 +34,11 @@ pub fn Cluster() -> impl IntoView {
         {move || {
             data.get()
                 .map(|cluster| {
+                    let role = if cluster.leader_role.is_empty() {
+                        "-".to_string()
+                    } else {
+                        cluster.leader_role.clone()
+                    };
                     view! {
                         {move || {
                             let overloaded = data
@@ -51,34 +54,31 @@ pub fn Cluster() -> impl IntoView {
                             };
                             view! {
                                 <div class="cards">
-                                    <crate::ui::StatCard label="Workers" value=cluster.available_workers.to_string() />
-                                    <crate::ui::StatCard label="Running tasks" value=cluster.running_tasks.to_string() tone="running" />
-                                    <crate::ui::StatCard label="Total tasks" value=cluster.total_tasks.to_string() tone="muted" />
-                                    <crate::ui::StatCard label="Overloaded workers" value=label tone=tone />
+                                    <crate::ui::StatCard label=t("cl.workers") value=cluster.available_workers.to_string() />
+                                    <crate::ui::StatCard label=t("ov.running_tasks") value=cluster.running_tasks.to_string() tone="running" />
+                                    <crate::ui::StatCard label=t("cl.total_tasks") value=cluster.total_tasks.to_string() tone="muted" />
+                                    <crate::ui::StatCard label=t("cl.overloaded") value=label tone=tone />
                                 </div>
                             }
                         }}
                         <div class="panel">
                             <h2>
-                                "Workers (leader: "
-                                {cluster.leader_id.clone()}
-                                ", term "
-                                {cluster.leader_term.to_string()}
-                                ", role "
-                                {if cluster.leader_role.is_empty() { "-" } else { &cluster.leader_role }}
-                                ")"
+                                {tf(
+                                    "cl.table_title",
+                                    &[&cluster.leader_id.clone(), &cluster.leader_term.to_string(), &role],
+                                )}
                             </h2>
                             <table>
                                 <thead>
                                     <tr>
-                                        <th>"Worker ID"</th>
-                                        <th>"Address"</th>
-                                        <th>"Status"</th>
-                                        <th>"Load"</th>
-                                        <th>"Lag (ms)"</th>
-                                        <th>"Memory"</th>
-                                        <th>"Running tasks"</th>
-                                        <th>"Last heartbeat"</th>
+                                        <th>{t("cl.col.worker_id")}</th>
+                                        <th>{t("cl.col.address")}</th>
+                                        <th>{t("cl.col.status")}</th>
+                                        <th>{t("cl.col.load")}</th>
+                                        <th>{t("cl.col.lag")}</th>
+                                        <th>{t("cl.col.memory")}</th>
+                                        <th>{t("cl.col.tasks")}</th>
+                                        <th>{t("cl.col.heartbeat")}</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -104,9 +104,9 @@ pub fn Cluster() -> impl IntoView {
                                                     <td>
                                         {
                                             if worker.can_accept {
-                                                view! { <span class="badge ok">"accepting"</span> }
+                                                view! { <span class="badge ok">{t("cl.accepting")}</span> }
                                             } else {
-                                                view! { <span class="badge bad">"OVERLOADED"</span> }
+                                                view! { <span class="badge bad">{t("cl.overloaded_bad")}</span> }
                                             }.into_any()
                                         }
                                                     </td>
@@ -128,14 +128,18 @@ pub fn Cluster() -> impl IntoView {
                                         .collect::<Vec<_>>()}
                                 </tbody>
                             </table>
-                            <p class="hint">
-                                "Admission is dynamic (no slot counts): a worker accepts new tasks while its event-loop lag stays under the threshold and its memory under the watermark. Overloaded workers stop receiving tasks and their pending tasks are stolen by healthy peers."
-                            </p>
+                            <p class="hint">{t("cl.hint")}</p>
                         </div>
                     }
                     .into_any()
                 })
-                .unwrap_or_else(|| view! { <div class="loading">"Loading…"</div> }.into_any())
+                .unwrap_or_else(|| {
+                    if error.get().is_some() {
+                        view! { <div class="muted">{t("misc.no_data")}</div> }.into_any()
+                    } else {
+                        view! { <div class="loading">{t("misc.loading")}</div> }.into_any()
+                    }
+                })
         }}
     }
 }

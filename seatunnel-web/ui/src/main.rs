@@ -6,6 +6,7 @@
 mod api;
 mod app;
 mod fmt;
+mod i18n;
 mod pages;
 mod ui;
 
@@ -13,6 +14,8 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 fn main() {
+    // Root the console-wide signals before any reactive scope exists.
+    app::init_globals();
     // Mount into the #app container (not body-append) so the shell layout
     // owns the viewport from the first paint. `forget` keeps the mount
     // alive: dropping the handle would unmount the app immediately.
