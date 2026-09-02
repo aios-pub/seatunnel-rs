@@ -219,6 +219,16 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-heig
 .modal-confirm { width: min(520px, 92vw); }
 .modal-confirm .modal-body { color: var(--text); line-height: 1.6; }
 
+/* Charts (dependency-free SVG time series). */
+.chart { margin: 6px 0 14px; }
+.chart-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.chart svg { width: 100%; height: auto; display: block; }
+.chart-tick { font-size: 10px; fill: var(--muted); }
+.chart-empty { padding: 24px 0; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 2px; }
+.chart-legend-item { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+.chart-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+
 /* Toast notifications (bottom-right stack, auto-dismissed). */
 .toast-stack {
   position: fixed;

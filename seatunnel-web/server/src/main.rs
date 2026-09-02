@@ -37,6 +37,9 @@ struct Args {
     /// Disable authentication entirely (local development only).
     #[arg(long, default_value_t = false)]
     auth_disable: bool,
+    /// Retained chart samples per series (one sample per refresh cycle).
+    #[arg(long, default_value_t = 240)]
+    history_points: usize,
 }
 
 #[tokio::main]
@@ -66,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         engine: Arc::new(EngineClient::new(&args.master)),
         metrics: Arc::new(Metrics::new()),
+        history: Arc::new(seatunnel_web::History::new(args.history_points)),
         master_label: args.master.clone(),
         auth: Arc::new(auth),
         task_samples: Arc::default(),

@@ -15,6 +15,7 @@ mod assets;
 mod auth;
 mod dto;
 mod engine;
+mod history;
 mod metrics;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub use dto::{
     JobSummaryDto, SubmitJobDto, SubmitResultDto, TaskCheckpointDto, TaskStatusDto, WorkerDto,
 };
 pub use engine::{EngineError, EngineOps};
+pub use history::History;
 pub use metrics::{Metrics, spawn_poller};
 
 /// Shared application state for handlers.
@@ -38,6 +40,8 @@ pub struct AppState {
     pub engine: Arc<dyn EngineOps>,
     /// Prometheus registry and metric handles.
     pub metrics: Arc<metrics::Metrics>,
+    /// Time-series ring backing the console's charts.
+    pub history: Arc<history::History>,
     /// Display-only master address list this console is bound to.
     pub master_label: String,
     /// Login credentials and session-signing settings.
@@ -82,7 +86,12 @@ pub fn build_router(state: AppState) -> Router {
                 get(api::jobs::job_checkpoints),
             )
             .route("/api/v1/jobs/{job_id}/logs", get(api::jobs::job_logs))
+            .route(
+                "/api/v1/jobs/{job_id}/history",
+                get(api::jobs::job_history),
+            )
             .route("/api/v1/cluster", get(api::cluster))
+            .route("/api/v1/cluster/history", get(api::cluster_history))
             .route("/metrics", get(api::metrics))
             .fallback(assets::static_handler)
             .with_state(state.clone())
@@ -110,6 +119,7 @@ pub fn spawn_console(
     let state = AppState {
         engine: Arc::new(seatunnel_engine_client::EngineClient::new(&master)),
         metrics: Arc::new(Metrics::new()),
+        history: Arc::new(History::new(history::DEFAULT_CAPACITY)),
         master_label: master.clone(),
         auth: Arc::new(auth),
         task_samples: Arc::default(),
@@ -146,6 +156,7 @@ mod tests {
         AppState {
             engine: Arc::new(engine),
             metrics: Arc::new(metrics::Metrics::new()),
+            history: Arc::new(history::History::new(history::DEFAULT_CAPACITY)),
             master_label: "127.0.0.1:5800".to_string(),
             auth: Arc::new(AuthConfig::new(
                 "admin".to_string(),
@@ -523,11 +534,24 @@ mod tests {
     async fn metrics_exposes_job_gauges() {
         let state = test_state(FakeEngine::with_running_job());
         // Refresh gauges once synchronously.
-        state.metrics.refresh(&*state.engine).await;
+        state.metrics.refresh(&*state.engine, &state.history).await;
         let (status, body) = get_json(&state, "/metrics", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("seatunnel_jobs"));
         assert!(body.contains("seatunnel_workers"));
+    }
+
+    #[tokio::test]
+    async fn history_endpoint_serves_poller_samples() {
+        let state = test_state(FakeEngine::with_running_job());
+        let cookie = login_cookie(&state).await;
+        state.metrics.refresh(&*state.engine, &state.history).await;
+        let (status, body) = get_json(&state, "/api/v1/jobs/job-1/history", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("records_per_sec"), "body: {}", body);
+        let (status, body) = get_json(&state, "/api/v1/cluster/history", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("cpu_permille"), "body: {}", body);
     }
 
     #[tokio::test]

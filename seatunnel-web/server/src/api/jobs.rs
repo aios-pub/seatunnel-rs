@@ -223,6 +223,13 @@ pub async fn job_checkpoints(
     Json(history).into_response()
 }
 
+/// `GET /api/v1/jobs/{job_id}/history` — console-side sampled time series
+/// (throughput / sink latency per task). Web-process-local: empty until the
+/// poller has seen the job.
+pub async fn job_history(State(state): State<AppState>, Path(job_id): Path<String>) -> Response {
+    Json(state.history.job_snapshot(&job_id)).into_response()
+}
+
 fn parse_format(value: Option<&str>) -> Result<seatunnel_config::ConfigFormat, String> {
     match value.map(str::to_ascii_lowercase).as_deref() {
         None | Some("yaml") | Some("yml") => Ok(seatunnel_config::ConfigFormat::YAML),

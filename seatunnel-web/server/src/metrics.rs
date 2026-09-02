@@ -308,8 +308,10 @@ impl Metrics {
         String::from_utf8(buffer).ok()
     }
 
-    /// Pull engine state into the gauges once.
-    pub async fn refresh(&self, engine: &dyn EngineOps) {
+    /// Pull engine state into the gauges once, feeding the chart history
+    /// ring with the same samples.
+    pub async fn refresh(&self, engine: &dyn EngineOps, history: &crate::history::History) {
+        use crate::history::{TaskPoint, WorkerPoint};
         self.refresh_cycles.inc();
         for state in [
             "CREATED",
@@ -331,9 +333,12 @@ impl Metrics {
             );
             let now = std::time::Instant::now();
             let mut live_labels = HashSet::new();
+            let live_jobs: std::collections::HashSet<String> =
+                jobs.iter().map(|j| j.job_id.clone()).collect();
             for job in jobs {
                 self.jobs.with_label_values(&[&job.state]).inc();
                 if let Ok(status) = engine.job_status(&job.job_id).await {
+                    let mut points = Vec::new();
                     let mut samples = self.rate_samples.lock().unwrap();
                     for task in status.tasks {
                         let key = (job.job_id.clone(), task.task_id.clone());
@@ -390,8 +395,24 @@ impl Metrics {
                                 .with_label_values(&labels)
                                 .set(m.latency_max_ms as i64);
                         }
+                        points.push(TaskPoint {
+                            task_id: task.task_id.clone(),
+                            records_per_sec: rate as f64,
+                            latency_ema_ms: task
+                                .sink_metrics
+                                .as_ref()
+                                .map(|m| m.latency_ema_ms)
+                                .unwrap_or(0.0),
+                            latency_max_ms: task
+                                .sink_metrics
+                                .as_ref()
+                                .map(|m| m.latency_max_ms)
+                                .unwrap_or(0),
+                        });
                         live_labels.insert((job.job_id.clone(), task.task_id.clone()));
                     }
+                    // Feed the console's chart ring with this cycle's rates.
+                    history.record_job(&job.job_id, points);
                 }
             }
             // Drop gauges of tasks that disappeared (job finished/evicted).
@@ -402,12 +423,26 @@ impl Metrics {
                     .remove_label_values(&[job, task]);
             }
             *previous = live_labels;
+            // Trim chart series of jobs that left the engine.
+            history.retain_jobs(&live_jobs);
         }
 
         if let Ok(cluster) = engine.cluster_info().await {
             self.workers.set(cluster.available_workers as i64);
             self.running_tasks.set(cluster.running_tasks as i64);
             let mut live: HashSet<String> = HashSet::new();
+            let worker_points: Vec<WorkerPoint> = cluster
+                .workers
+                .iter()
+                .map(|w| WorkerPoint {
+                    worker_id: w.worker_id.clone(),
+                    load_permille: w.load_score_permille,
+                    lag_ms: w.lag_ms,
+                    mem_permille: w.mem_permille,
+                    cpu_permille: w.cpu_permille,
+                })
+                .collect();
+            history.record_cluster(cluster.running_tasks, worker_points);
             for w in &cluster.workers {
                 let id = w.worker_id.clone();
                 self.worker_load_score
@@ -452,7 +487,11 @@ pub fn spawn_poller(state: AppState, interval: Duration) {
             // metrics (a hung gRPC call without a deadline would park this
             // poller forever and /metrics would serve stale gauges). Bound
             // every refresh cycle by the interval; the next tick retries.
-            let _ = tokio::time::timeout(interval, state.metrics.refresh(&*state.engine)).await;
+            let _ = tokio::time::timeout(
+                interval,
+                state.metrics.refresh(&*state.engine, &state.history),
+            )
+            .await;
         }
     });
 }

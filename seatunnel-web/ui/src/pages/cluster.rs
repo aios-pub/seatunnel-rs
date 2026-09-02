@@ -5,6 +5,7 @@
 
 use crate::api;
 use crate::app::{mark_refreshed, use_polling};
+use crate::charts::{LineChart, PALETTE, Series};
 use crate::fmt::fmt_time;
 use crate::i18n::{t, tf};
 use crate::ui::ErrorBanner;
@@ -14,6 +15,7 @@ use leptos::task::spawn_local;
 #[component]
 pub fn Cluster() -> impl IntoView {
     let (data, set_data) = RwSignal::new_local(None::<api::ClusterInfo>).split();
+    let (history, set_history) = RwSignal::new_local(None::<api::ClusterHistory>).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
 
     use_polling(move || {
@@ -25,6 +27,10 @@ pub fn Cluster() -> impl IntoView {
                     mark_refreshed();
                 }
                 Err(err) => set_error.set(Some(err)),
+            }
+            match api::cluster_history().await {
+                Ok(value) => set_history.set(Some(value)),
+                Err(_) => set_history.set(None),
             }
         })
     });
@@ -160,6 +166,31 @@ pub fn Cluster() -> impl IntoView {
                             </table>
                             <p class="hint">{t("cl.hint")}</p>
                         </div>
+                        {move || {
+                            history
+                                .get()
+                                .map(|history| {
+                                    let load = worker_series(&history, |w| {
+                                        w.load_permille as f64 / 10.0
+                                    });
+                                    let mem = worker_series(&history, |w| {
+                                        w.mem_permille as f64 / 10.0
+                                    });
+                                    let cpu = worker_series(&history, |w| {
+                                        w.cpu_permille as f64 / 10.0
+                                    });
+                                    view! {
+                                        <div class="panel">
+                                            <h2>{t("cl.history")}</h2>
+                                            <LineChart title=t("chart.worker_load") series=load unit="%" />
+                                            <LineChart title=t("chart.worker_mem") series=mem unit="%" />
+                                            <LineChart title=t("chart.worker_cpu") series=cpu unit="%" />
+                                        </div>
+                                    }
+                                        .into_any()
+                                })
+                                .unwrap_or_else(|| ().into_any())
+                        }}
                     }
                     .into_any()
                 })
@@ -172,4 +203,31 @@ pub fn Cluster() -> impl IntoView {
                 })
         }}
     }
+}
+
+/// Percentage charts fed by the console-side sampling ring (one series per
+/// worker).
+fn worker_series(
+    history: &api::ClusterHistory,
+    pick: impl Fn(&api::WorkerHistoryPoint) -> f64,
+) -> Vec<Series> {
+    let mut by_worker: std::collections::BTreeMap<String, Vec<(f64, f64)>> =
+        std::collections::BTreeMap::new();
+    for point in &history.points {
+        for worker in &point.workers {
+            by_worker
+                .entry(worker.worker_id.clone())
+                .or_default()
+                .push((point.ts_ms as f64, pick(worker)));
+        }
+    }
+    by_worker
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, points))| Series {
+            color: PALETTE[i % PALETTE.len()].to_string(),
+            name,
+            points,
+        })
+        .collect()
 }

@@ -5,6 +5,7 @@
 
 mod api;
 mod app;
+mod charts;
 mod fmt;
 mod i18n;
 mod pages;

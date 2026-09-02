@@ -93,6 +93,12 @@ pub async fn cluster(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `GET /api/v1/cluster/history` — console-side sampled worker/cluster
+/// time series. Web-process-local: empty until the poller has cycled.
+pub async fn cluster_history(State(state): State<AppState>) -> Response {
+    Json(state.history.cluster_snapshot()).into_response()
+}
+
 /// `GET /metrics` — Prometheus text exposition.
 pub async fn metrics(State(state): State<AppState>) -> Response {
     match state.metrics.gather() {

@@ -193,6 +193,7 @@ const DICT: &[(&str, &str, &str)] = &[
     ("jd.cp_completed", "Checkpoints completed", "已完成 checkpoint"),
     ("jd.tasks", "Tasks", "任务"),
     ("jd.parallelism", "Parallelism", "并行度"),
+    ("jd.metrics", "Metrics", "指标"),
     ("jd.edit_restart", "Edit & restart", "编辑配置并重启"),
     ("jd.resubmit", "Resubmit same id", "以同 ID 重新提交"),
     ("jd.restart", "Restart", "重启"),
@@ -239,6 +240,7 @@ const DICT: &[(&str, &str, &str)] = &[
     ("cl.accepting", "accepting", "可接收"),
     ("cl.overloaded_bad", "OVERLOADED", "已过载"),
     ("cl.masters", "Masters (raft members)", "Master 节点（raft 成员）"),
+    ("cl.history", "History", "历史趋势"),
     ("cl.leader_badge", "leader", "主"),
     ("cl.hint", "Admission is dynamic (no slot counts): a worker accepts new tasks while its event-loop lag stays under the threshold and its memory under the watermark. Overloaded workers stop receiving tasks and their pending tasks are stolen by healthy peers.", "准入是动态的（无固定 slot 数）：事件循环延迟低于阈值且内存低于水位线时，节点才接收新任务。过载节点停止接收任务，其排队任务会被健康节点抢占。"),
     // Not found
@@ -248,4 +250,11 @@ const DICT: &[(&str, &str, &str)] = &[
     ("misc.loading", "Loading…", "加载中…"),
     ("misc.no_data", "No data (see the error above).", "暂无数据（见上方错误）。"),
     ("misc.cancel", "Cancel", "取消"),
+    // Charts
+    ("chart.throughput", "Throughput (rec/s)", "吞吐 (rec/s)"),
+    ("chart.sink_latency", "Sink latency EMA (ms)", "Sink 延迟 EMA (ms)"),
+    ("chart.worker_load", "Worker load (%)", "节点负载 (%)"),
+    ("chart.worker_mem", "Worker memory (%)", "节点内存 (%)"),
+    ("chart.worker_cpu", "Worker CPU (%)", "节点 CPU (%)"),
+    ("chart.collecting", "Collecting samples…", "正在采集数据…"),
 ];

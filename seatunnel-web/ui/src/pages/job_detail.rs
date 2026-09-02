@@ -6,6 +6,7 @@
 
 use crate::api;
 use crate::app::{mark_refreshed, use_polling};
+use crate::charts::{LineChart, PALETTE, Series};
 use crate::fmt::{fmt_bytes, fmt_count, fmt_duration, fmt_short_duration, fmt_time};
 use crate::i18n::{lang, t, tf};
 use crate::ui::{push_toast, ConfirmDialog, ErrorBanner, StateTag, ToastKind};
@@ -32,6 +33,7 @@ pub fn JobDetail() -> impl IntoView {
     let (status, set_status) = RwSignal::new_local(None::<api::JobStatus>).split();
     let (checkpoints, set_checkpoints) = RwSignal::new_local(None::<api::CheckpointHistory>).split();
     let (logs, set_logs) = RwSignal::new_local(None::<api::JobLogs>).split();
+    let (history, set_history) = RwSignal::new_local(None::<api::JobHistory>).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
     // Edit-and-restart state: editor visibility, edited config, flow busy flag.
     let (editor_open, set_editor_open) = RwSignal::new_local(false).split();
@@ -60,6 +62,10 @@ pub fn JobDetail() -> impl IntoView {
             match api::job_logs(&poll_id).await {
                 Ok(value) => set_logs.set(Some(value)),
                 Err(_) => set_logs.set(None),
+            }
+            match api::job_history(&poll_id).await {
+                Ok(value) => set_history.set(Some(value)),
+                Err(_) => set_history.set(None),
             }
         })
     });
@@ -348,6 +354,7 @@ pub fn JobDetail() -> impl IntoView {
                     }
                 })
         }}
+        <MetricsCharts history=history />
         <TaskLogsPanel logs=logs />
         {move || {
             checkpoints
@@ -426,6 +433,54 @@ pub fn JobDetail() -> impl IntoView {
             }
         }}
     }
+}
+
+/// Throughput and sink-latency charts fed by the console-side sampling
+/// ring (one series per task).
+#[component]
+fn MetricsCharts(history: ReadSignal<Option<api::JobHistory>, LocalStorage>) -> impl IntoView {
+    move || {
+        history
+            .get()
+            .map(|history| {
+                let rps = task_series(&history, |p| p.records_per_sec);
+                let latency = task_series(&history, |p| p.latency_ema_ms);
+                view! {
+                    <div class="panel">
+                        <h2>{t("jd.metrics")}</h2>
+                        <LineChart title=t("chart.throughput") series=rps unit="rec/s" />
+                        <LineChart title=t("chart.sink_latency") series=latency unit="ms" />
+                    </div>
+                }
+                .into_any()
+            })
+            .unwrap_or_else(|| ().into_any())
+    }
+}
+
+fn task_series(
+    history: &api::JobHistory,
+    pick: impl Fn(&api::TaskHistoryPoint) -> f64,
+) -> Vec<Series> {
+    let mut by_task: std::collections::BTreeMap<String, Vec<(f64, f64)>> =
+        std::collections::BTreeMap::new();
+    for point in &history.points {
+        for task in &point.tasks {
+            by_task
+                .entry(task.task_id.clone())
+                .or_default()
+                .push((point.ts_ms as f64, pick(task)));
+        }
+    }
+    by_task
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, points))| Series {
+            color: PALETTE[i % PALETTE.len()].to_string(),
+            name,
+            points,
+        })
+        .collect()
 }
 
 /// Live per-task log viewer: lifecycle events and sampled data rows.

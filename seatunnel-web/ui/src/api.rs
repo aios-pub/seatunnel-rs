@@ -397,3 +397,61 @@ pub async fn delete_job(job_id: &str) -> Result<(), String> {
         Err(extract_error(&text).unwrap_or_else(|| format!("HTTP {}", status)))
     }
 }
+
+/// One task's sample in the job history ring.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TaskHistoryPoint {
+    pub task_id: String,
+    pub records_per_sec: f64,
+    pub latency_ema_ms: f64,
+    pub latency_max_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct JobHistoryPoint {
+    pub ts_ms: i64,
+    #[serde(default)]
+    pub tasks: Vec<TaskHistoryPoint>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct JobHistory {
+    pub job_id: String,
+    #[serde(default)]
+    pub points: Vec<JobHistoryPoint>,
+}
+
+/// One worker's sample in the cluster history ring.
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkerHistoryPoint {
+    pub worker_id: String,
+    pub load_permille: u32,
+    pub lag_ms: u32,
+    pub mem_permille: u32,
+    pub cpu_permille: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClusterHistoryPoint {
+    pub ts_ms: i64,
+    pub running_tasks: i32,
+    #[serde(default)]
+    pub workers: Vec<WorkerHistoryPoint>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClusterHistory {
+    #[serde(default)]
+    pub points: Vec<ClusterHistoryPoint>,
+}
+
+/// Console-side sampled throughput/sink-latency series for a job (empty
+/// until the web poller has seen it; resets when the console restarts).
+pub async fn job_history(job_id: &str) -> Result<JobHistory, String> {
+    get(&format!("/jobs/{}/history", job_id)).await
+}
+
+/// Console-side sampled worker/cluster series.
+pub async fn cluster_history() -> Result<ClusterHistory, String> {
+    get("/cluster/history").await
+}
