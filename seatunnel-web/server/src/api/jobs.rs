@@ -198,6 +198,19 @@ pub async fn restart_job(State(state): State<AppState>, Path(job_id): Path<Strin
     }
 }
 
+/// `DELETE /api/v1/jobs/{job_id}` — remove a TERMINAL job from history.
+/// The engine rejects deleting a non-terminal job (mapped to 400).
+pub async fn delete_job(State(state): State<AppState>, Path(job_id): Path<String>) -> Response {
+    match state.engine.delete_job(&job_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": job_id })),
+        )
+            .into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
 /// `GET /api/v1/jobs/{job_id}/checkpoints` — checkpoint history.
 pub async fn job_checkpoints(
     State(state): State<AppState>,

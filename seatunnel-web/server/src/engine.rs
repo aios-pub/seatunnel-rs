@@ -68,7 +68,7 @@ impl EngineError {
     }
 }
 
-/// Name for a proto `JobState` code (1..=6).
+/// Name for a proto `JobState` code (1..=7).
 pub fn job_state_name(code: i32) -> &'static str {
     match code {
         1 => "CREATED",
@@ -77,6 +77,7 @@ pub fn job_state_name(code: i32) -> &'static str {
         4 => "COMPLETED",
         5 => "FAILED",
         6 => "CANCELLED",
+        7 => "DEPLOYING",
         _ => "UNKNOWN",
     }
 }
@@ -109,6 +110,9 @@ pub trait EngineOps: Send + Sync {
     /// cancel (exit checkpoint) when still non-terminal → resubmit;
     /// tasks resume from their last checkpoint.
     async fn restart_job(&self, job_id: &str) -> Result<SubmitResultDto, EngineError>;
+    /// Delete a TERMINAL job from history (state + checkpoint metadata).
+    /// Non-terminal jobs are rejected by the engine.
+    async fn delete_job(&self, job_id: &str) -> Result<(), EngineError>;
     /// Edit-and-restart: cancel (exit checkpoint) → resubmit same id.
     async fn update_job(
         &self,
@@ -168,8 +172,10 @@ fn status_dto(s: JobStatus) -> JobStatusDto {
                     last_error: m.last_error.clone(),
                     last_error_at: m.last_error_at,
                 }),
+                error: t.error,
             })
             .collect(),
+        parallelism: s.parallelism,
     }
 }
 
@@ -193,8 +199,11 @@ fn cluster_dto(c: ClusterInfo) -> ClusterInfoDto {
                 lag_ms: w.lag_ms,
                 mem_permille: w.mem_permille,
                 can_accept: w.can_accept,
+                cpu_permille: w.cpu_permille,
+                task_ids: w.task_ids,
             })
             .collect(),
+        raft_members: c.raft_members,
     }
 }
 
@@ -275,6 +284,12 @@ impl EngineOps for EngineClient {
             job_id: resp.job_id,
             message: resp.message,
         })
+    }
+
+    async fn delete_job(&self, job_id: &str) -> Result<(), EngineError> {
+        EngineClient::delete_job(self, job_id)
+            .await
+            .map_err(EngineError::from_client)
     }
 
     async fn update_job(
@@ -374,6 +389,7 @@ impl FakeEngine {
             checkpoint_interval_ms: 10_000,
             checkpoints_completed: 3,
             job_config: r#"{"env":{"job.name":"demo"},"source":{"Fake":{"row.num":1}},"sink":{"Console":{}}}"#.to_string(),
+            parallelism: 1,
             tasks: vec![TaskStatusDto {
                 task_id: "task-0".to_string(),
                 stage_id: "0".to_string(),
@@ -384,6 +400,7 @@ impl FakeEngine {
                 records_per_sec: 0.0,
                 idle_ms: 0,
                 sink_metrics: None,
+                error: String::new(),
             }],
         };
         FakeEngine {
@@ -414,6 +431,24 @@ impl EngineOps for FakeEngine {
             job_id: job_id.to_string(),
             message: "restarted (fake)".to_string(),
         })
+    }
+
+    async fn delete_job(&self, job_id: &str) -> Result<(), EngineError> {
+        if self.unreachable {
+            return Err(self.err());
+        }
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(job) = jobs.iter().find(|j| j.job_id == job_id) else {
+            return Err(EngineError::NotFound(format!("Job {} not found", job_id)));
+        };
+        if job.state != "COMPLETED" && job.state != "FAILED" && job.state != "CANCELLED" {
+            return Err(EngineError::Invalid(format!(
+                "job {} is {} — cancel it before deleting",
+                job_id, job.state
+            )));
+        }
+        jobs.retain(|j| j.job_id != job_id);
+        Ok(())
     }
 
     async fn update_job(
@@ -485,6 +520,7 @@ impl EngineOps for FakeEngine {
             checkpoint_interval_ms: 0,
             checkpoints_completed: 0,
             job_config: String::new(),
+            parallelism: 0,
             tasks: Vec::new(),
         });
         Ok(SubmitResultDto {
@@ -516,6 +552,7 @@ impl EngineOps for FakeEngine {
             available_workers: 1,
             total_tasks: 1,
             running_tasks: 1,
+            raft_members: vec!["127.0.0.1:5800".to_string()],
             workers: vec![WorkerDto {
                 load_score_permille: 100,
                 lag_ms: 20,
@@ -525,6 +562,8 @@ impl EngineOps for FakeEngine {
                 address: "127.0.0.1:5801".to_string(),
                 last_heartbeat_ms: 99,
                 running_tasks: 1,
+                cpu_permille: 120,
+                task_ids: vec!["task-0".to_string()],
             }],
         })
     }

@@ -175,6 +175,12 @@ pub fn JobDetail() -> impl IntoView {
                                     <div class="kv-value">{fmt_count(status.checkpoints_completed)}</div>
                                 </div>
                                 <div class="kv">
+                                    <div class="kv-label">{t("jd.parallelism")}</div>
+                                    <div class="kv-value">
+                                        {if status.parallelism > 0 { status.parallelism.to_string() } else { "—".to_string() }}
+                                    </div>
+                                </div>
+                                <div class="kv">
                                     <div class="kv-label">{t("jd.tasks")}</div>
                                     <div class="kv-value">{status.tasks.len()}</div>
                                 </div>
@@ -266,6 +272,7 @@ pub fn JobDetail() -> impl IntoView {
                                         <th>{t("jd.col.throughput")}</th>
                                         <th>{t("jd.col.idle")}</th>
                                         <th>{t("jd.col.sink")}</th>
+                                        <th>{t("jd.col.error")}</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -314,6 +321,13 @@ pub fn JobDetail() -> impl IntoView {
                                                                     failed,
                                                                 )
                                                             }
+                                                        }}
+                                                    </td>
+                                                    <td class="mono small idle-critical" title={task.error.clone()}>
+                                                        {if task.error.is_empty() {
+                                                            "—".to_string()
+                                                        } else {
+                                                            task.error.clone()
                                                         }}
                                                     </td>
                                                 </tr>

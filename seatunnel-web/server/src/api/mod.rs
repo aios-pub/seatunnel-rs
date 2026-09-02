@@ -67,6 +67,7 @@ pub async fn overview(State(state): State<AppState>) -> Response {
             available_workers: cluster.available_workers,
             total_tasks: cluster.total_tasks,
             running_tasks: cluster.running_tasks,
+            raft_members: cluster.raft_members,
             workers: cluster.workers,
         },
     };

@@ -62,6 +62,32 @@ pub fn Cluster() -> impl IntoView {
                             }
                         }}
                         <div class="panel">
+                            <h2>{t("cl.masters")}</h2>
+                            <div class="checkpoint-list">
+                                {cluster
+                                    .raft_members
+                                    .iter()
+                                    .map(|member| {
+                                        let is_leader = *member == cluster.leader_id
+                                            && !cluster.leader_id.is_empty();
+                                        view! {
+                                            <span class="checkpoint-chip">
+                                                <span class="mono">{member.clone()}</span>
+                                                {is_leader.then(|| {
+                                                    view! {
+                                                        <span class="badge ok">{t("cl.leader_badge")}</span>
+                                                    }
+                                                })}
+                                            </span>
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()}
+                            </div>
+                            {cluster.raft_members.is_empty().then(|| {
+                                view! { <div class="muted">"—"</div> }
+                            })}
+                        </div>
+                        <div class="panel">
                             <h2>
                                 {tf(
                                     "cl.table_title",
@@ -77,6 +103,7 @@ pub fn Cluster() -> impl IntoView {
                                         <th>{t("cl.col.load")}</th>
                                         <th>{t("cl.col.lag")}</th>
                                         <th>{t("cl.col.memory")}</th>
+                                        <th>{t("cl.col.cpu")}</th>
                                         <th>{t("cl.col.tasks")}</th>
                                         <th>{t("cl.col.heartbeat")}</th>
                                     </tr>
@@ -120,6 +147,9 @@ pub fn Cluster() -> impl IntoView {
                                                     </td>
                                                     <td class="mono">{worker.lag_ms}</td>
                                                     <td class="mono">{format!("{}%", mem_pct)}</td>
+                                                    <td class="mono">
+                                                        {format!("{}%", worker.cpu_permille as f64 / 10.0)}
+                                                    </td>
                                                     <td>{worker.running_tasks}</td>
                                                     <td>{fmt_time(worker.last_heartbeat_ms)}</td>
                                                 </tr>

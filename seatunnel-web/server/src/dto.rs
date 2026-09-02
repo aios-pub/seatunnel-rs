@@ -64,6 +64,9 @@ pub struct TaskStatusDto {
     /// Sink delivery metrics (absent when the sink reports nothing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sink_metrics: Option<SinkMetricsDto>,
+    /// Last failure detail reported by the task (empty when healthy).
+    #[serde(default)]
+    pub error: String,
 }
 
 /// Full job status for the detail view.
@@ -82,6 +85,9 @@ pub struct JobStatusDto {
     /// update-and-restart.
     #[serde(default)]
     pub job_config: String,
+    /// Requested task parallelism (0 = unknown for legacy records).
+    #[serde(default)]
+    pub parallelism: i32,
 }
 
 /// Request body for `POST /api/v1/jobs/{job_id}/update`.
@@ -150,6 +156,12 @@ pub struct WorkerDto {
     /// False while the worker is over a pressure watermark: it receives
     /// no new tasks and its pending tasks may be stolen by peers.
     pub can_accept: bool,
+    /// Host CPU usage, per-mille 0..1000 (display signal).
+    #[serde(default)]
+    pub cpu_permille: u32,
+    /// Task ids currently owned by this worker (Running/Deploying).
+    #[serde(default)]
+    pub task_ids: Vec<String>,
 }
 
 /// Cluster snapshot for the cluster view.
@@ -164,6 +176,9 @@ pub struct ClusterInfoDto {
     pub total_tasks: i32,
     pub running_tasks: i32,
     pub workers: Vec<WorkerDto>,
+    /// Known raft member addresses (master/hybrid nodes).
+    #[serde(default)]
+    pub raft_members: Vec<String>,
 }
 
 /// One retained checkpoint of a task.

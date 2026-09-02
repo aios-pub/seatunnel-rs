@@ -39,6 +39,9 @@ pub struct ClusterInfo {
     pub available_workers: i32,
     pub total_tasks: i32,
     pub running_tasks: i32,
+    /// Known raft member addresses (master/hybrid nodes).
+    #[serde(default)]
+    pub raft_members: Vec<String>,
     #[serde(default)]
     pub workers: Vec<Worker>,
 }
@@ -58,6 +61,12 @@ pub struct Worker {
     /// RSS over usable memory, 0..1000 (per-mille).
     #[serde(default)]
     pub mem_permille: u32,
+    /// Host CPU usage, 0..1000 (per-mille).
+    #[serde(default)]
+    pub cpu_permille: u32,
+    /// Task ids currently owned by this worker (Running/Deploying).
+    #[serde(default)]
+    pub task_ids: Vec<String>,
     /// False while over a pressure watermark (no new tasks; pending tasks
     /// may be stolen by healthy peers).
     #[serde(default = "default_true")]
@@ -91,6 +100,9 @@ pub struct JobStatus {
     /// update-and-restart.
     #[serde(default)]
     pub job_config: String,
+    /// Requested task parallelism (0 = unknown).
+    #[serde(default)]
+    pub parallelism: i32,
     #[serde(default)]
     pub tasks: Vec<TaskStatus>,
 }
@@ -115,6 +127,9 @@ pub struct TaskStatus {
     /// Sink delivery metrics (absent when the sink reports nothing).
     #[serde(default)]
     pub sink_metrics: Option<SinkMetrics>,
+    /// Last failure detail reported by the task (empty when healthy).
+    #[serde(default)]
+    pub error: String,
 }
 
 /// Sink-side delivery metrics of one task (windowed, not lifetime).
@@ -366,4 +381,19 @@ pub async fn restart_job(job_id: &str) -> Result<SubmitResult, String> {
         .await
         .map_err(|e| format!("request failed: {}", e))?;
     read_json(resp).await
+}
+
+/// Delete a TERMINAL job from history (state + checkpoint metadata).
+pub async fn delete_job(job_id: &str) -> Result<(), String> {
+    let resp = gloo_net::http::Request::delete(&format!("{}/jobs/{}", BASE, job_id))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e))?;
+    if resp.ok() {
+        Ok(())
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Err(extract_error(&text).unwrap_or_else(|| format!("HTTP {}", status)))
+    }
 }

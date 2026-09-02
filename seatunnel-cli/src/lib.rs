@@ -151,6 +151,14 @@ pub enum JobCommand {
         #[arg(short, long, default_value = "127.0.0.1:5800")]
         address: String,
     },
+    /// Delete a TERMINAL job from history (state + checkpoint metadata).
+    /// Non-terminal jobs must be cancelled first.
+    Delete {
+        #[arg(short, long)]
+        job_id: String,
+        #[arg(short, long, default_value = "127.0.0.1:5800")]
+        address: String,
+    },
 }
 
 /// Parse and execute CLI commands.
@@ -225,6 +233,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             JobCommand::Status { job_id, address } => show_status(&address, &job_id).await?,
             JobCommand::Cancel { job_id, address } => cancel_job(&address, &job_id).await?,
             JobCommand::Restart { job_id, address } => restart_job(&address, &job_id).await?,
+            JobCommand::Delete { job_id, address } => delete_job(&address, &job_id).await?,
         },
         Some(Commands::Cluster { address }) => print_cluster_info(&address).await?,
         None => {
@@ -928,6 +937,16 @@ async fn restart_job(address: &str, job_id: &str) -> Result<()> {
     // Long-running by design (≤ the server-side cancel timeout): print
     // the flow's own outcome message (abort reasons included).
     println!("{}", response.message);
+    Ok(())
+}
+
+async fn delete_job(address: &str, job_id: &str) -> Result<()> {
+    let client = EngineClient::new(address);
+    client
+        .delete_job(job_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    println!("Job {} deleted from history", job_id);
     Ok(())
 }
 

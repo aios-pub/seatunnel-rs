@@ -77,8 +77,12 @@ pub fn Jobs() -> impl IntoView {
                             .map(|job| {
                                 let job_id = job.job_id.clone();
                                 let cancel_id = job.job_id.clone();
+                                let delete_id = job.job_id.clone();
                                 let link_id = job.job_id.clone();
+                                let state = job.state.clone();
                                 let navigate = navigate.clone();
+                                let is_terminal =
+                                    matches!(state.as_str(), "COMPLETED" | "FAILED" | "CANCELLED");
                                 view! {
                                     <tr>
                                         <td>{job.job_name.clone()}</td>
@@ -98,7 +102,11 @@ pub fn Jobs() -> impl IntoView {
                                         <td>{fmt_time(job.start_time_ms)}</td>
                                         <td>{fmt_duration(job.start_time_ms, job.end_time_ms)}</td>
                                         <td>
-                                            <CancelJobButton job_id=cancel_id />
+                                            {if is_terminal {
+                                                view! { <DeleteJobButton job_id=delete_id /> }.into_any()
+                                            } else {
+                                                view! { <CancelJobButton job_id=cancel_id /> }.into_any()
+                                            }}
                                         </td>
                                     </tr>
                                 }
@@ -155,6 +163,58 @@ fn CancelJobButton(job_id: String) -> impl IntoView {
                     confirm_label=t("jobs.cancel")
                     danger=true
                     on_confirm=stop.clone()
+                />
+            }
+        }}
+    }
+}
+
+/// Delete button for terminal jobs: removes the history record (state +
+/// checkpoint metadata) after confirmation.
+#[component]
+fn DeleteJobButton(job_id: String) -> impl IntoView {
+    let busy = RwSignal::new(false);
+    let confirm_open = RwSignal::new(false);
+    let message = Signal::derive({
+        let job_id = job_id.clone();
+        move || tf("jobs.delete_confirm", &[job_id.as_str()])
+    });
+    let del = {
+        let job_id = job_id.clone();
+        Callback::new(move |_| {
+            busy.set(true);
+            let job_id = job_id.clone();
+            spawn_local(async move {
+                match api::delete_job(&job_id).await {
+                    Ok(()) => {
+                        push_toast(ToastKind::Success, tf("jobs.deleted", &[&job_id]));
+                    }
+                    Err(err) => {
+                        push_toast(ToastKind::Error, format!("{}: {}", t("jobs.delete_failed"), err))
+                    }
+                }
+                busy.set(false);
+            });
+        })
+    };
+
+    view! {
+        <button
+            class="danger"
+            disabled=move || busy.get()
+            on:click=move |_| confirm_open.set(true)
+        >{move || t("jobs.delete")}</button>
+        {move || {
+            let _ = lang().get();
+            let title = tf("jobs.delete_title", &[job_id.as_str()]);
+            view! {
+                <ConfirmDialog
+                    show=confirm_open
+                    title=title
+                    message=message
+                    confirm_label=t("jobs.delete")
+                    danger=true
+                    on_confirm=del.clone()
                 />
             }
         }}

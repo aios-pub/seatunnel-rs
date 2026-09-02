@@ -62,6 +62,10 @@ pub fn build_router(state: AppState) -> Router {
             )
             .route("/api/v1/jobs/{job_id}", get(api::jobs::job_detail))
             .route(
+                "/api/v1/jobs/{job_id}",
+                axum::routing::delete(api::jobs::delete_job),
+            )
+            .route(
                 "/api/v1/jobs/{job_id}/cancel",
                 axum::routing::post(api::jobs::cancel_job),
             )
@@ -447,6 +451,72 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("restarted"), "body: {}", body);
+    }
+
+    /// `delete_json` — DELETE with the session cookie; returns the body.
+    async fn delete_json(
+        state: &AppState,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("DELETE").uri(path);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let response = build_router(state.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn fake_engine_with_state(state_name: &str) -> FakeEngine {
+        let mut fake = FakeEngine::default();
+        fake.jobs.lock().unwrap().push(JobStatusDto {
+            job_id: "job-1".to_string(),
+            job_name: "demo".to_string(),
+            state: state_name.to_string(),
+            start_time_ms: 1,
+            end_time_ms: 2,
+            error_message: String::new(),
+            checkpoint_interval_ms: 10_000,
+            checkpoints_completed: 1,
+            job_config: "{}".to_string(),
+            parallelism: 1,
+            tasks: Vec::new(),
+        });
+        fake
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_job_returns_404() {
+        let state = test_state(FakeEngine::default());
+        let cookie = login_cookie(&state).await;
+        let (status, _) = delete_json(&state, "/api/v1/jobs/missing", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_running_job_returns_400() {
+        let state = test_state(fake_engine_with_state("RUNNING"));
+        let cookie = login_cookie(&state).await;
+        let (status, _) = delete_json(&state, "/api/v1/jobs/job-1", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_terminal_job_removes_it() {
+        let state = test_state(fake_engine_with_state("CANCELLED"));
+        let cookie = login_cookie(&state).await;
+        let (status, body) = delete_json(&state, "/api/v1/jobs/job-1", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert!(body.contains("\"job-1\""), "body: {}", body);
+        // The job is gone from the list.
+        let (status, body) = get_json(&state, "/api/v1/jobs", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]", "body: {}", body);
     }
 
     #[tokio::test]
