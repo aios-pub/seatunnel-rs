@@ -192,10 +192,16 @@ impl RaftStateMachine<Types> for CoordinatorStateMachine {
             inner.membership =
                 StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
             inner.last_applied = meta.last_log_id;
-            // Persist: snapshot.json holds {state, membership, applied}.
+            // Persist the same complete document `build_snapshot` writes:
+            // {state, membership, last_applied, meta}. The meta/last_applied
+            // keys are what `load_snapshot_from_disk` and
+            // `get_current_snapshot` parse after a restart — a partial doc
+            // would lose the applied pointer and fail snapshot reads.
             let doc = serde_json::json!({
                 "state": state,
                 "membership": serde_json::to_value(&inner.membership).map_err(storage_err)?,
+                "last_applied": serde_json::to_value(&meta.last_log_id).map_err(storage_err)?,
+                "meta": serde_json::to_value(meta).map_err(storage_err)?,
             });
             let path = inner.dir.join("snapshot.json");
             let tmp = inner.dir.join("snapshot.json.tmp");
