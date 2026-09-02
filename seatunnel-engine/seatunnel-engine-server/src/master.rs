@@ -247,11 +247,10 @@ impl MasterHandler {
 
 impl MasterHandler {
     /// Classify a (re)registering worker's running tasks: adopt the
-    /// still-assigned ones (through the write path), fence the rest.
+    /// still-assigned ones (through the write path), fence the rest, and
+    /// release the tasks the coordinator still believes this worker runs
+    /// but it did NOT report — the truth source for restart recovery.
     async fn reattach_tasks(&self, worker_id: &str, running: Vec<String>) {
-        if running.is_empty() {
-            return;
-        }
         let (adopt, preempted) = self.coordinator.classify_running_tasks(worker_id, &running);
         if !adopt.is_empty() {
             let cmd = Command::AdoptTasks {
@@ -264,6 +263,35 @@ impl MasterHandler {
         }
         for task_id in preempted {
             self.coordinator.queue_preemption(worker_id, &task_id);
+        }
+
+        // Restart recovery: a restarted worker process registers with an
+        // empty (or partial) running list while the Raft-replayed
+        // coordinator still holds its tasks in Running/Deploying. Those
+        // unreported tasks are lost work of a previous process lifetime;
+        // release them so the claim rule can hand them out again (the
+        // worker resumes from its local checkpoint store).
+        let lost = self
+            .coordinator
+            .reconcile_lost_active_tasks(worker_id, &running);
+        if !lost.is_empty() {
+            let task_ids: Vec<String> = lost.iter().map(|t| t.task_id.clone()).collect();
+            let cmd = Command::ReleaseLostTasks {
+                worker_id: worker_id.to_string(),
+                task_ids,
+            };
+            match self.writes.propose(cmd).await {
+                Ok(_) => {
+                    for task in &lost {
+                        info!(
+                            "Restart recovery: task {} of job {} released (worker {} no longer \
+                             runs it); it will be re-dispatched and resume from its checkpoint",
+                            task.task_id, task.job_id, task.worker_id
+                        );
+                    }
+                }
+                Err(e) => warn!("ReleaseLostTasks proposal failed: {}", e),
+            }
         }
         self.wake_heartbeats();
     }

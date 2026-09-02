@@ -38,6 +38,15 @@ use seatunnel_engine_server::{
 };
 
 async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
+    spawn_master_with(Arc::new(JobCoordinator::new())).await
+}
+
+/// Master bound to a caller-supplied coordinator — used by the
+/// restart-recovery test to simulate a restarted process whose state was
+/// reloaded from the previous incarnation.
+async fn spawn_master_with(
+    coordinator: Arc<JobCoordinator>,
+) -> anyhow::Result<(String, Arc<JobCoordinator>)> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -47,7 +56,6 @@ async fn spawn_master() -> anyhow::Result<(String, Arc<JobCoordinator>)> {
         ))
         .with_test_writer()
         .try_init();
-    let coordinator = Arc::new(JobCoordinator::new());
     let registry = new_worker_registry();
     // Bind eagerly so callers can connect immediately after this returns.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -524,4 +532,90 @@ async fn submit_without_workers_is_rejected() {
         )))
         .await;
     assert!(result.is_err(), "expected rejection with zero workers");
+}
+
+/// Restart recovery: after a full-service restart (master state reloaded
+/// from the previous incarnation — what the Raft snapshot/log replay
+/// does at boot — and the worker process replaced by a fresh one with
+/// the SAME id and an empty running list), the previously RUNNING job
+/// must be re-dispatched instead of staying a zombie under its Healthy
+/// re-registered owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_restart_recovers_running_job_on_worker_reregister() {
+    // Phase 1 — original cluster: the job reaches RUNNING under it-worker-1.
+    let (master_addr, coordinator_a) = spawn_master().await.unwrap();
+    let _worker = spawn_worker_named(&master_addr, "it-worker-1")
+        .await
+        .unwrap();
+    let client = EngineClient::new(&master_addr);
+
+    let job_id = format!("job-restart-{}", uuid::Uuid::new_v4().simple());
+    let config = serde_json::json!({
+        "env": {
+            "job.name": "it-restart",
+            "parallelism": 1,
+            "checkpoint": { "interval": 10000 }
+        },
+        // Unbounded throttled stream: deterministic long-running source.
+        "source": { "Fake": { "row.num": -1, "sleep.ms": 5 } },
+        "sink": { "Console": {} }
+    });
+    let resp = client
+        .submit_job(
+            &job_id,
+            "it-restart",
+            serde_json::to_vec(&config).unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(resp.success, "submit failed: {}", resp.message);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "job never ran");
+        let s = client.get_job_status(&job_id).await.unwrap();
+        if s.state == 3 {
+            break;
+        }
+        assert_ne!(s.state, 5, "job failed: {}", s.error_message);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Phase 2 — "restart": the new master process loads its state from
+    // the old incarnation; its registry starts empty. A FRESH worker
+    // process registers with the same id but an empty running list.
+    let snapshot = coordinator_a.export_state().await;
+    let coordinator_b = Arc::new(JobCoordinator::new());
+    coordinator_b.replace_state(&snapshot).await;
+    let (master_b_addr, _) = spawn_master_with(coordinator_b).await.unwrap();
+    let _ = spawn_worker_named(&master_b_addr, "it-worker-1")
+        .await
+        .unwrap();
+
+    // Registration must reconcile the lost task: released, re-dispatched
+    // to the new worker process and reported RUNNING again on master B.
+    let client_b = EngineClient::new(&master_b_addr);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restarted job never resumed — zombie Running task"
+        );
+        let s = client_b.get_job_status(&job_id).await.unwrap();
+        if s.state == 3 {
+            assert!(
+                s.tasks
+                    .iter()
+                    .any(|t| t.state == 2 && t.worker_id == "it-worker-1"),
+                "recovered task must run again on the re-registered worker"
+            );
+            break;
+        }
+        assert_ne!(s.state, 5, "recovered job failed: {}", s.error_message);
+        assert_ne!(s.state, 6, "recovered job was cancelled");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = client_b.cancel_job(&job_id).await;
 }

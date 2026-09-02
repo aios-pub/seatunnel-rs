@@ -451,6 +451,37 @@ async fn start_master(
         config.cluster_name
     );
 
+    // Restart-recovery visibility: once this node first takes leadership
+    // the committed log is fully applied, so the coordinator then holds
+    // every job recovered from the durable Raft state (snapshot + log).
+    // Summarize the non-terminal ones — they resume as their workers
+    // re-register and reclaim their released tasks.
+    {
+        let leader = Arc::clone(&leader);
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            loop {
+                if leader.read().unwrap().leader_id == Some(node_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let active_ids: Vec<String> = coordinator
+                .list_jobs()
+                .into_iter()
+                .filter(|j| !j.state.is_terminal())
+                .map(|j| j.job_id)
+                .collect();
+            if !active_ids.is_empty() {
+                tracing::info!(
+                    "Restart recovery: {} non-terminal job(s) restored from durable state: {}",
+                    active_ids.len(),
+                    active_ids.join(", ")
+                );
+            }
+        });
+    }
+
     let master_handler = MasterHandler::new(
         coordinator.clone(),
         registry.clone(),

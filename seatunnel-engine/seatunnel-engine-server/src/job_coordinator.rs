@@ -241,6 +241,13 @@ pub enum Command {
         worker_id: String,
         task_ids: Vec<String>,
     },
+    /// A (re)registering worker truthfully reported it no longer runs
+    /// these tasks (e.g. the process restarted): they went back to a
+    /// claimable state so the normal dispatch loop recovers them.
+    ReleaseLostTasks {
+        worker_id: String,
+        task_ids: Vec<String>,
+    },
     /// Allocate a coordinated checkpoint id for a pipeline and open the
     /// pending set (participants derived from applied state).
     CheckpointTriggered {
@@ -925,6 +932,56 @@ impl JobCoordinator {
         stuck
     }
 
+    /// Active (non-terminal job) tasks that a (re)registering worker no
+    /// longer runs — the restart-recovery counterpart of [`Self::reconcile_lost_cancelled_tasks`].
+    ///
+    /// After a full service restart the coordinator state is replayed
+    /// from the Raft log/snapshot, so tasks may still read `Running` /
+    /// `Deploying` under a worker id; a restarted worker process
+    /// registers with the same id but an empty running list (its
+    /// `running_tasks` map was in-memory). Any such task missing from
+    /// the registration report is lost work from a previous process
+    /// lifetime and must be made claimable again — otherwise it stays
+    /// Running under a Healthy owner forever (the claim rule releases
+    /// tasks only from Dead owners, and the absent-owner reconciliation
+    /// skips owners present in the registry).
+    ///
+    /// Unlike the heartbeat-time cancelled reconciliation, `Deploying` IS
+    /// meaningful here: registration precedes every dispatch of this
+    /// process lifetime, so an unreported `Deploying` task cannot be an
+    /// in-flight dispatch race — it is leftover state from before the
+    /// restart. (The Java engine reaches the same effect differently:
+    /// every non-end-state job is rebuilt from the persisted job info
+    /// and pushed back through the pending-job scheduler on master
+    /// activation.)
+    pub fn reconcile_lost_active_tasks(
+        &self,
+        worker_id: &str,
+        running_task_ids: &[String],
+    ) -> Vec<StuckCancelledTask> {
+        let jobs = self.jobs.read();
+        let mut lost = Vec::new();
+        for job in jobs.values() {
+            if job.state.is_terminal() {
+                continue;
+            }
+            for info in job.tasks.values() {
+                if matches!(info.state, JobState::Running | JobState::Deploying)
+                    && info.worker_id == worker_id
+                    && !running_task_ids.contains(&info.task_id)
+                {
+                    lost.push(StuckCancelledTask {
+                        job_id: job.job_id.clone(),
+                        task_id: info.task_id.clone(),
+                        worker_id: info.worker_id.clone(),
+                        processed_records: info.processed_records,
+                    });
+                }
+            }
+        }
+        lost
+    }
+
     /// Non-terminal tasks of cancelled jobs whose cancel deadline passed.
     ///
     /// A task can ignore cancellation (hung source/sink) or sit in
@@ -1130,6 +1187,35 @@ impl JobCoordinator {
             }
         }
         affected
+    }
+
+    /// Deterministic apply of [`Command::ReleaseLostTasks`]: put lost
+    /// tasks back to `Scheduled` while KEEPING the original owner (and
+    /// the descriptor's placement), so the assignment survives and the
+    /// normal claim rule's own-pending arm lets that same worker — or,
+    /// if it never returns, the absent-owner eviction — pick the task
+    /// up again. Guards re-check ownership and state so a replay after
+    /// an intervening reassignment/terminal report is a no-op. Returns
+    /// the released task ids (for logging).
+    pub fn release_lost_tasks(&self, worker_id: &str, task_ids: &[String]) -> Vec<String> {
+        let mut jobs = self.jobs.write();
+        let mut released = Vec::new();
+        for task_id in task_ids {
+            for job in jobs.values_mut() {
+                let Some(info) = job.tasks.get_mut(task_id) else {
+                    continue;
+                };
+                if info.worker_id == worker_id
+                    && matches!(info.state, JobState::Running | JobState::Deploying)
+                    && !job.state.is_terminal()
+                {
+                    info.state = JobState::Scheduled;
+                    released.push(task_id.clone());
+                }
+                break;
+            }
+        }
+        released
     }
 
     /// Tasks a (re)registering worker reports as still running.
@@ -1500,6 +1586,13 @@ impl JobCoordinator {
                 task_ids,
             } => {
                 self.adopt_tasks(worker_id, task_ids);
+                CommandResult::Ok
+            }
+            Command::ReleaseLostTasks {
+                worker_id,
+                task_ids,
+            } => {
+                self.release_lost_tasks(worker_id, task_ids);
                 CommandResult::Ok
             }
             Command::CheckpointTriggered {
@@ -2311,6 +2404,136 @@ mod tests {
             ]),
         );
         assert!(claimed.iter().any(|t| t.task_id == ids[0]));
+    }
+
+    #[test]
+    fn test_reconcile_lost_active_tasks_finds_unreported_work() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 2 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        // Both subtasks placed on worker-0 (single worker).
+        let (_, tasks) = coordinator
+            .compile_and_install("jrec", "j", &config, None, &workers(1))
+            .unwrap();
+        let ids: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        // One task confirmed RUNNING, the other stuck in Deploying (its
+        // RUNNING report was lost when the process died).
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&ids[0]), "worker-0");
+        coordinator.report_task_status("jrec", &ids[0], "RUNNING", 3, None);
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&ids[1]), "worker-0");
+
+        // Full restart: the fresh process reports an empty running list —
+        // BOTH the Running and the Deploying task are lost.
+        let lost = coordinator.reconcile_lost_active_tasks("worker-0", &[]);
+        let mut lost_ids: Vec<String> = lost.iter().map(|t| t.task_id.clone()).collect();
+        lost_ids.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(lost_ids, expected);
+
+        // A still-running task IS reported → only the other one is lost.
+        let reported =
+            coordinator.reconcile_lost_active_tasks("worker-0", std::slice::from_ref(&ids[0]));
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].task_id, ids[1]);
+
+        // Another worker owns nothing here.
+        assert!(
+            coordinator
+                .reconcile_lost_active_tasks("worker-1", &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_release_lost_tasks_reschedules_keeps_owner_skips_terminal() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = coordinator
+            .compile_and_install("jrel", "j", &config, None, &workers(1))
+            .unwrap();
+        let id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&id), "worker-0");
+        coordinator.report_task_status("jrel", &id, "RUNNING", 7, None);
+
+        // A second job, cancelled while its task is still Running: tasks
+        // of a TERMINAL job must never be released (they belong to the
+        // cancelled-task reconciliation / cancel broadcast instead).
+        let (_, tasks2) = coordinator
+            .compile_and_install("jterm", "j", &config, None, &workers(1))
+            .unwrap();
+        let id2 = tasks2[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&id2), "worker-0");
+        coordinator.report_task_status("jterm", &id2, "RUNNING", 1, None);
+        coordinator.apply_command(&Command::CancelJob {
+            job_id: "jterm".to_string(),
+            at_ms: 1,
+        });
+
+        let lost = coordinator.reconcile_lost_active_tasks("worker-0", &[]);
+        assert_eq!(lost.len(), 1, "only the non-terminal job's task is lost");
+        assert_eq!(lost[0].task_id, id);
+
+        // Feed both ids to exercise the terminal-job guard on apply.
+        let released = coordinator.release_lost_tasks("worker-0", &[id.clone(), id2.clone()]);
+        assert_eq!(released, vec![id.clone()], "terminal-job task not released");
+
+        // The released task keeps its owner but is claimable by that same
+        // (re-registered, Healthy) worker — the restart-recovery fast path.
+        let claimed = coordinator.claim_tasks_for_worker(
+            "worker-0",
+            "a",
+            &live(&[("worker-0", WorkerState::Healthy)]),
+        );
+        assert!(claimed.iter().any(|t| t.task_id == id));
+        assert!(claimed.iter().all(|t| t.task_id != id2));
+
+        // Idempotent replay (Raft re-apply): already Scheduled → no-op.
+        let again = coordinator.release_lost_tasks("worker-0", std::slice::from_ref(&id));
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_restart_recovery_via_state_snapshot_roundtrip() {
+        let before = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = before
+            .compile_and_install("jboot", "j", &config, None, &workers(1))
+            .unwrap();
+        let id = tasks[0].task_id.clone();
+        before.mark_tasks_dispatched(std::slice::from_ref(&id), "worker-0");
+        before.report_task_status("jboot", &id, "RUNNING", 9, None);
+
+        // "Restart": a fresh coordinator loads the durable state (what the
+        // Raft snapshot/log replay does at boot).
+        let after = JobCoordinator::new();
+        after.replace_state(&before.export_state().await).await;
+
+        // The replayed coordinator believes the task still runs on
+        // worker-0; the restarted process truthfully reports nothing.
+        let lost = after.reconcile_lost_active_tasks("worker-0", &[]);
+        assert_eq!(lost.len(), 1);
+        after.apply_command(&Command::ReleaseLostTasks {
+            worker_id: "worker-0".to_string(),
+            task_ids: vec![id.clone()],
+        });
+        let claimed = after.claim_tasks_for_worker(
+            "worker-0",
+            "a",
+            &live(&[("worker-0", WorkerState::Healthy)]),
+        );
+        assert!(claimed.iter().any(|t| t.task_id == id));
     }
 
     #[test]
