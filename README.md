@@ -23,6 +23,12 @@ worker execution → Kafka sink → periodic checkpoints, exercised continuously
   impossible by construction, not mitigated by long timeouts. Measured leader
   failover in ~2–4 s with exactly one term bump; the Java engine ships a 180 s
   heartbeat tolerance precisely because without a quorum, fast failover is unsafe.
+- **Restart recovery**: job metadata (configs, plans, states, checkpoint-id
+  counters) is durable in the Raft log/snapshot; after a full service restart
+  every non-terminal job is re-dispatched automatically and resumes from its
+  last checkpoint (the Java `restoreAllRunningJobFromMasterNodeSwitch`
+  equivalent). Historical jobs can also be re-run as-is via
+  `POST /api/v1/jobs/{id}/restart` or `seatunnel job restart -i <job-id>`.
 - **Verified exactly-once checkpointing**: the full coordinator protocol —
   globally aligned cuts, atomically durable checkpoint envelopes
   (`tmp + fsync + rename`), two-phase commit. MySQL XA is implemented in pure SQL

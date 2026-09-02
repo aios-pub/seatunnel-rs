@@ -141,6 +141,7 @@ All endpoints are JSON under `/api/v1`:
 | GET | `/api/v1/jobs/{id}` | Job status incl. tasks and checkpoint counters |
 | POST | `/api/v1/jobs` | Submit a job config |
 | POST | `/api/v1/jobs/{id}/cancel` | Cancel a job |
+| POST | `/api/v1/jobs/{id}/restart` | Restart a historical job (same id + retained config; checkpoint restore) |
 | GET | `/api/v1/jobs/{id}/checkpoints` | Checkpoint history metadata |
 | GET | `/api/v1/jobs/{id}/logs` | Per-task live log lines |
 | GET | `/api/v1/cluster` | Workers and leader info |
@@ -259,3 +260,18 @@ refreshes automatically afterwards.
 `POST /api/v1/jobs/{job_id}/update` with
 `{"config_text": "<edited JSON>", "cancel_timeout_secs": 60}` is the
 backing API.
+
+## Restarting a historical job
+
+`POST /api/v1/jobs/{job_id}/restart` re-runs a job with its retained
+config under the SAME id — no request body needed. The engine cancels a
+still-running incarnation first (exit checkpoint, same never-in-parallel
+safety as the update flow), then resubmits from the config stored at
+submission time; tasks resume from their latest checkpoint (batch jobs
+without checkpoints cold-start). On a cancel timeout the restart aborts
+without resubmitting and returns HTTP 400 explaining why.
+
+Note this is the manual path — a full service restart recovers
+non-terminal jobs automatically (see the restart-recovery section in
+[production readiness](production-readiness.md)); the endpoint is for
+finished/failed/cancelled jobs you want to run again.
