@@ -274,6 +274,12 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-heig
 .muted { color: var(--muted); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.toolbar-gap { flex: 1; }
+.inline-select { width: auto; padding: 5px 8px; font-size: 13px; }
+.inline-search { width: 220px; padding: 5px 10px; font-size: 13px; }
+.col-check { width: 34px; text-align: center; }
+.col-check input { width: auto; }
+.pager { display: flex; gap: 12px; align-items: center; justify-content: center; margin-top: 10px; }
 .loading { color: var(--muted); padding: 24px 0; }
 a { color: var(--primary); text-decoration: none; }
 a:hover { text-decoration: underline; }

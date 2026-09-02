@@ -73,7 +73,6 @@ pub fn LineChart(
     let x = move |t: f64| PAD_L + (t - x_min) / (x_max - x_min) * (W - PAD_L - PAD_R);
     let y = move |v: f64| H - PAD_B - (v / y_max) * (H - PAD_T - PAD_B);
 
-    let plot_w = W - PAD_L - PAD_R;
     let plot_h = H - PAD_T - PAD_B;
 
     let grid_y = [0.0, 0.5, 1.0];
