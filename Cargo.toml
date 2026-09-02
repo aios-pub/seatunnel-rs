@@ -75,6 +75,8 @@ crossterm = "0.29"
 # Logging & Metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono", "local-time"] }
+# 0.2.3 is the first release whose rolling Builder supports max_log_files.
+tracing-appender = "0.2.3"
 prometheus = "0.13"
 
 # Database

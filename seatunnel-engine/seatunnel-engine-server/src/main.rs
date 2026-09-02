@@ -28,6 +28,10 @@
 //!
 //! The web management console is compiled into this binary; pass `--web`
 //! to also serve it (see the `--web-*` flags).
+//!
+//! Logs go to stdout and, in addition, to daily rolling files named
+//! `<role>.YYYY-MM-DD` under `<state-dir>/logs` (override with `--log-dir`;
+//! keep at most 30 files).
 
 use clap::Parser;
 use seatunnel_engine_comm::{
@@ -37,6 +41,7 @@ use seatunnel_engine_server::{
     ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode, new_worker_registry,
     server_config::EngineServerConfig,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::Duration;
@@ -94,6 +99,12 @@ struct Args {
     /// over --debug; RUST_LOG is used when neither is given).
     #[arg(long, env = "SEATUNNEL_LOG")]
     log_level: Option<String>,
+
+    /// Directory for the daily rolling log files (<role>.YYYY-MM-DD,
+    /// 30 files kept). Defaults to <state-dir>/logs; "none" disables
+    /// file logging (stdout only).
+    #[arg(long, env = "SEATUNNEL_LOG_DIR")]
+    log_dir: Option<String>,
 
     /// Serve the embedded web management console (SPA + REST API +
     /// /metrics) from this process.
@@ -157,6 +168,15 @@ async fn main() -> anyhow::Result<()> {
     // Parse first so --debug / --log-level can shape the log filter.
     let args = Args::parse();
 
+    // Validate the role before anything opens files or starts logging.
+    if !matches!(args.role.as_str(), "master" | "worker" | "hybrid") {
+        eprintln!(
+            "Unknown role: {}. Use 'master', 'worker' or 'hybrid'.",
+            args.role
+        );
+        std::process::exit(1);
+    }
+
     // Precedence: --log-level > --debug > RUST_LOG > "info".
     let filter = match args.log_level.as_deref() {
         Some(level) => EnvFilter::try_new(level).unwrap_or_else(|_| {
@@ -166,17 +186,10 @@ async fn main() -> anyhow::Result<()> {
         None if args.debug => EnvFilter::new("debug"),
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     };
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            Layer::default().with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
-                // "YYYY-MM-DD HH:mm:ss" in the server's local timezone.
-                "%Y-%m-%d %H:%M:%S".to_string(),
-            )),
-        )
-        .init();
 
     // Precedence: --state-dir > SEATUNNEL_STATE_DIR > config file > default.
+    // Loaded before the subscriber so the rolling log files can default to
+    // <state-dir>/logs.
     let explicit_state_dir = if args.state_dir == ".seatunnel-state" {
         None
     } else {
@@ -187,6 +200,16 @@ async fn main() -> anyhow::Result<()> {
         explicit_state_dir,
         std::env::var("SEATUNNEL_STATE_DIR").ok().as_deref(),
     )?;
+
+    // Dual output: stdout (containers, foreground runs) plus daily rolling
+    // files per role. The guard flushes the non-blocking file writer on drop.
+    let _log_guard = init_tracing(
+        filter,
+        &args.role,
+        args.log_dir.as_deref(),
+        &engine_config.state_dir,
+    );
+
     tracing::info!(
         "Engine config: state_dir={} keep-checkpoint-count={} checkpoint-interval={}ms \
          auto-clean={} grace={}min sweep-every={}min ttl={}min",
@@ -223,16 +246,78 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        other => {
-            eprintln!(
-                "Unknown role: {}. Use 'master', 'worker' or 'hybrid'.",
-                other
-            );
-            std::process::exit(1);
-        }
+        _ => unreachable!("role validated before init_tracing"),
     }
 
     Ok(())
+}
+
+/// Daily rolling log files keep at most this many files (~30 days).
+const MAX_LOG_FILES: usize = 30;
+
+/// Install the global subscriber: a stdout layer (containers, foreground
+/// runs) plus, unless disabled, a daily rolling file layer named
+/// `<role>.YYYY-MM-DD` under the log directory, pruning files beyond
+/// [`MAX_LOG_FILES`]. Returns the guard that flushes the non-blocking file
+/// writer on drop; `None` when file logging is off or unusable.
+fn init_tracing(
+    filter: EnvFilter,
+    role: &str,
+    log_dir: Option<&str>,
+    state_dir: &str,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    // "YYYY-MM-DD HH:mm:ss" in the server's local timezone.
+    let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S".to_string());
+    let stdout_layer = Layer::default().with_timer(timer.clone());
+
+    let dir = match log_dir.map(str::trim) {
+        // "--log-dir none" opts out of file logging (stdout only).
+        Some(dir) if dir.eq_ignore_ascii_case("none") => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(stdout_layer)
+                .init();
+            return None;
+        }
+        Some(dir) => PathBuf::from(dir),
+        // Default: <state-dir>/logs so every node keeps its own files.
+        None => Path::new(state_dir).join("logs"),
+    };
+
+    let appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        // The builder joins prefix and date with '.' → master.YYYY-MM-DD.
+        .filename_prefix(role)
+        .max_log_files(MAX_LOG_FILES)
+        .build(&dir)
+    {
+        Ok(appender) => appender,
+        // An unusable log directory must not keep the server from starting.
+        Err(err) => {
+            eprintln!(
+                "warning: cannot open rolling log dir {}: {err}; logging to stdout only",
+                dir.display()
+            );
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(stdout_layer)
+                .init();
+            return None;
+        }
+    };
+
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer)
+        .with(
+            Layer::default()
+                .with_timer(timer)
+                .with_ansi(false)
+                .with_writer(writer),
+        )
+        .init();
+    Some(guard)
 }
 
 /// Master list: --master (comma separated) > config member-list > default.

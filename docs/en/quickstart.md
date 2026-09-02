@@ -48,6 +48,38 @@ seatunnel-engine-server --role worker --master 127.0.0.1:5800 \
 
 See [Cluster HA Design](cluster-ha-design.md) for the trade-offs.
 
+## Logging
+
+The engine server logs to **stdout** (containers, foreground runs) and, in
+addition, to **daily rolling files** named `<role>.YYYY-MM-DD` under
+`<state-dir>/logs`, keeping at most **30 files** (~30 days; the oldest is
+pruned on rotation). Master and worker processes write separate files
+(`master.*` / `worker.*`); a `hybrid` process runs both in one process and
+writes its own `hybrid.*` files:
+
+```
+<state-dir>/logs/
+  master.2026-09-01
+  master.2026-09-02
+  worker.2026-09-02
+```
+
+| Flag / env | Default | Behavior |
+|------------|---------|----------|
+| `--log-dir` / `SEATUNNEL_LOG_DIR` | `<state-dir>/logs` | directory for the rolling files |
+| `--log-level` / `SEATUNNEL_LOG` | `info` | filter: `--log-level` > `--debug` > `RUST_LOG` > `info` |
+
+Pass `--log-dir none` to disable file logging (stdout only). If the log
+directory cannot be opened, the server starts anyway and logs a warning to
+stdout. The startup scripts discard the child's stdout (the engine writes
+the rolling files itself) and keep stderr — panics and pre-logging startup
+failures — in `console.err` next to the `logs/` directory.
+
+> Note: the file-rotation date is computed by the `time` crate, which may
+> fall back to UTC in multi-threaded processes on Unix — the day boundary
+> of the file name can then be local midnight shifted by your UTC offset.
+> Rotation and retention are unaffected; log timestamps use local time.
+
 ## MySQL CDC → Kafka (cluster mode)
 
 1. Start infrastructure and seed data:

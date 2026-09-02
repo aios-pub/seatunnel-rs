@@ -22,6 +22,10 @@
 # the voters via the coordinator state snapshot) so a task moved to another
 # node after a kill resumes instead of restarting from scratch — no MinIO
 # required. Switch to storage.type s3 for large production checkpoints.
+#
+# Per-node logs go to daily rolling files in node-$i/logs/hybrid.YYYY-MM-DD
+# (30 days kept); stderr (panics, early startup failures) appends to
+# node-$i/console.err.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,6 +39,17 @@ STATE_BASE=${STATE_BASE:-.seatunnel-state/hybrid-cluster}
 BIN_DIR=${BIN_DIR:-./target/debug}
 
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Newest daily log file of node $1, if any (date suffixes sort
+# lexicographically).
+latest_log() {
+  local latest="" f
+  for f in "$STATE_BASE/node-$1/logs"/hybrid.*; do
+    [[ -f "$f" ]] || continue
+    if [[ -z "$latest" || "$f" > "$latest" ]]; then latest=$f; fi
+  done
+  [[ -n "$latest" ]] && echo "$latest" || true
+}
 
 for port in "${PORTS[@]}"; do
   if port_open "$port"; then
@@ -95,11 +110,13 @@ for port in "${PORTS[@]}"; do
   IDX=$((IDX + 1))
   NODE_DIR="$STATE_BASE/node-$IDX"
   mkdir -p "$NODE_DIR"
-  echo "==> starting hybrid node $IDX on 127.0.0.1:$port (log: $NODE_DIR/server.log)"
+  echo "==> starting hybrid node $IDX on 127.0.0.1:$port (logs: $NODE_DIR/logs)"
+  # stdout is discarded — the engine logs to the daily rolling files
+  # itself; stderr (panics, early failures) lands in console.err.
   RUST_LOG=${RUST_LOG:-info} "$BIN_DIR/seatunnel-engine-server" --role hybrid \
     --addr "127.0.0.1:$port" --advertise-addr "127.0.0.1:$port" \
     --worker-id "hybrid-$IDX" --state-dir "$NODE_DIR" \
-    --config "$STATE_BASE/engine.yaml" >"$NODE_DIR/server.log" 2>&1 &
+    --config "$STATE_BASE/engine.yaml" 1>/dev/null 2>>"$NODE_DIR/console.err" &
   PIDS+=($!)
   sleep 1
 done
@@ -120,9 +137,15 @@ for _ in $(seq 1 30); do
 done
 [ -n "$LEADER" ] || {
   echo "error: no leader elected in 30s — tails of the node logs:" >&2
+  log=""
   for IDX in $(seq 1 "$N"); do
-    echo "--- $STATE_BASE/node-$IDX/server.log ---" >&2
-    tail -10 "$STATE_BASE/node-$IDX/server.log" >&2
+    echo "--- $STATE_BASE/node-$IDX/console.err ---" >&2
+    tail -10 "$STATE_BASE/node-$IDX/console.err" >&2 2>/dev/null || true
+    log=$(latest_log "$IDX")
+    if [[ -n "$log" ]]; then
+      echo "--- $log ---" >&2
+      tail -10 "$log" >&2
+    fi
   done
   exit 1
 }
@@ -133,7 +156,7 @@ echo "  $N-node hybrid pseudo-cluster is up (one process = voter + worker)"
 echo "$LEADER"
 i=0
 for port in "${PORTS[@]}"; do
-  echo "  node-$((i + 1))  127.0.0.1:$port  pid ${PIDS[$i]}  log $STATE_BASE/node-$((i + 1))/server.log"
+  echo "  node-$((i + 1))  127.0.0.1:$port  pid ${PIDS[$i]}  logs $STATE_BASE/node-$((i + 1))/logs"
   i=$((i + 1))
 done
 FIRST="127.0.0.1:${PORTS[0]}"

@@ -15,6 +15,10 @@
 #   STATE_DIR    durable state directory    (default .seatunnel-state/hybrid)
 #   BIN_DIR      binary directory           (default ./target/debug)
 #   NO_BUILD     set to 1 to skip cargo build
+#
+# Logs go to daily rolling files in $STATE_DIR/logs/hybrid.YYYY-MM-DD
+# (30 days kept); stderr (panics, early startup failures) appends to
+# $STATE_DIR/console.err.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,6 +27,16 @@ STATE_DIR=${STATE_DIR:-.seatunnel-state/hybrid}
 BIN_DIR=${BIN_DIR:-./target/debug}
 
 port_open() { (exec 3<>"/dev/tcp/${1%:*}/${1##*:}") 2>/dev/null; }
+
+# Newest daily log file, if any (date suffixes sort lexicographically).
+latest_log() {
+  local latest="" f
+  for f in "$STATE_DIR/logs"/hybrid.*; do
+    [[ -f "$f" ]] || continue
+    if [[ -z "$latest" || "$f" > "$latest" ]]; then latest=$f; fi
+  done
+  [[ -n "$latest" ]] && echo "$latest" || true
+}
 
 if port_open "$ADDR"; then
   echo "error: $ADDR already in use — stop the old instance or set HYBRID_ADDR" >&2
@@ -46,15 +60,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> starting hybrid node on $ADDR (log: $STATE_DIR/server.log)"
+echo "==> starting hybrid node on $ADDR (logs: $STATE_DIR/logs)"
+# stdout is discarded — the engine logs to the daily rolling files itself;
+# stderr (panics, early failures) lands in console.err.
 RUST_LOG=${RUST_LOG:-info} "$BIN_DIR/seatunnel-engine-server" --role hybrid \
-  --addr "$ADDR" --state-dir "$STATE_DIR" >"$STATE_DIR/server.log" 2>&1 &
+  --addr "$ADDR" --state-dir "$STATE_DIR" 1>/dev/null 2>>"$STATE_DIR/console.err" &
 PIDS+=($!)
 
 for _ in $(seq 1 30); do port_open "$ADDR" && break; sleep 1; done
 port_open "$ADDR" || {
-  echo "error: node did not come up — tail of $STATE_DIR/server.log:" >&2
-  tail -20 "$STATE_DIR/server.log" >&2
+  echo "error: node did not come up — tail of $STATE_DIR/console.err:" >&2
+  tail -20 "$STATE_DIR/console.err" >&2 2>/dev/null || true
+  log=$(latest_log)
+  if [[ -n "$log" ]]; then
+    echo "error: tail of $log:" >&2
+    tail -20 "$log" >&2
+  fi
   exit 1
 }
 
@@ -69,8 +90,13 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 [ -n "$CLUSTER" ] || {
-  echo "error: cluster info unreachable — tail of $STATE_DIR/server.log:" >&2
-  tail -20 "$STATE_DIR/server.log" >&2
+  echo "error: cluster info unreachable — tail of $STATE_DIR/console.err:" >&2
+  tail -20 "$STATE_DIR/console.err" >&2 2>/dev/null || true
+  log=$(latest_log)
+  if [[ -n "$log" ]]; then
+    echo "error: tail of $log:" >&2
+    tail -20 "$log" >&2
+  fi
   exit 1
 }
 
@@ -78,7 +104,7 @@ echo
 echo "=================================================================="
 echo "  Hybrid node is up — one process = coordinator + worker"
 echo "$CLUSTER" | sed -n '1,2p' | sed 's/^/  /'
-echo "  Log            : $STATE_DIR/server.log"
+echo "  Log            : $STATE_DIR/logs/hybrid.YYYY-MM-DD (daily, 30 kept)"
 echo "  Submit a job   : $BIN_DIR/seatunnel job submit -c <job.yaml> -a $ADDR"
 echo "  Cluster status : $BIN_DIR/seatunnel cluster -a $ADDR"
 echo "  Ctrl+C stops the node; state in $STATE_DIR is kept, so a resubmitted"

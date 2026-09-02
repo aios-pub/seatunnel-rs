@@ -22,7 +22,9 @@
 # its own directory — fully self-contained, no cargo or repo needed.
 #
 # The state dir is KEPT across stop/start so resubmitted jobs resume from
-# their latest checkpoint. Logs append to $STATE_DIR/server.log.
+# their latest checkpoint. Logs go to daily rolling files in
+# $STATE_DIR/logs/hybrid.YYYY-MM-DD (30 days kept); stderr (panics, early
+# startup failures) appends to $STATE_DIR/console.err.
 #
 # Two run modes:
 #   repo mode     — script inside a checkout: builds (unless NO_BUILD=1)
@@ -52,7 +54,8 @@ WEB_USER=${WEB_USER:-${SEATUNNEL_WEB_USER:-admin}}
 WEB_PASSWORD=${WEB_PASSWORD:-${SEATUNNEL_WEB_PASSWORD:-}}
 STATE_DIR=${STATE_DIR:-.seatunnel-state/hybrid-web}
 PID_FILE="$STATE_DIR/hybrid-web.pid"
-LOG_FILE="$STATE_DIR/server.log"
+LOG_DIR="$STATE_DIR/logs"
+ERR_FILE="$STATE_DIR/console.err"
 ACTION=${1:-start}
 
 command -v curl >/dev/null || { echo "error: curl is required" >&2; exit 1; }
@@ -67,6 +70,16 @@ fi
 HEALTH_URL="http://${HEALTH_HOST}:${WEB_LISTEN##*:}/api/v1/health"
 
 healthy() { curl -sf "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; }
+
+# Newest daily log file, if any (date suffixes sort lexicographically).
+latest_log() {
+  local latest="" f
+  for f in "$LOG_DIR"/hybrid.*; do
+    [[ -f "$f" ]] || continue
+    if [[ -z "$latest" || "$f" > "$latest" ]]; then latest=$f; fi
+  done
+  [[ -n "$latest" ]] && echo "$latest" || true
+}
 
 running_pid() {
   [[ -f "$PID_FILE" ]] || return 1
@@ -101,7 +114,7 @@ do_stop() {
 do_start() {
   local pid
   if pid=$(running_pid); then
-    echo "error: already running (pid $pid, log: $LOG_FILE) — use '$0 stop' first" >&2
+    echo "error: already running (pid $pid, logs: $LOG_DIR) — use '$0 stop' first" >&2
     exit 1
   fi
   rm -f "$PID_FILE"
@@ -132,14 +145,15 @@ do_start() {
   fi
 
   mkdir -p "$STATE_DIR"
-  echo "==> starting hybrid node on $ADDR with web console on $WEB_LISTEN (nohup, log: $LOG_FILE)"
+  echo "==> starting hybrid node on $ADDR with web console on $WEB_LISTEN (nohup, logs: $LOG_DIR)"
   # The password rides in the environment, not argv, so it never shows up
-  # in `ps` output.
+  # in `ps` output. stdout is discarded — the engine logs to the daily
+  # rolling files itself; stderr (panics, early failures) lands in console.err.
   export SEATUNNEL_WEB_PASSWORD="$WEB_PASSWORD"
   nohup env RUST_LOG=${RUST_LOG:-info} "$BIN_DIR/seatunnel-engine-server" \
     --role hybrid --addr "$ADDR" --state-dir "$STATE_DIR" \
     --web --web-listen "$WEB_LISTEN" --web-auth-user "$WEB_USER" \
-    >>"$LOG_FILE" 2>&1 &
+    1>/dev/null 2>>"$ERR_FILE" &
   pid=$!
   echo "$pid" >"$PID_FILE"
 
@@ -149,8 +163,13 @@ do_start() {
     sleep 1
   done
   if ! healthy; then
-    echo "error: node did not become healthy — tail of $LOG_FILE:" >&2
-    tail -20 "$LOG_FILE" >&2
+    echo "error: node did not become healthy — tail of $ERR_FILE:" >&2
+    tail -20 "$ERR_FILE" >&2 2>/dev/null || true
+    local log
+    if log=$(latest_log); then
+      echo "error: tail of $log:" >&2
+      tail -20 "$log" >&2
+    fi
     kill "$pid" 2>/dev/null || true
     rm -f "$PID_FILE"
     exit 1
@@ -161,7 +180,8 @@ do_start() {
   echo "  Hybrid node + web console is up (background, pid $pid)"
   echo "  Engine       : $ADDR"
   echo "  Console      : http://${HEALTH_HOST}:${WEB_LISTEN##*:}  (login: $WEB_USER)"
-  echo "  Log          : $LOG_FILE"
+  echo "  Logs         : $LOG_DIR/hybrid.YYYY-MM-DD (daily, 30 kept)"
+  echo "  Stderr       : $ERR_FILE (panics / early startup failures)"
   echo "  Stop         : $0 stop"
   echo "  State in $STATE_DIR is kept, so a resubmitted job resumes from"
   echo "  its latest checkpoint."
@@ -177,7 +197,7 @@ do_status() {
     if healthy; then
       echo "  health : ok ($(curl -sf "$HEALTH_URL"))"
     else
-      echo "  health : NOT responding (log: $LOG_FILE)"
+      echo "  health : NOT responding (logs: $LOG_DIR, stderr: $ERR_FILE)"
     fi
   else
     echo "stopped"

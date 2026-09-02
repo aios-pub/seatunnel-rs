@@ -27,7 +27,10 @@
 #   NO_BUILD     set to 1 to skip cargo build
 #
 # Per-node state/logs/pid live in $STATE_BASE/node-$i; state is KEPT across
-# stop/start so jobs resume from their latest checkpoint. Cross-node
+# stop/start so jobs resume from their latest checkpoint. Per-node logs are
+# daily rolling files in node-$i/logs/hybrid.YYYY-MM-DD (30 days kept);
+# stderr (panics, early startup failures) appends to node-$i/console.err.
+# Cross-node
 # checkpoint restore uses storage type "master" so a task re-claimed by
 # another node after a kill resumes instead of restarting (no MinIO
 # required; switch to storage.type s3 for large production checkpoints).
@@ -81,6 +84,17 @@ console_healthy() {
 }
 
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Newest daily log file of node $1, if any (date suffixes sort
+# lexicographically).
+latest_log() {
+  local latest="" f
+  for f in "$STATE_BASE/node-$1/logs"/hybrid.*; do
+    [[ -f "$f" ]] || continue
+    if [[ -z "$latest" || "$f" > "$latest" ]]; then latest=$f; fi
+  done
+  [[ -n "$latest" ]] && echo "$latest" || true
+}
 
 node_pid() {
   local f="$STATE_BASE/node-$1/node.pid"
@@ -200,14 +214,16 @@ EOF
     port=${PORTS[$((i - 1))]}
     local NODE_DIR="$STATE_BASE/node-$i"
     mkdir -p "$NODE_DIR"
-    echo "==> starting node $i: engine 127.0.0.1:$port, console :$(console_port "$i") (log: $NODE_DIR/server.log)"
+    echo "==> starting node $i: engine 127.0.0.1:$port, console :$(console_port "$i") (logs: $NODE_DIR/logs)"
+    # stdout is discarded — the engine logs to the daily rolling files
+    # itself; stderr (panics, early failures) lands in console.err.
     nohup env RUST_LOG=${RUST_LOG:-info} "$BIN_DIR/seatunnel-engine-server" \
       --role hybrid --addr "127.0.0.1:$port" --advertise-addr "127.0.0.1:$port" \
       --worker-id "node-$i" --state-dir "$NODE_DIR" \
       --config "$STATE_BASE/engine.yaml" \
       --web --web-listen "${WEB_HOST}:$(console_port "$i")" \
       --web-auth-user "$WEB_USER" \
-      >>"$NODE_DIR/server.log" 2>&1 &
+      1>/dev/null 2>>"$NODE_DIR/console.err" &
     echo $! >"$NODE_DIR/node.pid"
     pids+=($!)
     sleep 1
@@ -224,9 +240,14 @@ EOF
   done
   if [[ "$ready" != "1" ]]; then
     echo "error: cluster did not become healthy — node log tails:" >&2
+    local log
     for i in $(seq 1 "$N"); do
-      echo "--- $STATE_BASE/node-$i/server.log (tail) ---" >&2
-      tail -10 "$STATE_BASE/node-$i/server.log" >&2
+      echo "--- $STATE_BASE/node-$i/console.err (tail) ---" >&2
+      tail -10 "$STATE_BASE/node-$i/console.err" >&2 2>/dev/null || true
+      if log=$(latest_log "$i"); then
+        echo "--- $log (tail) ---" >&2
+        tail -10 "$log" >&2
+      fi
     done
     for i in $(seq 1 "$N"); do
       if pid=$(node_pid "$i"); then kill -INT "$pid" 2>/dev/null || true; fi
@@ -242,7 +263,8 @@ EOF
   for i in $(seq 1 "$N"); do
     echo "  node-$i  engine 127.0.0.1:${PORTS[$((i - 1))]}  console http://${HEALTH_HOST}:$(console_port "$i")  pid $(cat "$STATE_BASE/node-$i/node.pid")"
   done
-  echo "  Logs   : $STATE_BASE/node-*/server.log"
+  echo "  Logs   : $STATE_BASE/node-*/logs/hybrid.YYYY-MM-DD (daily, 30 kept)"
+  echo "  Stderr  : $STATE_BASE/node-*/console.err (panics / early failures)"
   echo "  Stop   : $0 stop"
   echo "  Try failover: kill -9 one node pid — a new leader is elected in"
   echo "  ~2s and the consoles keep working off the survivors."
@@ -256,7 +278,7 @@ do_status() {
       if console_healthy "$i"; then
         echo "node-$i: running (pid $pid)  engine 127.0.0.1:${PORTS[$((i - 1))]}  console http://${HEALTH_HOST}:$(console_port "$i")  health ok"
       else
-        echo "node-$i: running (pid $pid)  engine 127.0.0.1:${PORTS[$((i - 1))]}  health NOT responding (log: $STATE_BASE/node-$i/server.log)"
+        echo "node-$i: running (pid $pid)  engine 127.0.0.1:${PORTS[$((i - 1))]}  health NOT responding (logs: $STATE_BASE/node-$i/logs, stderr: $STATE_BASE/node-$i/console.err)"
       fi
     else
       echo "node-$i: stopped"
