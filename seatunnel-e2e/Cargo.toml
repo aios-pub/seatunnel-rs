@@ -17,6 +17,11 @@ path = "tests/checkpoint_recovery.rs"
 harness = true
 
 [[test]]
+name = "server_restart_recovery"
+path = "tests/server_restart_recovery.rs"
+harness = true
+
+[[test]]
 name = "connectors_ext"
 path = "tests/connectors_ext.rs"
 harness = true
