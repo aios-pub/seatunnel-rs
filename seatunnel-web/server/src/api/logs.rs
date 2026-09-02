@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::dto::ErrorDto;
 use crate::AppState;
 
-/// A daily rolling file name, e.g. `master.2026-09-02.log` / `hybrid.2026-09-02.log`.
+/// A daily rolling file name, e.g. `master.2026-09-02` (the rolling
+/// appender joins prefix and date with a dot, no extension) or
+/// `master.2026-09-02.log`.
 fn is_log_file_name(name: &str) -> bool {
     let Some((role, rest)) = name.split_once('.') else {
         return false;
@@ -26,10 +28,7 @@ fn is_log_file_name(name: &str) -> bool {
     if !matches!(role, "master" | "worker" | "hybrid") {
         return false;
     }
-    // rest = YYYY-MM-DD.log
-    let Some((date, "log")) = rest.rsplit_once('.') else {
-        return false;
-    };
+    let date = rest.strip_suffix(".log").unwrap_or(rest);
     let bytes = date.as_bytes();
     bytes.len() == 10
         && bytes[4] == b'-'
@@ -257,16 +256,16 @@ mod tests {
 
     #[test]
     fn whitelist_rejects_traversal_and_garbage() {
-        assert!(is_log_file_name("master.2026-09-02.log"));
+        assert!(is_log_file_name("master.2026-09-02"));
         assert!(is_log_file_name("hybrid.2026-01-01.log"));
-        assert!(is_log_file_name("worker.2026-12-31.log"));
+        assert!(is_log_file_name("worker.2026-12-31"));
         // Calendar validity is not checked — only the file-name shape.
-        assert!(is_log_file_name("master.2026-13-99.log"));
+        assert!(is_log_file_name("master.2026-13-99"));
         assert!(!is_log_file_name("../../../etc/passwd"));
         assert!(!is_log_file_name(".."));
         assert!(!is_log_file_name("raft"));
         assert!(!is_log_file_name("state.json"));
-        assert!(!is_log_file_name("evil.2026-09-02.log")); // unknown role
-        assert!(!is_log_file_name("master.2026-09-02.log.bak"));
+        assert!(!is_log_file_name("evil.2026-09-02")); // unknown role
+        assert!(!is_log_file_name("master.2026-09-02.bak"));
     }
 }

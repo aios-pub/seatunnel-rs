@@ -138,13 +138,19 @@ All endpoints are JSON under `/api/v1`:
 | GET | `/api/v1/health` | Web liveness + master reachability probe |
 | GET | `/api/v1/overview` | Job counts by state + cluster summary |
 | GET | `/api/v1/jobs` | List jobs (newest first) |
-| GET | `/api/v1/jobs/{id}` | Job status incl. tasks and checkpoint counters |
+| GET | `/api/v1/jobs/{id}` | Job status incl. parallelism, per-task errors and checkpoint counters |
 | POST | `/api/v1/jobs` | Submit a job config |
 | POST | `/api/v1/jobs/{id}/cancel` | Cancel a job |
 | POST | `/api/v1/jobs/{id}/restart` | Restart a historical job (same id + retained config; checkpoint restore) |
+| DELETE | `/api/v1/jobs/{id}` | Delete a TERMINAL job from history (state + checkpoint metadata) |
 | GET | `/api/v1/jobs/{id}/checkpoints` | Checkpoint history metadata |
 | GET | `/api/v1/jobs/{id}/logs` | Per-task live log lines |
-| GET | `/api/v1/cluster` | Workers and leader info |
+| GET | `/api/v1/jobs/{id}/history` | Console-side sampled throughput/sink-latency series for the charts |
+| GET | `/api/v1/cluster` | Workers (incl. cpu, owned task ids) and leader info |
+| GET | `/api/v1/cluster/workers/{worker_id}` | Worker drill-down: the task summaries this worker owns |
+| GET | `/api/v1/cluster/history` | Console-side sampled worker load/memory/cpu series |
+| GET | `/api/v1/logs/files` | Node's daily rolling log files (`--log-dir` required) |
+| GET | `/api/v1/logs/files/{name}?tail=&level=&q=&download=1` | Filtered tail of one log file (raw attachment with `download=1`) |
 | GET | `/metrics` | Prometheus exposition |
 
 Submit body:
@@ -172,6 +178,32 @@ a background poller (default 5 s, `--refresh-interval-secs`).
 Throughput and idle are derived server-side from consecutive reads;
 workers ship record counters, the last-record timestamp and incremental
 log lines with each 2 s heartbeat.
+
+## Console features
+
+- **Bilingual UI** — the console ships English and 中文 dictionaries with a
+  topbar language toggle (persisted to localStorage, browser language as
+  the default).
+- **Charts** — the job detail page plots per-task throughput and sink
+  latency; the cluster page plots per-worker load/memory/CPU. Series come
+  from the console's own sampling ring (default 240 samples at the 5 s
+  refresh interval ≈ 20 minutes; `--history-points` on the standalone
+  binary). The ring lives in the console process: it restarts empty.
+- **Job management** — filter by state, search by name/ID, sort, paginate
+  (50/page), multi-select batch stop, submit from text or file (format
+  auto-detected, JSON pre-checked client-side), stop (final checkpoint =
+  savepoint semantics), delete terminal jobs from history, restart or
+  edit-and-restart with checkpoint restore.
+- **Cluster** — worker table with CPU column and leader badge, Masters
+  (raft members) panel, worker drill-down page with the tasks a worker
+  owns.
+- **Node logs** — the Logs page lists and tails the node's daily rolling
+  log files with level/substring filters and download. The embedded
+  console derives the directory from the engine's `--log-dir`
+  automatically; the standalone `seatunnel-web` binary takes the same
+  flag.
+- **Dark mode** — topbar toggle, persisted; the whole palette is themed
+  via CSS variables.
 
 ## Streaming demo
 
