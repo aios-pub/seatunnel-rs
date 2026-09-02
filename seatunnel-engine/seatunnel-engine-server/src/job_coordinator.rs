@@ -79,7 +79,7 @@ impl JobState {
         match self {
             JobState::Created => 1,
             JobState::Scheduled => 2,
-            JobState::Deploying => 2,
+            JobState::Deploying => 7,
             JobState::Running => 3,
             JobState::Completed => 4,
             JobState::Failed { .. } => 5,
@@ -216,6 +216,13 @@ pub enum Command {
     CancelJob {
         job_id: String,
         at_ms: i64,
+    },
+    /// Remove a TERMINAL job from history (console delete): state, pending
+    /// checkpoint bookkeeping and retained checkpoint metadata. Applied
+    /// only when the job is still terminal at apply time, so a concurrent
+    /// restart wins over a stale delete.
+    DropJob {
+        job_id: String,
     },
     /// A task lifecycle transition rolled up to job state.
     TaskStatus {
@@ -1552,6 +1559,23 @@ impl JobCoordinator {
                 }
                 CommandResult::Ok
             }
+            Command::DropJob { job_id } => {
+                let removed = {
+                    let mut jobs = self.jobs.write();
+                    match jobs.get(job_id) {
+                        Some(job) if job.state.is_terminal() => {
+                            jobs.remove(job_id);
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if removed {
+                    info!("Job {} dropped from history", job_id);
+                    self.drop_pending_checkpoints(job_id);
+                }
+                CommandResult::Ok
+            }
             Command::TaskStatus {
                 job_id,
                 task_id,
@@ -2534,6 +2558,50 @@ mod tests {
             &live(&[("worker-0", WorkerState::Healthy)]),
         );
         assert!(claimed.iter().any(|t| t.task_id == id));
+    }
+
+    #[tokio::test]
+    async fn test_drop_job_deletes_only_terminal_jobs() {
+        let coordinator = JobCoordinator::new();
+        let config = json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks_a) = coordinator
+            .compile_and_install("jrun", "j", &config, None, &workers(1))
+            .unwrap();
+        let (_, tasks_b) = coordinator
+            .compile_and_install("jdone", "j", &config, None, &workers(1))
+            .unwrap();
+        let id_a = tasks_a[0].task_id.clone();
+        let id_b = tasks_b[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&id_a), "worker-0");
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&id_b), "worker-0");
+        coordinator.apply_command(&Command::CancelJob {
+            job_id: "jdone".to_string(),
+            at_ms: 1,
+        });
+
+        // A running job is protected: the delete is a no-op at apply time.
+        coordinator.apply_command(&Command::DropJob {
+            job_id: "jrun".to_string(),
+        });
+        assert!(coordinator.get_job("jrun").is_some());
+
+        // A terminal job is removed; the command is idempotent and unknown
+        // ids are silent no-ops (deterministic Raft replay).
+        coordinator.apply_command(&Command::DropJob {
+            job_id: "jdone".to_string(),
+        });
+        assert!(coordinator.get_job("jdone").is_none());
+        coordinator.apply_command(&Command::DropJob {
+            job_id: "jdone".to_string(),
+        });
+        coordinator.apply_command(&Command::DropJob {
+            job_id: "ghost".to_string(),
+        });
+        assert!(coordinator.get_job("jrun").is_some());
     }
 
     #[test]

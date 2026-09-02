@@ -24,8 +24,8 @@ use crate::job_coordinator::{Command, JobCoordinator};
 use crate::master::{MasterInfo, WorkerRegistry, registry_snapshot_admission};
 use crate::raft::WritePath;
 use seatunnel_engine_comm::{
-    CancelJobRequest, CheckpointEntry, ClusterInfo, Empty, JobCheckpointHistory, JobList, JobLogs,
-    JobStatus, JobStatusRequest, JobSummary, RestartJobRequest, SubmitJobRequest,
+    CancelJobRequest, CheckpointEntry, ClusterInfo, DeleteJobRequest, Empty, JobCheckpointHistory,
+    JobList, JobLogs, JobStatus, JobStatusRequest, JobSummary, RestartJobRequest, SubmitJobRequest,
     SubmitJobResponse, TaskCheckpointHistory, TaskLogs, WorkerInfo,
 };
 use std::collections::HashMap;
@@ -108,17 +108,25 @@ impl ClientHandler {
     }
 
     fn worker_infos(&self) -> Vec<WorkerInfo> {
-        // Live per-worker running-task counts from the coordinator's
-        // view of assignments.
+        // Live per-worker task ownership from the coordinator's view:
+        // counts for the summary, ids for the console's drill-down.
         let mut running_per_worker: HashMap<String, i32> = HashMap::new();
+        let mut tasks_per_worker: HashMap<String, Vec<String>> = HashMap::new();
         for job in self.coordinator.list_jobs() {
             for info in job.tasks.values() {
-                if info.state == crate::job_coordinator::JobState::Running
-                    && !info.worker_id.is_empty()
+                if matches!(
+                    info.state,
+                    crate::job_coordinator::JobState::Running
+                        | crate::job_coordinator::JobState::Deploying
+                ) && !info.worker_id.is_empty()
                 {
                     *running_per_worker
                         .entry(info.worker_id.clone())
                         .or_default() += 1;
+                    tasks_per_worker
+                        .entry(info.worker_id.clone())
+                        .or_default()
+                        .push(info.task_id.clone());
                 }
             }
         }
@@ -135,6 +143,8 @@ impl ClientHandler {
                 lag_ms: e.lag_ms,
                 mem_permille: e.mem_permille,
                 can_accept: e.can_accept,
+                cpu_permille: e.cpu_permille,
+                task_ids: tasks_per_worker.remove(id).unwrap_or_default(),
                 ..Default::default()
             })
             .collect()
@@ -348,6 +358,45 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
         }))
     }
 
+    /// Delete a TERMINAL job from history: state, pending checkpoint
+    /// bookkeeping and retained checkpoint metadata. Deleting a
+    /// non-terminal job is rejected — cancel it first.
+    async fn delete_job(
+        &self,
+        request: Request<DeleteJobRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        self.require_leader()?;
+
+        let job = self
+            .coordinator
+            .get_job(&job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+        if !job.state.is_terminal() {
+            return Err(Status::failed_precondition(format!(
+                "job {} is {} — cancel it before deleting",
+                job_id,
+                job.state.to_wire()
+            )));
+        }
+
+        self.writes
+            .propose(crate::job_coordinator::Command::DropJob {
+                job_id: job_id.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("drop job proposal failed: {}", e)))?;
+        // Retained checkpoint payloads/metadata are not part of the Raft
+        // command; purge them locally (a failover node replays the drop
+        // and cleans its own copies with the same RPC if any remain).
+        self.coordinator.checkpoint_store().drop_job(&job_id).await;
+
+        tracing::info!("Job {} deleted from history", job_id);
+        Ok(Response::new(Empty {}))
+    }
+
     async fn get_job_status(
         &self,
         request: Request<JobStatusRequest>,
@@ -380,6 +429,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 last_record_at: info.last_record_at,
                 worker_id: info.worker_id.clone(),
                 sink_metrics: info.sink_metrics.as_ref().map(|m| m.into()),
+                error: info.error.clone().unwrap_or_default(),
             })
             .collect();
         tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
@@ -395,6 +445,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             checkpoint_interval_ms: job.checkpoint_interval_ms as i64,
             checkpoints_completed: job.checkpoints_completed as i64,
             job_config: job.raw_config.clone(),
+            parallelism: job.parallelism as i32,
         }))
     }
 
@@ -434,6 +485,7 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
             term: self.coordinator.term(),
             leader_address,
             role: self.info.role.clone(),
+            raft_members: self.writes.raft_members(),
         }))
     }
 

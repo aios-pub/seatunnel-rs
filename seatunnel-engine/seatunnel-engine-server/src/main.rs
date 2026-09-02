@@ -1029,8 +1029,7 @@ async fn run_worker(
                 }
 
                 let tasks = worker.heartbeat_tasks().await;
-                let (load_score, lag_ms, mem_permille, can_accept) =
-                    worker.admission_fields().await;
+                let admission = worker.admission_fields().await;
                 let hb = HeartbeatRequest {
                     worker_id: worker_id.clone(),
                     address: addr.clone(),
@@ -1044,10 +1043,11 @@ async fn run_worker(
                     // worker-initiated (NAT-friendly).
                     wait_ms: interval_ms as i64,
                     // Dynamic admission signals (measured pressure).
-                    load_score,
-                    lag_ms,
-                    mem_permille,
-                    can_accept,
+                    load_score: admission.load_score,
+                    lag_ms: admission.lag_ms,
+                    mem_permille: admission.mem_permille,
+                    cpu_permille: admission.cpu_permille,
+                    can_accept: admission.can_accept,
                 };
 
                 // Long-poll budget + slack; a request that never returns

@@ -13,8 +13,9 @@ pub use update::{UpdateOptions, UpdateOutcome, update_job};
 
 use reqwest::Client as HttpClient;
 use seatunnel_engine_comm::{
-    CancelJobRequest, ClientServiceClient, ClusterInfo, JobCheckpointHistory, JobList, JobLogs,
-    JobStatus, JobStatusRequest, RestartJobRequest, SubmitJobRequest, SubmitJobResponse,
+    CancelJobRequest, ClientServiceClient, ClusterInfo, DeleteJobRequest, JobCheckpointHistory,
+    JobList, JobLogs, JobStatus, JobStatusRequest, RestartJobRequest, SubmitJobRequest,
+    SubmitJobResponse,
 };
 use tonic::Request;
 use tracing::info;
@@ -212,6 +213,21 @@ impl EngineClient {
             .await?;
         info!("Job {} restarted: {}", job_id, response.message);
         Ok(response)
+    }
+
+    /// Delete a TERMINAL job from history (state + checkpoint metadata).
+    /// Follows the leader hint like the other mutating RPCs; the server
+    /// rejects deleting a non-terminal job.
+    pub async fn delete_job(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = DeleteJobRequest {
+            job_id: job_id.to_string(),
+        };
+        self.with_leader_follow("delete", job_id, request, |mut client, request| async move {
+            client.delete_job(Request::new(request)).await.map(|_| ())
+        })
+        .await?;
+        info!("Job {} deleted", job_id);
+        Ok(())
     }
 
     /// Run a mutating RPC against the configured masters, following the

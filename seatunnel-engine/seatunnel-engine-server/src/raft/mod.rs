@@ -223,6 +223,12 @@ pub trait WritePath: Send + Sync {
     fn leader_hint(&self) -> String {
         String::new()
     }
+
+    /// Known raft member addresses (master/hybrid nodes) for the console's
+    /// HA view. Empty when membership is not tracked (DirectWrite).
+    fn raft_members(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// In-process write path: apply immediately (tests, embedded setups).
@@ -288,6 +294,17 @@ impl WritePath for RaftWrite {
                 .unwrap_or_default(),
             _ => String::new(),
         }
+    }
+
+    fn raft_members(&self) -> Vec<String> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(_, node)| node.addr.clone())
+            .collect()
     }
 }
 

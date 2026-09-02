@@ -43,6 +43,21 @@ use seatunnel_engine_core::state::TaskState;
 use seatunnel_engine_core::task_group::TaskGroup;
 use seatunnel_engine_core::{TaskStatus, now_millis};
 
+/// Admission signals snapshot shipped with every heartbeat/registration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionFields {
+    /// Overall pressure 0..1000 (per-mille).
+    pub load_score: u32,
+    /// Event-loop lag EMA (ms).
+    pub lag_ms: u32,
+    /// RSS over usable memory (per-mille).
+    pub mem_permille: u32,
+    /// Host CPU usage (per-mille, display only).
+    pub cpu_permille: u32,
+    /// False while over a pressure watermark.
+    pub can_accept: bool,
+}
+
 use crate::admission::{AdmissionController, AdmissionSignals};
 use crate::state_store::LocalStateStore;
 
@@ -168,17 +183,17 @@ impl WorkerNode {
         self
     }
 
-    /// Admission snapshot for heartbeats/registration:
-    /// (load_score_permille, lag_ms, mem_permille, can_accept).
-    pub async fn admission_fields(&self) -> (u32, u32, u32, bool) {
+    /// Admission snapshot for heartbeats/registration.
+    pub async fn admission_fields(&self) -> AdmissionFields {
         let decision = self.admission.decision();
         let signals = self.admission.signals();
-        (
-            decision.load_score_permille,
-            signals.lag_ms.unwrap_or(0).min(u32::MAX as u64) as u32,
-            signals.mem_permille.unwrap_or(0),
-            decision.can_accept,
-        )
+        AdmissionFields {
+            load_score: decision.load_score_permille,
+            lag_ms: signals.lag_ms.unwrap_or(0).min(u32::MAX as u64) as u32,
+            mem_permille: signals.mem_permille.unwrap_or(0),
+            cpu_permille: signals.cpu_permille.unwrap_or(0),
+            can_accept: decision.can_accept,
+        }
     }
 
     /// Test hook: inject admission signals into the manual controller.

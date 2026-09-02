@@ -31,12 +31,12 @@ pub use generated::raft_service_client::RaftServiceClient;
 pub use generated::raft_service_server::{RaftService, RaftServiceServer};
 pub use generated::{
     CancelJobRequest, CheckpointEntry, CheckpointPhase, CheckpointReport, CheckpointResolution,
-    CheckpointTrigger, ClusterInfo, Empty, FetchCheckpointRequest, FetchCheckpointResponse,
-    HeartbeatRequest, HeartbeatResponse, JobCheckpointHistory, JobList, JobLogs, JobStatus,
-    JobStatusRequest, JobSummary, RestartJobRequest, SinkMetricsStats, SubmitJobRequest,
-    SubmitJobResponse, TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat, TaskLogs,
-    TaskStatusInfo, TaskStatusReport, UnregisterWorkerRequest, WorkerInfo, WorkerRegistration,
-    WorkerRegistrationResponse,
+    CheckpointTrigger, ClusterInfo, DeleteJobRequest, Empty, FetchCheckpointRequest,
+    FetchCheckpointResponse, HeartbeatRequest, HeartbeatResponse, JobCheckpointHistory, JobList,
+    JobLogs, JobStatus, JobStatusRequest, JobSummary, RestartJobRequest, SinkMetricsStats,
+    SubmitJobRequest, SubmitJobResponse, TaskCheckpointHistory, TaskDescriptor, TaskHeartbeat,
+    TaskLogs, TaskStatusInfo, TaskStatusReport, UnregisterWorkerRequest, WorkerInfo,
+    WorkerRegistration, WorkerRegistrationResponse,
 };
 
 use seatunnel_api::sink::SinkMetricsSnapshot;

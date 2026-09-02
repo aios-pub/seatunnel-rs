@@ -67,6 +67,9 @@ pub struct AdmissionSignals {
     pub lag_ms: Option<u64>,
     /// Process RSS over usable memory, per-mille (None when unknown).
     pub mem_permille: Option<u32>,
+    /// Host CPU usage, per-mille 0..1000 (None before the first sample;
+    /// display signal, not admission-scored).
+    pub cpu_permille: Option<u32>,
 }
 
 impl AdmissionSignals {
@@ -170,56 +173,54 @@ fn ratio(value: f64, threshold: f64) -> f64 {
 }
 
 /// Shared, lock-free signal store the samplers write and the heartbeat
-/// reads. Packed as (lag_ms << 32) | mem_permille; a set-but-zero payload
-/// distinguishes "measured zero" from "never measured".
+/// reads. All three fields are optional, so each has a presence bit and a
+/// dedicated bit range in the packed word (in-process only: both sides of
+/// the wire ship in the same binary):
+///   bit 62 = lag present    | bits 0..31  = lag ms (clamped to u32)
+///   bit 61 = mem present    | bits 32..46 = mem per-mille
+///   bit 60 = cpu present    | bits 47..57 = cpu per-mille
+/// The all-zero word means "never measured".
 #[derive(Clone, Default)]
 pub struct SharedSignals(Arc<AtomicU64>);
 
-const NO_SAMPLE: u64 = 1;
+const NO_SAMPLE: u64 = 0;
+const LAG_PRESENT: u64 = 1 << 62;
+const MEM_PRESENT: u64 = 1 << 61;
+const CPU_PRESENT: u64 = 1 << 60;
 
 impl SharedSignals {
     pub fn new() -> Self {
         SharedSignals(Arc::new(AtomicU64::new(NO_SAMPLE)))
     }
 
-    fn pack(lag: Option<u64>, mem: Option<u32>) -> u64 {
-        match (lag, mem) {
-            (Some(l), Some(m)) => {
-                ((l.min(u32::MAX as u64) as u64) << 32) | (m.min(1000) as u64 + 1)
-            }
-            (Some(l), None) => ((l.min(u32::MAX as u64) as u64) << 32) | NO_SAMPLE | (1 << 63),
-            (None, Some(m)) => ((1 << 31) | NO_SAMPLE) | m as u64 + 1,
-            (None, None) => NO_SAMPLE,
+    fn pack(signals: &AdmissionSignals) -> u64 {
+        let mut raw = NO_SAMPLE;
+        if let Some(l) = signals.lag_ms {
+            raw |= LAG_PRESENT | l.min(u32::MAX as u64);
         }
+        if let Some(m) = signals.mem_permille {
+            raw |= MEM_PRESENT | ((m.min(1000) as u64) << 32);
+        }
+        if let Some(c) = signals.cpu_permille {
+            raw |= CPU_PRESENT | ((c.min(1000) as u64) << 47);
+        }
+        raw
     }
 
     fn unpack(raw: u64) -> AdmissionSignals {
         if raw == NO_SAMPLE {
             return AdmissionSignals::default();
         }
-        let lag = if raw & (1 << 31) != 0 {
-            None
-        } else {
-            Some((raw >> 32) & 0x7fff_ffff)
-        };
-        let mem = if raw & (1 << 63) != 0 {
-            None
-        } else {
-            let m = (raw & 0xffff_ffff).saturating_sub(1);
-            if m > 1000 { None } else { Some(m as u32) }
-        };
         AdmissionSignals {
-            lag_ms: lag,
-            mem_permille: mem,
+            lag_ms: (raw & LAG_PRESENT != 0).then_some(raw & 0xffff_ffff),
+            mem_permille: (raw & MEM_PRESENT != 0).then_some(((raw >> 32) & 0x7fff) as u32),
+            cpu_permille: (raw & CPU_PRESENT != 0).then_some(((raw >> 47) & 0x7ff) as u32),
         }
     }
 
     /// Publish the latest signals (samplers call this).
     pub fn store(&self, signals: &AdmissionSignals) {
-        self.0.store(
-            Self::pack(signals.lag_ms, signals.mem_permille),
-            Ordering::Relaxed,
-        );
+        self.0.store(Self::pack(signals), Ordering::Relaxed);
     }
 
     /// Read the latest signals.
@@ -252,7 +253,10 @@ pub fn spawn_samplers(signals: SharedSignals, config: AdmissionConfig) {
         }
     });
 
-    // Memory sampler (only when the watermark is enabled).
+    // Memory sampler (only when the watermark is enabled). Clones the
+    // signal handle for the CPU sampler below BEFORE this async move
+    // block captures the original.
+    let signals_for_cpu = signals.clone();
     if config.memory_watermark_percent > 0 {
         tokio::spawn(async move {
             let mut sys = sysinfo::System::new();
@@ -279,6 +283,21 @@ pub fn spawn_samplers(signals: SharedSignals, config: AdmissionConfig) {
             }
         });
     }
+
+    // Host CPU sampler (display signal for the console; never scored).
+    // sysinfo needs two refreshes with a gap to produce a usage reading.
+    tokio::spawn(async move {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_usage();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sys.refresh_cpu_usage();
+            let usage = sys.global_cpu_usage().clamp(0.0, 100.0);
+            let mut fresh = signals_for_cpu.load();
+            fresh.cpu_permille = Some((usage * 10.0).round() as u32);
+            signals_for_cpu.store(&fresh);
+        }
+    });
 }
 
 /// Per-worker admission controller: signals + hysteresis state.
@@ -343,7 +362,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(50),
                 mem_permille: Some(300),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             1,
@@ -359,7 +378,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(900),
                 mem_permille: Some(300),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             1,
@@ -374,7 +393,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(10),
                 mem_permille: Some(800),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             1,
@@ -390,7 +409,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(900),
                 mem_permille: Some(300),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             1,
@@ -400,7 +419,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(50),
                 mem_permille: Some(300),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             5,
@@ -411,7 +430,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(50),
                 mem_permille: Some(300),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             5,
@@ -431,7 +450,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(60_000),
                 mem_permille: Some(999),
-            },
+                cpu_permille: None,            },
             &config,
             &mut state,
             1,
@@ -455,7 +474,7 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(250),
                 mem_permille: Some(300),
-            },
+                cpu_permille: None,            },
             &cfg(),
             &mut state,
             1,
@@ -470,19 +489,23 @@ mod tests {
         s.store(&AdmissionSignals {
             lag_ms: Some(123),
             mem_permille: Some(456),
+            cpu_permille: Some(789),
         });
         assert_eq!(
             s.load(),
             AdmissionSignals {
                 lag_ms: Some(123),
-                mem_permille: Some(456)
+                mem_permille: Some(456),
+                cpu_permille: Some(789),
             }
         );
         s.store(&AdmissionSignals {
             lag_ms: Some(7),
             mem_permille: None,
+            cpu_permille: Some(10),
         });
         assert_eq!(s.load().lag_ms, Some(7));
         assert_eq!(s.load().mem_permille, None);
+        assert_eq!(s.load().cpu_permille, Some(10));
     }
 }

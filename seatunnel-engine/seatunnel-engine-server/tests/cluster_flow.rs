@@ -128,7 +128,7 @@ async fn spawn_worker_named(master_addr: &str, worker_id: &str) -> anyhow::Resul
         loop {
             tick.tick().await;
             let tasks = hb_worker.heartbeat_tasks().await;
-            let (load_score, lag_ms, mem_permille, can_accept) = hb_worker.admission_fields().await;
+            let admission = hb_worker.admission_fields().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
                     worker_id: hb_worker_id.clone(),
@@ -137,10 +137,11 @@ async fn spawn_worker_named(master_addr: &str, worker_id: &str) -> anyhow::Resul
                     tasks,
                     term: hb_worker.term(),
                     wait_ms: 0,
-                    load_score,
-                    lag_ms,
-                    mem_permille,
-                    can_accept,
+                    load_score: admission.load_score,
+                    lag_ms: admission.lag_ms,
+                    mem_permille: admission.mem_permille,
+                    cpu_permille: admission.cpu_permille,
+                    can_accept: admission.can_accept,
                 })
                 .await
             else {
@@ -357,6 +358,7 @@ async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
     let overloaded = seatunnel_engine_server::admission::AdmissionSignals {
         lag_ms: Some(900),
         mem_permille: Some(100),
+        cpu_permille: None,
     };
     worker_a.set_admission_signals(overloaded).await;
     worker_b.set_admission_signals(overloaded).await;
@@ -396,6 +398,7 @@ async fn overloaded_workers_pending_task_is_stolen_by_healthy_peer() {
         .set_admission_signals(seatunnel_engine_server::admission::AdmissionSignals {
             lag_ms: Some(10),
             mem_permille: Some(100),
+            cpu_permille: None,
         })
         .await;
 

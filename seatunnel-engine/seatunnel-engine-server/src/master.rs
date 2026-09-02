@@ -44,6 +44,8 @@ pub struct WorkerEntry {
     pub lag_ms: u32,
     /// RSS over usable memory (per-mille) as last reported.
     pub mem_permille: u32,
+    /// Host CPU usage (per-mille) as last reported (display signal).
+    pub cpu_permille: u32,
     /// False while the worker is over a pressure watermark: no new
     /// tasks; its PENDING tasks may be stolen by healthy peers.
     pub can_accept: bool,
@@ -58,6 +60,7 @@ impl WorkerEntry {
             load_score: 0,
             lag_ms: 0,
             mem_permille: 0,
+            cpu_permille: 0,
             can_accept: true,
         }
     }
@@ -458,6 +461,7 @@ impl MasterHandler {
                     entry.load_score = hb.load_score;
                     entry.lag_ms = hb.lag_ms;
                     entry.mem_permille = hb.mem_permille;
+                    entry.cpu_permille = hb.cpu_permille;
                     entry.can_accept = hb.can_accept;
                 }
                 None => {
@@ -467,6 +471,7 @@ impl MasterHandler {
                     entry.load_score = hb.load_score;
                     entry.lag_ms = hb.lag_ms;
                     entry.mem_permille = hb.mem_permille;
+                    entry.cpu_permille = hb.cpu_permille;
                     entry.can_accept = hb.can_accept;
                     reg.insert(worker_id.clone(), entry);
                 }
