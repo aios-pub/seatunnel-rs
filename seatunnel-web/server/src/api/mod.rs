@@ -7,15 +7,19 @@
 
 pub mod auth;
 pub mod jobs;
+pub mod logs;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+use std::collections::HashSet;
 use std::time::Instant;
 
-use crate::dto::{ClusterInfoDto, ErrorDto, HealthDto, OverviewDto};
+use crate::dto::{
+    ClusterInfoDto, ErrorDto, HealthDto, OverviewDto, WorkerDetailDto, WorkerTaskDto,
+};
 use crate::{AppState, EngineError};
 
 /// `GET /api/v1/health` — web liveness plus master reachability probe.
@@ -97,6 +101,52 @@ pub async fn cluster(State(state): State<AppState>) -> Response {
 /// time series. Web-process-local: empty until the poller has cycled.
 pub async fn cluster_history(State(state): State<AppState>) -> Response {
     Json(state.history.cluster_snapshot()).into_response()
+}
+
+/// `GET /api/v1/cluster/workers/{worker_id}` — one worker plus the task
+/// summaries it currently owns (task ids joined with job statuses).
+pub async fn worker_detail(
+    State(state): State<AppState>,
+    Path(worker_id): Path<String>,
+) -> Response {
+    let info = match state.engine.cluster_info().await {
+        Ok(info) => info,
+        Err(e) => return error_response(&e),
+    };
+    let Some(worker) = info
+        .workers
+        .into_iter()
+        .find(|w| w.worker_id == worker_id)
+    else {
+        return error_response(&EngineError::NotFound(format!(
+            "worker {} not found",
+            worker_id
+        )));
+    };
+    let owned: HashSet<String> = worker.task_ids.iter().cloned().collect();
+    let mut tasks = Vec::new();
+    if let Ok(jobs) = state.engine.list_jobs().await {
+        for job in jobs {
+            let Ok(status) = state.engine.job_status(&job.job_id).await else {
+                continue;
+            };
+            for task in status.tasks {
+                if owned.contains(&task.task_id) {
+                    tasks.push(WorkerTaskDto {
+                        job_id: status.job_id.clone(),
+                        job_name: status.job_name.clone(),
+                        task_id: task.task_id,
+                        state: task.state,
+                        processed_records: task.processed_records,
+                        records_per_sec: task.records_per_sec,
+                        idle_ms: task.idle_ms,
+                    });
+                }
+            }
+        }
+    }
+    tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    Json(WorkerDetailDto { worker, tasks }).into_response()
 }
 
 /// `GET /metrics` — Prometheus text exposition.

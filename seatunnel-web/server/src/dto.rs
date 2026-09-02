@@ -181,6 +181,27 @@ pub struct ClusterInfoDto {
     pub raft_members: Vec<String>,
 }
 
+/// One task owned by a worker, for the worker drill-down view.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerTaskDto {
+    pub job_id: String,
+    pub job_name: String,
+    pub task_id: String,
+    pub state: String,
+    pub processed_records: i64,
+    /// Records per second from consecutive samples (0 on first sight).
+    pub records_per_sec: f64,
+    /// Ms since the last record (-1 = none yet).
+    pub idle_ms: i64,
+}
+
+/// A worker with the task summaries it currently owns.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerDetailDto {
+    pub worker: WorkerDto,
+    pub tasks: Vec<WorkerTaskDto>,
+}
+
 /// One retained checkpoint of a task.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckpointEntryDto {

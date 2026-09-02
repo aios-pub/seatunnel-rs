@@ -40,6 +40,10 @@ struct Args {
     /// Retained chart samples per series (one sample per refresh cycle).
     #[arg(long, default_value_t = 240)]
     history_points: usize,
+    /// Node log directory exposed to the console's Logs page
+    /// (e.g. <state-dir>/logs of the node this console runs on).
+    #[arg(long)]
+    log_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -70,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         engine: Arc::new(EngineClient::new(&args.master)),
         metrics: Arc::new(Metrics::new()),
         history: Arc::new(seatunnel_web::History::new(args.history_points)),
+        log_dir: args.log_dir.clone(),
         master_label: args.master.clone(),
         auth: Arc::new(auth),
         task_samples: Arc::default(),

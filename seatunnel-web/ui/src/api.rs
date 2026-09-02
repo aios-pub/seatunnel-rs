@@ -455,3 +455,82 @@ pub async fn job_history(job_id: &str) -> Result<JobHistory, String> {
 pub async fn cluster_history() -> Result<ClusterHistory, String> {
     get("/cluster/history").await
 }
+
+/// One task owned by a worker (drill-down view).
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkerTaskSummary {
+    pub job_id: String,
+    pub job_name: String,
+    pub task_id: String,
+    pub state: String,
+    pub processed_records: i64,
+    pub records_per_sec: f64,
+    pub idle_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkerDetail {
+    pub worker: Worker,
+    #[serde(default)]
+    pub tasks: Vec<WorkerTaskSummary>,
+}
+
+/// One worker plus the task summaries it currently owns.
+pub async fn worker_detail(worker_id: &str) -> Result<WorkerDetail, String> {
+    get(&format!(
+        "/cluster/workers/{}",
+        js_sys::encode_uri_component(worker_id)
+    ))
+    .await
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LogFileList {
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LogContent {
+    pub name: String,
+    pub truncated: bool,
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+/// List the node's daily rolling log files (404-ish when no log dir is
+/// configured; the `error` field carries the hint).
+pub async fn log_files() -> Result<LogFileList, String> {
+    get("/logs/files").await
+}
+
+/// Tail of one log file, filtered by level and substring.
+pub async fn log_file(
+    name: &str,
+    tail: u32,
+    level: &str,
+    q: &str,
+) -> Result<LogContent, String> {
+    let mut url = format!("/logs/files/{}?tail={}", js_sys::encode_uri_component(name), tail);
+    if !level.is_empty() {
+        url.push_str(&format!("&level={}", js_sys::encode_uri_component(level)));
+    }
+    if !q.is_empty() {
+        url.push_str(&format!("&q={}", js_sys::encode_uri_component(q)));
+    }
+    get(&url).await
+}
+
+/// Browser download URL for a log file (filtered tail as attachment).
+pub fn log_file_download_url(name: &str, tail: u32, level: &str, q: &str) -> String {
+    format!(
+        "{}/logs/files/{}?tail={}&download=1&level={}&q={}",
+        BASE,
+        js_sys::encode_uri_component(name),
+        tail,
+        js_sys::encode_uri_component(level),
+        js_sys::encode_uri_component(q),
+    )
+}

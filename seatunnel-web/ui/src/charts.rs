@@ -139,7 +139,7 @@ pub fn LineChart(
                                 let label = fmt_value(f * y_max);
                                 view! {
                                     <line x1=PAD_L y1=gy x2={W - PAD_R} y2=gy
-                                        stroke="#e3e6ea" stroke-width="1" />
+                                        stroke="var(--border)" stroke-width="1" />
                                     <text x={PAD_L - 4.0} y={gy + 3.0} text-anchor="end"
                                         class="chart-tick">{label}</text>
                                 }

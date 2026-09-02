@@ -42,6 +42,9 @@ pub struct AppState {
     pub metrics: Arc<metrics::Metrics>,
     /// Time-series ring backing the console's charts.
     pub history: Arc<history::History>,
+    /// Node log directory for the online log viewer (`None` hides the
+    /// feature; the endpoints answer 404 with a hint).
+    pub log_dir: Option<String>,
     /// Display-only master address list this console is bound to.
     pub master_label: String,
     /// Login credentials and session-signing settings.
@@ -91,7 +94,13 @@ pub fn build_router(state: AppState) -> Router {
                 get(api::jobs::job_history),
             )
             .route("/api/v1/cluster", get(api::cluster))
+            .route(
+                "/api/v1/cluster/workers/{worker_id}",
+                get(api::worker_detail),
+            )
             .route("/api/v1/cluster/history", get(api::cluster_history))
+            .route("/api/v1/logs/files", get(api::logs::log_files))
+            .route("/api/v1/logs/files/{name}", get(api::logs::log_file))
             .route("/metrics", get(api::metrics))
             .fallback(assets::static_handler)
             .with_state(state.clone())
@@ -115,11 +124,13 @@ pub fn spawn_console(
     listen: String,
     master: String,
     auth: AuthConfig,
+    log_dir: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     let state = AppState {
         engine: Arc::new(seatunnel_engine_client::EngineClient::new(&master)),
         metrics: Arc::new(Metrics::new()),
         history: Arc::new(History::new(history::DEFAULT_CAPACITY)),
+        log_dir,
         master_label: master.clone(),
         auth: Arc::new(auth),
         task_samples: Arc::default(),
@@ -157,6 +168,7 @@ mod tests {
             engine: Arc::new(engine),
             metrics: Arc::new(metrics::Metrics::new()),
             history: Arc::new(history::History::new(history::DEFAULT_CAPACITY)),
+            log_dir: None,
             master_label: "127.0.0.1:5800".to_string(),
             auth: Arc::new(AuthConfig::new(
                 "admin".to_string(),
@@ -552,6 +564,68 @@ mod tests {
         let (status, body) = get_json(&state, "/api/v1/cluster/history", Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("cpu_permille"), "body: {}", body);
+    }
+
+    #[tokio::test]
+    async fn worker_detail_lists_owned_tasks() {
+        let state = test_state(FakeEngine::with_running_job());
+        let cookie = login_cookie(&state).await;
+        let (status, body) =
+            get_json(&state, "/api/v1/cluster/workers/worker-1", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("task-0"), "body: {}", body);
+        assert!(body.contains("demo"), "body: {}", body);
+        let (status, _) =
+            get_json(&state, "/api/v1/cluster/workers/nope", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn log_endpoints_serve_node_files() {
+        let mut state = test_state(FakeEngine::default());
+        let dir = std::env::temp_dir().join(format!("st-web-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("master.2026-09-02.log"),
+            "[2026-09-02 10:00:00 INFO seatunnel]: hello\n\
+             [2026-09-02 10:00:01 ERROR seatunnel]: boom\n",
+        )
+        .unwrap();
+        state.log_dir = Some(dir.to_string_lossy().to_string());
+        let cookie = login_cookie(&state).await;
+
+        let (status, body) = get_json(&state, "/api/v1/logs/files", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("master.2026-09-02.log"), "body: {}", body);
+
+        let (status, body) = get_json(
+            &state,
+            "/api/v1/logs/files/master.2026-09-02.log?level=ERROR",
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("boom"), "body: {}", body);
+        assert!(!body.contains("hello"), "level filter failed: {}", body);
+
+        // Path traversal is rejected by the file-name whitelist.
+        let (status, _) = get_json(
+            &state,
+            "/api/v1/logs/files/..%2F..%2Fetc%2Fpasswd",
+            Some(&cookie),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn log_endpoints_404_without_log_dir() {
+        let state = test_state(FakeEngine::default());
+        let cookie = login_cookie(&state).await;
+        let (status, body) = get_json(&state, "/api/v1/logs/files", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("no log directory"), "body: {}", body);
     }
 
     #[tokio::test]

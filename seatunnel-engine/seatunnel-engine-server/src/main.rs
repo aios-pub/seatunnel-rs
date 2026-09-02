@@ -144,6 +144,8 @@ struct WebConsoleArgs {
     auth_user: String,
     auth_password: Option<String>,
     auth_disable: bool,
+    /// Resolved node log directory for the console's log viewer.
+    log_dir: Option<String>,
 }
 
 /// Console auth from the `--web-auth-*` flags; mirrors the standalone
@@ -222,12 +224,21 @@ async fn main() -> anyhow::Result<()> {
         engine_config.history_job_expire_minutes
     );
 
+    // Resolve the log directory once for both file logging and the
+    // embedded console's log viewer ("--log-dir none" = stdout only).
+    let resolved_log_dir = match args.log_dir.as_deref().map(str::trim) {
+        Some(dir) if dir.eq_ignore_ascii_case("none") => None,
+        Some(dir) => Some(dir.to_string()),
+        None => Some(format!("{}/logs", engine_config.state_dir)),
+    };
+
     let web = args.web.then(|| WebConsoleArgs {
         listen: args.web_listen.clone(),
         master: args.web_master.clone(),
         auth_user: args.web_auth_user.clone(),
         auth_password: args.web_auth_password.clone(),
         auth_disable: args.web_auth_disable,
+        log_dir: resolved_log_dir,
     });
 
     match args.role.as_str() {
@@ -742,7 +753,7 @@ async fn run_master(
             .master
             .clone()
             .unwrap_or_else(|| advertise_address(advertise, &serving.local_addr));
-        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web));
+        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web), web.log_dir.clone());
     }
     let shutdown = serving.shutdown;
     tokio::select! {
@@ -781,7 +792,7 @@ async fn run_hybrid(
             .master
             .clone()
             .unwrap_or_else(|| format!("127.0.0.1:{}", serving.local_addr.port()));
-        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web));
+        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web), web.log_dir.clone());
     }
     tracing::info!(
         "Hybrid node: coordinator at {} + in-process worker '{}'",
@@ -866,7 +877,7 @@ async fn run_worker(
     // list so it fails over together with the heartbeat loop.
     if let Some(web) = web {
         let endpoint = web.master.clone().unwrap_or_else(|| master_list.join(","));
-        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web));
+        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web), web.log_dir.clone());
     }
 
     // Worker advertise address: --addr > config worker.address > default.

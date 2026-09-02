@@ -11,6 +11,25 @@
   --primary: #2563eb;
   --sidebar: #101828;
   --sidebar-text: #cdd3de;
+  --thead-bg: #f9fafb;
+  --input-bg: #ffffff;
+  --row-hover: #fafbfc;
+  --chip-bg: #eef2f7;
+}
+
+/* Dark theme: variable overrides only; components keep using the vars. */
+html[data-theme="dark"] {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --sidebar: #010409;
+  --sidebar-text: #cdd3de;
+  --thead-bg: #1c2129;
+  --input-bg: #0d1117;
+  --row-hover: #1c2129;
+  --chip-bg: #21262d;
 }
 
 html, body {
@@ -122,10 +141,10 @@ th, td {
   white-space: nowrap;
 }
 
-thead th { background: #f9fafb; }
+thead th { background: var(--thead-bg); }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
 tr:last-child td { border-bottom: none; }
-tr:hover td { background: #fafbfc; }
+tr:hover td { background: var(--row-hover); }
 
 td.wrap, th.wrap { white-space: normal; }
 
@@ -175,7 +194,7 @@ input, select, textarea {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 7px 10px;
-  background: #fff;
+  background: var(--input-bg);
   color: var(--text);
 }
 
@@ -288,7 +307,7 @@ a:hover { text-decoration: underline; }
 .checkpoint-chip {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
-  background: #eef2f7;
+  background: var(--chip-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 2px 8px;
@@ -447,3 +466,5 @@ tr.row-overloaded td {
   resize: vertical;
   white-space: pre;
 }
+
+.log-tall { max-height: 460px; }

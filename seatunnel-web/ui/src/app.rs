@@ -12,7 +12,10 @@ use leptos_router::path;
 
 use crate::i18n;
 use crate::i18n::Lang;
-use crate::pages::{cluster::Cluster, job_detail::JobDetail, jobs::Jobs, login::Login, overview::Overview};
+use crate::pages::{
+    cluster::Cluster, job_detail::JobDetail, jobs::Jobs, login::Login, logs::Logs, overview::Overview,
+    worker::WorkerDetail,
+};
 use crate::ui::{push_toast, StateTag, ToastHost, ToastKind};
 
 /// Session state shared with every page.
@@ -40,6 +43,70 @@ thread_local! {
     static AUTO_REFRESH: std::cell::OnceCell<RwSignal<bool>> = const { std::cell::OnceCell::new() };
     static REFRESH_BUMP: std::cell::OnceCell<RwSignal<u64>> = const { std::cell::OnceCell::new() };
     static LAST_UPDATE: std::cell::OnceCell<RwSignal<Option<f64>>> = const { std::cell::OnceCell::new() };
+    static THEME: std::cell::OnceCell<RwSignal<Theme>> = const { std::cell::OnceCell::new() };
+}
+
+/// UI color scheme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn key(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "dark" => Theme::Dark,
+            _ => Theme::Light,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Light,
+        }
+    }
+
+    /// Icon shown on the toggle (the theme you would switch TO).
+    fn icon(self) -> &'static str {
+        match self {
+            Theme::Light => "🌙",
+            Theme::Dark => "☀️",
+        }
+    }
+}
+
+/// Global theme signal (localStorage-persisted).
+pub fn theme() -> RwSignal<Theme> {
+    THEME.with(|cell| {
+        *cell.get_or_init(|| {
+            let stored = window()
+                .local_storage()
+                .ok()
+                .flatten()
+                .and_then(|storage| storage.get_item("seatunnel_theme").ok())
+                .flatten()
+                .map(|key| Theme::from_key(&key));
+            RwSignal::new(stored.unwrap_or_default())
+        })
+    })
+}
+
+/// Switch the UI color scheme and remember the choice.
+pub fn set_theme(next: Theme) {
+    theme().set(next);
+    if let Some(storage) = window().local_storage().ok().flatten() {
+        let _ = storage.set_item("seatunnel_theme", next.key());
+    }
 }
 
 /// Create every console-wide root signal BEFORE the app mounts. Signals
@@ -51,6 +118,7 @@ pub fn init_globals() {
     let _ = refresh_bump();
     let _ = last_update();
     let _ = i18n::lang();
+    let _ = theme();
     crate::ui::init_toasts();
 }
 
@@ -129,6 +197,15 @@ pub fn App() -> impl IntoView {
     let auth = RwSignal::new(AuthStatus::Unknown);
     provide_context(AuthState(auth));
 
+    // Reflect the theme signal onto <html data-theme="..."> so the CSS
+    // variable overrides apply.
+    Effect::new(move || {
+        let key = theme().get().key();
+        if let Some(element) = document().document_element() {
+            let _ = element.set_attribute("data-theme", key);
+        }
+    });
+
     // Probe the session cookie once on startup.
     spawn_local(async move {
         match crate::api::whoami().await {
@@ -198,6 +275,7 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
                     <A href="/">{move || i18n::t("nav.overview")}</A>
                     <A href="/jobs">{move || i18n::t("nav.jobs")}</A>
                     <A href="/cluster">{move || i18n::t("nav.cluster")}</A>
+                    <A href="/logs">{move || i18n::t("nav.logs")}</A>
                 </nav>
             </div>
             <div class="content">
@@ -239,6 +317,15 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
                                         .into_any()
                                 })
                         }}
+                        <button
+                            title=move || i18n::t("topbar.theme")
+                            on:click=move |_| {
+                                let next = theme().get_untracked().other();
+                                set_theme(next);
+                            }
+                        >
+                            {move || theme().get().icon()}
+                        </button>
                         <button on:click=on_toggle_lang>
                             {move || i18n::lang().get().toggle_label()}
                         </button>
@@ -261,6 +348,8 @@ fn Shell(auth: RwSignal<AuthStatus>) -> impl IntoView {
                     <Route path=path!("/jobs") view=Jobs />
                     <Route path=path!("/jobs/:id") view=JobDetail />
                     <Route path=path!("/cluster") view=Cluster />
+                    <Route path=path!("/cluster/workers/:id") view=WorkerDetail />
+                    <Route path=path!("/logs") view=Logs />
                     <Route path=path!("/*any") view=NotFound />
                 </Routes>
             </div>
