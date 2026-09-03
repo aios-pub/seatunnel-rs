@@ -5,7 +5,7 @@
 //! dialog (config text or file) and per-row stop/delete actions.
 
 use crate::api;
-use crate::app::{mark_refreshed, use_polling};
+use crate::app::{mark_refreshed, request_refresh, use_polling};
 use crate::fmt::{fmt_duration, fmt_time};
 use crate::i18n::{lang, t, tf};
 use crate::ui::{push_toast, ConfirmDialog, ErrorBanner, Modal, StateTag, ToastKind};
@@ -358,6 +358,9 @@ pub fn Jobs() -> impl IntoView {
                                 ToastKind::Success,
                                 tf("jobs.batch_stopped", &[&stopped.to_string()]),
                             );
+                            // One refresh after the whole batch instead of
+                            // one per job.
+                            request_refresh();
                         });
                     })
                 />
@@ -384,6 +387,10 @@ fn CancelJobButton(job_id: String) -> impl IntoView {
             spawn_local(async move {
                 if let Err(err) = api::cancel_job(&job_id).await {
                     push_toast(ToastKind::Error, format!("{}: {}", t("jobs.cancel_failed"), err));
+                } else {
+                    // Show the state transition (RUNNING → CANCELLING/…)
+                    // immediately.
+                    request_refresh();
                 }
                 busy.set(false);
             });
@@ -434,6 +441,9 @@ fn DeleteJobButton(job_id: String) -> impl IntoView {
                 match api::delete_job(&job_id).await {
                     Ok(()) => {
                         push_toast(ToastKind::Success, tf("jobs.deleted", &[&job_id]));
+                        // Drop the row from the list right away instead of
+                        // waiting for the next poll tick.
+                        request_refresh();
                     }
                     Err(err) => {
                         push_toast(
@@ -555,6 +565,8 @@ fn SubmitJobDialog(show: RwSignal<bool>) -> impl IntoView {
             match api::submit_job(request).await {
                 Ok(result) => {
                     push_toast(ToastKind::Success, tf("jobs.submitted", &[&result.job_id]));
+                    // Surface the new job in the list immediately.
+                    request_refresh();
                     show.set(false);
                 }
                 Err(err) => {

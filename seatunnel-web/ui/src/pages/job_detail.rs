@@ -5,7 +5,7 @@
 //! the edit/restart flows.
 
 use crate::api;
-use crate::app::{mark_refreshed, use_polling};
+use crate::app::{mark_refreshed, request_refresh, use_polling};
 use crate::charts::{LineChart, PALETTE, Series};
 use crate::fmt::{fmt_bytes, fmt_count, fmt_duration, fmt_short_duration, fmt_time};
 use crate::i18n::{lang, t, tf};
@@ -132,6 +132,10 @@ pub fn JobDetail() -> impl IntoView {
                                 &[&result.message, &result.cancel_wait_ms.to_string()],
                             ),
                         );
+                        // Refresh the status panel right away (the state
+                        // left its previous value the moment the resubmit
+                        // landed).
+                        request_refresh();
                         set_editor_open.set(false);
                     }
                     Err(err) => push_toast(ToastKind::Error, tf("jd.update_failed", &[&err])),
@@ -151,7 +155,8 @@ pub fn JobDetail() -> impl IntoView {
             spawn_local(async move {
                 match api::restart_job(&job_id).await {
                     Ok(result) => {
-                        push_toast(ToastKind::Success, tf("jd.restarted", &[&result.message]))
+                        push_toast(ToastKind::Success, tf("jd.restarted", &[&result.message]));
+                        request_refresh();
                     }
                     Err(err) => push_toast(ToastKind::Error, tf("jd.restart_failed", &[&err])),
                 }
