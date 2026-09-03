@@ -83,6 +83,24 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Read `env.job.name` from a job config — the display name pipelines set
+/// in their config (nested `env.job.name` or the flat dotted key
+/// `env."job.name"`). Mirrors the CLI's submit/update lookup so the web
+/// console names jobs the same way when the caller left the name empty.
+pub(crate) fn env_job_name(config: &serde_json::Value) -> Option<String> {
+    let env = config.get("env")?;
+    let nested = env
+        .get("job")
+        .and_then(|job| job.get("name"))
+        .and_then(|n| n.as_str());
+    let flat = env.get("job.name").and_then(|n| n.as_str());
+    nested
+        .or(flat)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// `POST /api/v1/jobs` — validate and submit a job config to the master.
 pub async fn submit_job(
     State(state): State<AppState>,
@@ -119,12 +137,19 @@ pub async fn submit_job(
         serde_json::Value::Array(parsed.transforms),
     );
     doc.insert("sink".to_string(), serde_json::Value::Array(parsed.sinks));
-    let config_bytes = match serde_json::to_vec(&serde_json::Value::Object(doc)) {
+    let config = serde_json::Value::Object(doc);
+    let config_bytes = match serde_json::to_vec(&config) {
         Ok(bytes) => bytes,
         Err(e) => return bad_request(format!("config serialization error: {}", e)),
     };
 
     let job_id = format!("job-{}", Uuid::new_v4());
+    // Without an explicit name, the config's own `env.job.name` wins over
+    // the synthetic default (same as the CLI submit path).
+    let mut request = request;
+    if request.job_name.is_none() {
+        request.job_name = env_job_name(&config);
+    }
     match state.engine.submit_job(request, job_id, config_bytes).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => error_response(&e),
@@ -148,23 +173,33 @@ pub async fn update_job(
                 .to_string(),
         ));
     }
-    let config_bytes = match body.config_text.trim() {
+    let config = match body.config_text.trim() {
         "" => {
             return error_response(&EngineError::Invalid(
                 "config_text must not be empty".to_string(),
             ));
         }
-        text => serde_json::from_str::<serde_json::Value>(text)
-            .map_err(|e| EngineError::Invalid(format!("invalid JSON config: {}", e)))
-            .and_then(|v| serde_json::to_vec(&v).map_err(|e| EngineError::Invalid(e.to_string())))
-            .and_then(|b| Ok(b)),
+        text => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(value) => value,
+            Err(e) => return error_response(&EngineError::Invalid(format!("invalid JSON config: {}", e))),
+        },
     };
-    let config_bytes = match config_bytes {
-        Ok(b) => b,
-        Err(e) => return error_response(&e),
+    let config_bytes = match serde_json::to_vec(&config) {
+        Ok(bytes) => bytes,
+        Err(e) => return error_response(&EngineError::Invalid(e.to_string())),
     };
-    // Default the name to the job id stem when not provided.
-    let job_name = body.job_name.clone().unwrap_or_else(|| job_id.clone());
+    // Name resolution, mirroring the CLI update path: an explicit override
+    // wins, then the edited config's own `env.job.name`. When neither is
+    // present keep the name the job already has — an update changes the
+    // config, not the job's identity — and only a nameless, unknown job
+    // falls back to the job id.
+    let mut job_name = body.job_name.clone().or_else(|| env_job_name(&config));
+    if job_name.is_none() {
+        if let Ok(status) = state.engine.job_status(&job_id).await {
+            job_name = Some(status.job_name);
+        }
+    }
+    let job_name = job_name.unwrap_or_else(|| job_id.clone());
     match state
         .engine
         .update_job(
@@ -400,5 +435,37 @@ mod tests {
     fn empty_prev_sends_everything() {
         let new = lines(0, 3);
         assert_eq!(tail_delta(&[], &new), new);
+    }
+
+    #[test]
+    fn env_job_name_nested_form() {
+        let config = serde_json::json!({
+            "env": { "job": { "name": "user-role-rabbitmq" } },
+            "source": [], "sink": []
+        });
+        assert_eq!(
+            super::env_job_name(&config).as_deref(),
+            Some("user-role-rabbitmq")
+        );
+    }
+
+    #[test]
+    fn env_job_name_flat_dotted_key() {
+        // HOCON/YAML writers may emit the dotted key instead of nesting.
+        let config = serde_json::json!({
+            "env": { "job.name": "recommand" },
+            "source": [], "sink": []
+        });
+        assert_eq!(super::env_job_name(&config).as_deref(), Some("recommand"));
+    }
+
+    #[test]
+    fn env_job_name_absent_or_blank_yields_none() {
+        assert_eq!(super::env_job_name(&serde_json::json!({ "env": {} })), None);
+        assert_eq!(
+            super::env_job_name(&serde_json::json!({ "env": { "job": { "name": "  " } } })),
+            None
+        );
+        assert_eq!(super::env_job_name(&serde_json::json!({})), None);
     }
 }

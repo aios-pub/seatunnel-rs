@@ -367,6 +367,8 @@ impl EngineOps for EngineClient {
 pub struct FakeEngine {
     pub unreachable: bool,
     pub jobs: std::sync::Mutex<Vec<JobStatusDto>>,
+    /// Name passed to the most recent `update_job`, for assertions.
+    pub last_update_name: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -375,6 +377,7 @@ impl FakeEngine {
         FakeEngine {
             unreachable: true,
             jobs: std::sync::Mutex::new(Vec::new()),
+            last_update_name: std::sync::Mutex::new(None),
         }
     }
 
@@ -406,6 +409,7 @@ impl FakeEngine {
         FakeEngine {
             unreachable: false,
             jobs: std::sync::Mutex::new(vec![job]),
+            last_update_name: std::sync::Mutex::new(None),
         }
     }
 
@@ -454,7 +458,7 @@ impl EngineOps for FakeEngine {
     async fn update_job(
         &self,
         job_id: &str,
-        _job_name: &str,
+        job_name: &str,
         _config_bytes: Vec<u8>,
         _parallelism: i32,
         _cancel_timeout_secs: u64,
@@ -462,6 +466,7 @@ impl EngineOps for FakeEngine {
         if self.unreachable {
             return Err(self.err());
         }
+        *self.last_update_name.lock().unwrap() = Some(job_name.to_string());
         Ok(UpdateResultDto {
             job_id: job_id.to_string(),
             cancelled: true,

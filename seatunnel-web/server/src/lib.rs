@@ -172,8 +172,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(engine: FakeEngine) -> AppState {
+        test_state_shared(Arc::new(engine))
+    }
+
+    /// Like [`test_state`], but hands back the shared fake so tests can
+    /// assert on what the handlers passed to the engine.
+    fn test_state_shared(engine: Arc<FakeEngine>) -> AppState {
         AppState {
-            engine: Arc::new(engine),
+            engine,
             metrics: Arc::new(metrics::Metrics::new()),
             history: Arc::new(history::History::new(history::DEFAULT_CAPACITY)),
             log_dir: None,
@@ -484,6 +490,52 @@ mod tests {
         assert!(body.contains("restarted"), "body: {}", body);
     }
 
+    #[tokio::test]
+    async fn update_names_job_after_config_env_job_name() {
+        let fake = Arc::new(FakeEngine::with_running_job());
+        let state = test_state_shared(fake.clone());
+        let cookie = login_cookie(&state).await;
+        let config = serde_json::json!({
+            "env": { "job": { "name": "user-role-rabbitmq" } },
+            "source": [],
+            "sink": []
+        });
+        let (status, body) = post_json_body(
+            &state,
+            "/api/v1/jobs/job-1/update",
+            serde_json::json!({ "config_text": config.to_string() }).to_string(),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(
+            *fake.last_update_name.lock().unwrap(),
+            Some("user-role-rabbitmq".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn update_without_any_name_keeps_the_current_one() {
+        let fake = Arc::new(FakeEngine::with_running_job());
+        let state = test_state_shared(fake.clone());
+        let cookie = login_cookie(&state).await;
+        let config = serde_json::json!({ "env": {}, "source": [], "sink": [] });
+        let (status, body) = post_json_body(
+            &state,
+            "/api/v1/jobs/job-1/update",
+            serde_json::json!({ "config_text": config.to_string() }).to_string(),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        // No explicit name, no env.job.name: the job keeps its name
+        // instead of being renamed to the job id.
+        assert_eq!(
+            *fake.last_update_name.lock().unwrap(),
+            Some("demo".to_string())
+        );
+    }
+
     /// `delete_json` — DELETE with the session cookie; returns the body.
     async fn delete_json(
         state: &AppState,
@@ -504,7 +556,7 @@ mod tests {
     }
 
     fn fake_engine_with_state(state_name: &str) -> FakeEngine {
-        let mut fake = FakeEngine::default();
+        let fake = FakeEngine::default();
         fake.jobs.lock().unwrap().push(JobStatusDto {
             job_id: "job-1".to_string(),
             job_name: "demo".to_string(),

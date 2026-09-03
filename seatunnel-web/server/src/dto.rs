@@ -97,7 +97,8 @@ pub struct UpdateJobDto {
     pub config_text: String,
     /// Config format: "json" (default; the edit basis is JSON).
     pub format: Option<String>,
-    /// Optional display name override.
+    /// Optional display name override; when empty the config's
+    /// `env.job.name` is used, then the job's current name.
     pub job_name: Option<String>,
     /// Optional parallelism override; 0 = keep config value.
     pub parallelism: Option<i32>,
@@ -126,7 +127,8 @@ pub struct SubmitJobDto {
     pub config_text: String,
     /// Config format: "yaml" (default), "toml" or "hocon".
     pub format: Option<String>,
-    /// Optional display name; defaults to `job-<uuid prefix>`.
+    /// Optional display name; defaults to the config's `env.job.name`,
+    /// then `job-<uuid prefix>`.
     pub job_name: Option<String>,
     /// Optional parallelism override; 0 = use config value.
     pub parallelism: Option<i32>,

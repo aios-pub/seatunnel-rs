@@ -293,6 +293,12 @@ Confirming runs the update flow — identical to `seatunnel job update`:
    their latest checkpoint and continue from the exact source position
    (at-least-once; exactly-once with transactional sinks).
 
+The job name survives the update: an explicit `job_name` in the request
+wins, then the edited config's own `env.job.name`, and when neither is
+present the job keeps its current name (only a nameless, unknown job
+falls back to the job id). `POST /api/v1/jobs` resolves names the same
+way, falling back to a `job-<uuid prefix>` default.
+
 The request may take up to the cancel timeout (~seconds normally); the
 page shows the progress message while it runs and the status panel
 refreshes automatically afterwards.

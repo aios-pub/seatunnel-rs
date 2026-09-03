@@ -10,7 +10,7 @@
 //! web-process-local: it resets when the console restarts.
 
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 /// Default retained samples per series (240 × 5s poll ≈ 20 minutes).
 pub const DEFAULT_CAPACITY: usize = 240;
