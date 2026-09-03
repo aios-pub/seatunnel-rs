@@ -5,10 +5,14 @@
 
 //! Job management handlers.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures::stream::Stream;
 use uuid::Uuid;
 
 use crate::api::error_response;
@@ -244,4 +248,157 @@ fn parse_format(value: Option<&str>) -> Result<seatunnel_config::ConfigFormat, S
 
 fn bad_request(message: String) -> Response {
     error_response(&EngineError::Invalid(message))
+}
+
+// --- Live log stream (SSE) ---------------------------------------------------
+
+/// Server-side poll cadence for the log stream: the engine itself ships
+/// task logs with 2 s heartbeats, so 1 s here bounds console latency to
+/// roughly the engine's own granularity.
+const LOG_STREAM_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Per-cycle gRPC budget; a hung master skips the cycle instead of
+/// wedging the stream.
+const LOG_STREAM_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Total stream lifetime; the browser's EventSource reconnects and
+/// receives a fresh full snapshot.
+const LOG_STREAM_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// One streamed log update for a task: the new lines since the previous
+/// event (`reset` = replace whatever the client has).
+#[derive(serde::Serialize)]
+struct TaskLogDelta {
+    task_id: String,
+    lines: Vec<String>,
+    reset: bool,
+}
+
+/// Largest-overlap delta between the previously seen tail and the current
+/// ring tail: returns `k` such that `new[..k] == prev[prev.len()-k..]` and
+/// the new lines are `new[k..]`. Plain appends give `k = prev.len()`; a
+/// ring-buffer shift still yields exactly the freshly appended lines.
+/// Complexity is bounded by the 500-line ring, and it only runs when the
+/// content changed.
+fn tail_delta<'a>(prev: &[String], new: &'a [String]) -> &'a [String] {
+    if prev.is_empty() {
+        return new;
+    }
+    let max_overlap = prev.len().min(new.len());
+    for k in (0..=max_overlap).rev() {
+        if new[..k] == prev[prev.len() - k..] {
+            return &new[k..];
+        }
+    }
+    new
+}
+
+fn sse_error_event(message: &str) -> Event {
+    Event::default().data(serde_json::json!({ "error": message }).to_string())
+}
+
+/// `GET /api/v1/jobs/{job_id}/logs/stream` — Server-Sent Events stream of
+/// per-task log deltas (the live-log viewer's transport). Ends after
+/// `LOG_STREAM_MAX_LIFETIME`; the browser reconnects automatically and the
+/// first event of every connection is a full snapshot.
+pub async fn job_logs_stream(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let engine = state.engine.clone();
+    let stream = async_stream::stream! {
+        yield Ok(Event::default().retry(std::time::Duration::from_secs(2)));
+        let mut prev: HashMap<String, Vec<String>> = HashMap::new();
+        let started = tokio::time::Instant::now();
+        loop {
+            if started.elapsed() > LOG_STREAM_MAX_LIFETIME {
+                break;
+            }
+            tokio::time::sleep(LOG_STREAM_POLL).await;
+            let logs = match tokio::time::timeout(
+                LOG_STREAM_RPC_TIMEOUT,
+                engine.job_logs(&job_id),
+            )
+            .await
+            {
+                Ok(Ok(logs)) => logs,
+                Ok(Err(EngineError::NotFound(msg))) => {
+                    // Job finished/evicted: logs are final, end the stream.
+                    yield Ok(sse_error_event(&format!("stream closed: {msg}")));
+                    break;
+                }
+                Ok(Err(e)) => {
+                    yield Ok(sse_error_event(&e.to_string()));
+                    continue;
+                }
+                Err(_) => {
+                    yield Ok(sse_error_event("engine read timed out"));
+                    continue;
+                }
+            };
+            for task in &logs.tasks {
+                let previous = prev.get(&task.task_id).map(|v| v.as_slice()).unwrap_or(&[]);
+                let delta = tail_delta(previous, &task.lines);
+                if delta.is_empty() && !previous.is_empty() {
+                    continue;
+                }
+                let reset = previous.is_empty() || delta.len() == task.lines.len();
+                prev.insert(task.task_id.clone(), task.lines.clone());
+                if delta.is_empty() {
+                    continue;
+                }
+                let event = TaskLogDelta {
+                    task_id: task.task_id.clone(),
+                    lines: delta.to_vec(),
+                    reset,
+                };
+                yield Ok(Event::default().data(
+                    serde_json::to_string(&event).unwrap_or_default(),
+                ));
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_delta;
+
+    fn lines(start: usize, count: usize) -> Vec<String> {
+        (start..start + count).map(|i| format!("line-{i}")).collect()
+    }
+
+    #[test]
+    fn plain_append_yields_only_new_lines() {
+        let prev = lines(0, 10);
+        let new = lines(0, 15);
+        assert_eq!(tail_delta(&prev, &new), lines(10, 5));
+    }
+
+    #[test]
+    fn no_change_yields_empty() {
+        let prev = lines(0, 10);
+        assert!(tail_delta(&prev, &prev.clone()).is_empty());
+    }
+
+    #[test]
+    fn ring_shift_yields_shifted_in_lines() {
+        // 500-cap ring: 5 new lines push 5 old ones out.
+        let prev = lines(0, 100);
+        let mut new = lines(5, 95);
+        new.extend(lines(100, 5));
+        assert_eq!(tail_delta(&prev, &new), lines(100, 5));
+    }
+
+    #[test]
+    fn full_rewrite_sends_everything() {
+        let prev = lines(0, 10);
+        let new = lines(1000, 10);
+        assert_eq!(tail_delta(&prev, &new), new);
+    }
+
+    #[test]
+    fn empty_prev_sends_everything() {
+        let new = lines(0, 3);
+        assert_eq!(tail_delta(&[], &new), new);
+    }
 }

@@ -1227,6 +1227,7 @@ dependencies = [
  "js-sys",
  "leptos",
  "leptos_router",
+ "send_wrapper",
  "serde",
  "serde_json",
  "wasm-bindgen",

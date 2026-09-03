@@ -145,12 +145,14 @@ All endpoints are JSON under `/api/v1`:
 | DELETE | `/api/v1/jobs/{id}` | Delete a TERMINAL job from history (state + checkpoint metadata) |
 | GET | `/api/v1/jobs/{id}/checkpoints` | Checkpoint history metadata |
 | GET | `/api/v1/jobs/{id}/logs` | Per-task live log lines |
+| GET | `/api/v1/jobs/{id}/logs/stream` | SSE stream of per-task log deltas (~1 s cadence; full snapshot on connect) |
 | GET | `/api/v1/jobs/{id}/history` | Console-side sampled throughput/sink-latency series for the charts |
 | GET | `/api/v1/cluster` | Workers (incl. cpu, owned task ids) and leader info |
 | GET | `/api/v1/cluster/workers/{worker_id}` | Worker drill-down: the task summaries this worker owns |
 | GET | `/api/v1/cluster/history` | Console-side sampled worker load/memory/cpu series |
 | GET | `/api/v1/logs/files` | Node's daily rolling log files (`--log-dir` required) |
 | GET | `/api/v1/logs/files/{name}?tail=&level=&q=&download=1` | Filtered tail of one log file (raw attachment with `download=1`) |
+| GET | `/api/v1/logs/files/{name}/stream?level=&q=&tail=` | SSE tail of one log file: initial snapshot, then only new lines |
 | GET | `/metrics` | Prometheus exposition |
 
 Submit body:
@@ -197,11 +199,17 @@ log lines with each 2 s heartbeat.
 - **Cluster** — worker table with CPU column and leader badge, Masters
   (raft members) panel, worker drill-down page with the tasks a worker
   owns.
-- **Node logs** — the Logs page lists and tails the node's daily rolling
-  log files with level/substring filters and download. The embedded
-  console derives the directory from the engine's `--log-dir`
-  automatically; the standalone `seatunnel-web` binary takes the same
-  flag.
+- **Node logs** — the Logs page live-tails the node's daily rolling log
+  files over the same SSE transport, with level/substring filters and
+  download. The embedded console derives the directory from the engine's
+  `--log-dir` automatically; the standalone `seatunnel-web` binary takes
+  the same flag.
+- **Live log viewer** — job task logs and node logs stream in near
+  real time (~1 s server-side cadence) instead of periodic full
+  refreshes. The pane follows the newest line automatically; scrolling
+  away pauses following and shows a "back to bottom" button, and
+  following resumes on return. The whole panel toggles fullscreen
+  (Esc exits).
 - **Dark mode** — topbar toggle, persisted; the whole palette is themed
   via CSS variables.
 

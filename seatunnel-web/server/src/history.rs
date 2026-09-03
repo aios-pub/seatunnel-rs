@@ -150,23 +150,6 @@ impl History {
     }
 }
 
-/// Aggregate a job's points into per-task series for charting:
-/// `task_id → [(ts_ms, value)]`. Used by tests and available to handlers.
-pub fn series_of(
-    points: &[JobPoint],
-    pick: impl Fn(&TaskPoint) -> f64,
-) -> BTreeMap<String, Vec<(i64, f64)>> {
-    let mut out: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
-    for point in points {
-        for task in &point.tasks {
-            out.entry(task.task_id.clone())
-                .or_default()
-                .push((point.ts_ms, pick(task)));
-        }
-    }
-    out
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

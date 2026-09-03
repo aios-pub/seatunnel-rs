@@ -21,5 +21,6 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 # need to download its own copy from GitHub releases.
 wasm-bindgen = "=0.2.126"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Document", "Element", "File", "FileList", "HtmlElement", "HtmlInputElement", "NodeList", "Window", "Storage", "Navigator", "VisibilityState"] }
+web-sys = { version = "0.3", features = ["Document", "Element", "EventSource", "File", "FileList", "HtmlElement", "HtmlInputElement", "KeyboardEvent", "NodeList", "Window", "Storage", "Navigator", "VisibilityState"] }
 wasm-bindgen-futures = "0.4"
+send_wrapper = "0.6"

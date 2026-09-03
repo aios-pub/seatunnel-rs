@@ -534,3 +534,110 @@ pub fn log_file_download_url(name: &str, tail: u32, level: &str, q: &str) -> Str
         js_sys::encode_uri_component(q),
     )
 }
+
+// --- SSE log streams ---------------------------------------------------------
+
+/// One streamed update of a task's log lines (`reset` = replace the lines
+/// the client holds for the task; otherwise append).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct TaskLogEvent {
+    pub task_id: String,
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One streamed update of a log file's tail.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct FileLogEvent {
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Live EventSource connection; closing on [`Drop`](std::ops::Drop), so
+/// replacing a stored handle reopens the stream with new parameters. The
+/// close callback is `Send`-wrapped (single-threaded wasm), letting the
+/// handle live in `Mutex`es inside cleanup hooks.
+pub struct StreamHandle {
+    close: send_wrapper::SendWrapper<Box<dyn Fn()>>,
+}
+
+impl std::ops::Drop for StreamHandle {
+    fn drop(&mut self) {
+        let close = std::mem::replace(&mut *self.close, Box::new(|| {}));
+        close();
+    }
+}
+
+fn open_event_source<F>(url: String, on_event: F) -> Result<StreamHandle, String>
+where
+    F: Fn(&str) + 'static,
+{
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+    let source = web_sys::EventSource::new(&url).map_err(|e| format!("eventsource: {e:?}"))?;
+    // The message callback must outlive this function: dropping the
+    // Closure would unregister it while the connection stays open, so it
+    // is intentionally leaked (streams live for the page's lifetime and
+    // the count is tiny).
+    let on_message: Closure<dyn FnMut(web_sys::MessageEvent)> =
+        Closure::new(move |ev: web_sys::MessageEvent| {
+            if let Some(text) = ev.data().as_string() {
+                on_event(&text);
+            }
+        });
+    source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    on_message.forget();
+    let close_source = source;
+    Ok(StreamHandle {
+        close: send_wrapper::SendWrapper::new(Box::new(move || {
+            close_source.close();
+        })),
+    })
+}
+
+/// Stream a job's live task logs over SSE. The first event of every
+/// (re)connection is a full snapshot (`reset = true`).
+pub fn stream_job_logs(
+    job_id: &str,
+    on_event: impl Fn(TaskLogEvent) + 'static,
+) -> Result<StreamHandle, String> {
+    open_event_source(format!("{}/jobs/{}/logs/stream", BASE, job_id), move |text| {
+        if let Ok(event) = serde_json::from_str::<TaskLogEvent>(text) {
+            on_event(event);
+        }
+    })
+}
+
+/// Stream one node log file's tail over SSE (level/substring filters are
+/// evaluated server-side; parameters are baked into the URL).
+pub fn stream_log_file(
+    name: &str,
+    level: &str,
+    q: &str,
+    on_event: impl Fn(FileLogEvent) + 'static,
+) -> Result<StreamHandle, String> {
+    let mut url = format!(
+        "{}/logs/files/{}/stream?tail=1000",
+        BASE,
+        js_sys::encode_uri_component(name)
+    );
+    if !level.is_empty() {
+        url.push_str(&format!("&level={}", js_sys::encode_uri_component(level)));
+    }
+    if !q.is_empty() {
+        url.push_str(&format!("&q={}", js_sys::encode_uri_component(q)));
+    }
+    open_event_source(url, move |text| {
+        if let Ok(event) = serde_json::from_str::<FileLogEvent>(text) {
+            on_event(event);
+        }
+    })
+}

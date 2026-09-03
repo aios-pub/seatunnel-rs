@@ -252,6 +252,9 @@ const DICT: &[(&str, &str, &str)] = &[
     ("jd.lines_title", "{} ({} lines)", "{}（{} 行）"),
     ("jd.autoscroll", "auto-scroll", "自动滚动"),
     ("jd.no_logs", "No task logs yet.", "暂无任务日志。"),
+    ("logs.follow", "↓ Back to bottom", "↓ 回到底部"),
+    ("logs.fullscreen", "Fullscreen", "全屏"),
+    ("logs.exit_fs", "Exit fullscreen", "退出全屏"),
     ("jd.cp_history", "Checkpoint history — {} completed, every {} ms", "Checkpoint 历史 — 已完成 {} 个，间隔 {} ms"),
     ("jd.no_checkpoints", "No checkpoints recorded yet (waiting for the first interval to complete).", "暂无 checkpoint 记录（等待第一个周期完成）。"),
     // Cluster

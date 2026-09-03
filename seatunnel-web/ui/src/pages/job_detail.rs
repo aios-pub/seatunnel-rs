@@ -32,7 +32,9 @@ pub fn JobDetail() -> impl IntoView {
 
     let (status, set_status) = RwSignal::new_local(None::<api::JobStatus>).split();
     let (checkpoints, set_checkpoints) = RwSignal::new_local(None::<api::CheckpointHistory>).split();
-    let (logs, set_logs) = RwSignal::new_local(None::<api::JobLogs>).split();
+    // Live task logs arrive incrementally over the SSE stream.
+    let logs = RwSignal::new_local(std::collections::BTreeMap::<String, Vec<String>>::new());
+    let (stream_error, set_stream_error) = RwSignal::new_local(None::<String>).split();
     let (history, set_history) = RwSignal::new_local(None::<api::JobHistory>).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
     // Edit-and-restart state: editor visibility, edited config, flow busy flag.
@@ -59,16 +61,51 @@ pub fn JobDetail() -> impl IntoView {
                 Ok(value) => set_checkpoints.set(Some(value)),
                 Err(_) => set_checkpoints.set(None),
             }
-            match api::job_logs(&poll_id).await {
-                Ok(value) => set_logs.set(Some(value)),
-                Err(_) => set_logs.set(None),
-            }
             match api::job_history(&poll_id).await {
                 Ok(value) => set_history.set(Some(value)),
                 Err(_) => set_history.set(None),
             }
         })
     });
+
+    // Live logs stream: the console server tails the engine at ~1 s and
+    // pushes per-task deltas; the stream reconnects (full snapshot) on its
+    // own after the server-side lifetime cap. The handle lives in an Rc
+    // cell (signals and streams are not Send in CSR) and is closed when
+    // the component unmounts.
+    {
+        let handle_cell: std::sync::Mutex<Option<api::StreamHandle>> = std::sync::Mutex::new(None);
+        let set_stream_error = set_stream_error.clone();
+        match api::stream_job_logs(&job_id, move |event| {
+            if let Some(err) = event.error {
+                set_stream_error.set(Some(err));
+                return;
+            }
+            set_stream_error.set(None);
+            logs.update(|map| {
+                let entry = map.entry(event.task_id).or_default();
+                if event.reset {
+                    *entry = event.lines;
+                } else {
+                    entry.extend(event.lines);
+                    let excess = entry.len().saturating_sub(2000);
+                    if excess > 0 {
+                        entry.drain(..excess);
+                    }
+                }
+            });
+        }) {
+            Ok(handle) => {
+                *handle_cell.lock().unwrap() = Some(handle);
+            }
+            Err(err) => set_stream_error.set(Some(err)),
+        }
+        on_cleanup(move || {
+            if let Some(handle) = handle_cell.lock().ok().and_then(|mut cell| cell.take()) {
+                drop(handle);
+            }
+        });
+    }
 
     // Edit flow: cancel (exit checkpoint) → resubmit with the edited config.
     // Reads the editor text from its signal at click time.
@@ -355,7 +392,7 @@ pub fn JobDetail() -> impl IntoView {
                 })
         }}
         <MetricsCharts history=history />
-        <TaskLogsPanel logs=logs />
+        <TaskLogsPanel logs=logs stream_error=Signal::derive(move || stream_error.get()) />
         {move || {
             checkpoints
                 .get()
@@ -483,83 +520,52 @@ fn task_series(
         .collect()
 }
 
-/// Live per-task log viewer: lifecycle events and sampled data rows.
-/// Auto-scrolls every log box to the newest line on each refresh; the
-/// toggle lets the user pin the view while reading history.
+/// Live per-task log viewer fed by the SSE stream: per-task panes follow
+/// the newest line until the user scrolls away; the whole panel can go
+/// fullscreen (Esc exits).
 #[component]
 fn TaskLogsPanel(
-    logs: leptos::prelude::ReadSignal<Option<api::JobLogs>, leptos::prelude::LocalStorage>,
+    logs: leptos::prelude::RwSignal<
+        std::collections::BTreeMap<String, Vec<String>>,
+        leptos::prelude::LocalStorage,
+    >,
+    stream_error: Signal<Option<String>>,
 ) -> impl IntoView {
-    let auto_scroll = RwSignal::new(true);
+    let fs = RwSignal::new_local(false);
+    crate::log_view::use_escape_on(move || fs.get(), move || fs.set(false));
 
-    // Runs after the DOM patch for each log refresh; scrolling here keeps
-    // the newest lines in view.
-    Effect::new(move || {
-        logs.get();
-        if !auto_scroll.get() {
-            return;
-        }
-        let Some(doc) = window().document() else { return };
-        let boxes = doc.query_selector_all(".log-box").unwrap();
-        for index in 0..boxes.length() {
-            if let Some(node) = boxes.item(index) {
-                let element: web_sys::HtmlElement = node.unchecked_into();
-                element.set_scroll_top(element.scroll_height());
-            }
-        }
-    });
+    let total = move || logs.get().values().map(|v| v.len()).sum::<usize>();
 
     view! {
-        {move || {
-            logs.get()
-                .map(|logs| {
-                    let total: usize = logs.tasks.iter().map(|t| t.lines.len()).sum();
-                    view! {
-                        <div class="panel">
-                            <div class="log-head">
-                                <h2>{tf("jd.lines_title", &[&t("jd.live_logs"), &total.to_string()])}</h2>
-                                <label class="log-autoscroll">
-                                    <input
-                                        type="checkbox"
-                                        prop:checked=move || auto_scroll.get()
-                                        on:change=move |event| {
-                                            auto_scroll.set(event_target_checked(&event));
-                                        }
-                                    />
-                                    {t("jd.autoscroll")}
-                                </label>
-                            </div>
-                            {if total == 0 {
-                                view! { <div class="muted">{t("jd.no_logs")}</div> }.into_any()
-                            } else {
-                                logs
-                                    .tasks
-                                    .iter()
-                                    .map(|task| {
-                                        view! {
-                                            <div class="log-group">
-                                                <div class="log-task mono">{task.task_id.clone()}</div>
-                                                <pre class="log-box">{
-                                                    task.lines
-                                                        .iter()
-                                                        .rev()
-                                                        .take(200)
-                                                        .rev()
-                                                        .cloned()
-                                                        .collect::<Vec<_>>()
-                                                        .join("\n")
-                                                }</pre>
-                                            </div>
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .into_any()
-                            }}
-                        </div>
-                    }
-                    .into_any()
-                })
-                .unwrap_or_else(|| ().into_any())
-        }}
+        <ErrorBanner message=stream_error />
+        <div class="panel" class:logs-fs=move || fs.get()>
+            <div class="log-head">
+                <h2>{move || tf("jd.lines_title", &[&t("jd.live_logs"), &total().to_string()])}</h2>
+                <button class="btn" on:click=move |_| fs.update(|value| *value = !*value)>
+                    {move || if fs.get() { t("logs.exit_fs") } else { t("logs.fullscreen") }}
+                </button>
+            </div>
+            {move || {
+                let map = logs.get();
+                if map.is_empty() {
+                    view! { <div class="muted">{t("jd.no_logs")}</div> }.into_any()
+                } else {
+                    map
+                        .into_iter()
+                        .map(|(task_id, lines)| {
+                            view! {
+                                <div class="log-group">
+                                    <div class="log-task mono">{task_id}</div>
+                                    <crate::log_view::FollowLog content=Signal::derive(move || {
+                                        lines.join("\n")
+                                    }) />
+                                </div>
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_any()
+                }
+            }}
+        </div>
     }
 }

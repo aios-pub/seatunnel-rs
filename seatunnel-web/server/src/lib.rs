@@ -90,6 +90,10 @@ pub fn build_router(state: AppState) -> Router {
             )
             .route("/api/v1/jobs/{job_id}/logs", get(api::jobs::job_logs))
             .route(
+                "/api/v1/jobs/{job_id}/logs/stream",
+                get(api::jobs::job_logs_stream),
+            )
+            .route(
                 "/api/v1/jobs/{job_id}/history",
                 get(api::jobs::job_history),
             )
@@ -101,6 +105,10 @@ pub fn build_router(state: AppState) -> Router {
             .route("/api/v1/cluster/history", get(api::cluster_history))
             .route("/api/v1/logs/files", get(api::logs::log_files))
             .route("/api/v1/logs/files/{name}", get(api::logs::log_file))
+            .route(
+                "/api/v1/logs/files/{name}/stream",
+                get(api::logs::log_file_stream),
+            )
             .route("/metrics", get(api::metrics))
             .fallback(assets::static_handler)
             .with_state(state.clone())

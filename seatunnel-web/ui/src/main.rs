@@ -8,6 +8,7 @@ mod app;
 mod charts;
 mod fmt;
 mod i18n;
+mod log_view;
 mod pages;
 mod ui;
 

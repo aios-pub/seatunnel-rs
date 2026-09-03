@@ -11,8 +11,10 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::dto::ErrorDto;
@@ -175,29 +177,10 @@ pub async fn log_file(
 
     let tail = query.tail.unwrap_or(500).clamp(1, 20_000);
     let needle = query.q.clone().unwrap_or_default().to_lowercase();
-    let levels: Vec<String> = query
-        .level
-        .clone()
-        .unwrap_or_default()
-        .split([',', ' '])
-        .filter_map(|l| {
-            let l = l.trim().to_ascii_uppercase();
-            (!l.is_empty()).then_some(l)
-        })
-        .collect();
+    let levels = parse_levels(&query.level);
 
-    let all_lines: Vec<&str> = raw.split_inclusive('\n').collect();
-    let filtered: Vec<String> = all_lines
-        .iter()
-        .filter(|line| {
-            levels.is_empty()
-                || levels
-                    .iter()
-                    .any(|level| line.contains(&format!(" {level} ")))
-        })
-        .filter(|line| needle.is_empty() || line.to_lowercase().contains(&needle))
-        .map(|line| line.trim_end_matches('\n').to_string())
-        .collect();
+    let all_lines: Vec<String> = raw.split_inclusive('\n').map(|l| l.trim_end_matches('\n').to_string()).collect();
+    let filtered = filter_lines(&all_lines, &levels, &needle);
     let lines: Vec<String> = filtered
         .iter()
         .skip(filtered.len().saturating_sub(tail))
@@ -226,6 +209,33 @@ pub async fn log_file(
     .into_response()
 }
 
+/// Parse the `level` query parameter into uppercase level tokens.
+fn parse_levels(level: &Option<String>) -> Vec<String> {
+    level
+        .clone()
+        .unwrap_or_default()
+        .split([',', ' '])
+        .filter_map(|l| {
+            let l = l.trim().to_ascii_uppercase();
+            (!l.is_empty()).then_some(l)
+        })
+        .collect()
+}
+
+/// Apply the level (tracing format: ` ERROR ` token) and substring filters.
+fn filter_lines(all: &[String], levels: &[String], needle: &str) -> Vec<String> {
+    all.iter()
+        .filter(|line| {
+            levels.is_empty()
+                || levels
+                    .iter()
+                    .any(|level| line.contains(&format!(" {level} ")))
+        })
+        .filter(|line| needle.is_empty() || line.to_lowercase().contains(needle))
+        .cloned()
+        .collect()
+}
+
 /// Read from `skip` bytes to EOF; `truncated` reports whether anything was
 /// skipped. The skipped region is cut at the first newline so the tail
 /// starts at a complete line.
@@ -248,6 +258,152 @@ fn read_tail(path: &std::path::Path, skip: u64) -> std::io::Result<(String, bool
         buf
     };
     Ok((raw, truncated))
+}
+
+// --- Log file stream (SSE) ---------------------------------------------------
+
+/// Server-side tail cadence; log files are appended continuously so 1 s
+/// reads keep the viewer effectively real-time.
+const FILE_STREAM_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Per-cycle read cap so a very chatty file cannot blow up the console.
+const FILE_STREAM_READ_CAP: u64 = 1024 * 1024;
+/// Total stream lifetime; the browser's EventSource reconnects and gets a
+/// fresh tail snapshot.
+const FILE_STREAM_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn sse_event<T: serde::Serialize>(value: &T) -> Event {
+    Event::default().data(serde_json::to_string(value).unwrap_or_default())
+}
+
+#[derive(serde::Serialize)]
+struct FileLogEvent {
+    /// New lines since the previous event.
+    #[serde(default)]
+    lines: Vec<String>,
+    /// Replace whatever the client has (first snapshot after connect).
+    #[serde(default)]
+    reset: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// `GET /api/v1/logs/files/{name}/stream?level=&q=&tail=` — Server-Sent
+/// Events tail of one log file: an initial tail snapshot, then only new
+/// lines as they are appended (byte-offset tracking, half-line buffering).
+pub async fn log_file_stream(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<LogQuery>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let dir = log_dir(&state);
+    let invalid: Option<String> = match (dir.clone(), is_log_file_name(&name)) {
+        (None, _) => Some("no log directory configured for the console".to_string()),
+        (_, false) => Some("invalid log file name".to_string()),
+        _ => None,
+    };
+    let stream = async_stream::stream! {
+        yield Ok(Event::default().retry(std::time::Duration::from_secs(2)));
+        // Early exits need a labeled block: async_stream wraps the body in
+        // one of its own, so a bare `break` there would be ambiguous.
+        'validation: {
+            if let Some(message) = invalid {
+                yield Ok(sse_event(&FileLogEvent {
+                    lines: Vec::new(),
+                    reset: true,
+                    error: Some(message),
+                }));
+                break 'validation;
+            }
+            let path = dir.expect("validated above").join(&name);
+            let tail = query.tail.unwrap_or(1000).clamp(1, 20_000);
+            let needle = query.q.clone().unwrap_or_default().to_lowercase();
+            let levels = parse_levels(&query.level);
+            let mut offset: u64 = 0;
+            let mut remainder: Vec<u8> = Vec::new();
+            let mut first = true;
+            let started = tokio::time::Instant::now();
+            loop {
+                if started.elapsed() > FILE_STREAM_MAX_LIFETIME {
+                    break;
+                }
+                tokio::time::sleep(FILE_STREAM_POLL).await;
+                // Rotation/truncation underneath us: start over with a
+                // fresh snapshot.
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.len() < offset {
+                        offset = 0;
+                        remainder.clear();
+                        first = true;
+                    }
+                }
+                let mut file = match std::fs::File::open(&path) {
+                    Ok(file) => file,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if !first {
+                            yield Ok(sse_event(&FileLogEvent {
+                                lines: Vec::new(),
+                                reset: true,
+                                error: Some(format!("log file {} disappeared", name)),
+                            }));
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        yield Ok(sse_event(&FileLogEvent {
+                            lines: Vec::new(),
+                            reset: true,
+                            error: Some(format!("cannot read log file {}: {}", name, err)),
+                        }));
+                        continue;
+                    }
+                };
+                use std::io::{Read, Seek, SeekFrom};
+                if file.seek(SeekFrom::Start(offset)).is_err() {
+                    continue;
+                }
+                let cap = FILE_STREAM_READ_CAP as usize;
+                let mut buf = Vec::with_capacity(4096);
+                if file.take(cap as u64).read_to_end(&mut buf).is_err() {
+                    continue;
+                }
+                offset += buf.len() as u64;
+                remainder.extend_from_slice(&buf);
+                // Only complete lines are emitted; a trailing partial line
+                // stays buffered until its newline arrives.
+                let complete = match remainder.iter().rposition(|b| *b == b'\n') {
+                    Some(pos) => remainder.drain(..=pos).collect::<Vec<u8>>(),
+                    None => Vec::new(),
+                };
+                let text = String::from_utf8_lossy(&complete);
+                let new_lines: Vec<String> = text
+                    .split_inclusive('\n')
+                    .map(|l| l.trim_end_matches('\n').to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if new_lines.is_empty() && !first {
+                    continue;
+                }
+                let filtered = filter_lines(&new_lines, &levels, &needle);
+                if first {
+                    let start = filtered.len().saturating_sub(tail);
+                    yield Ok(sse_event(&FileLogEvent {
+                        lines: filtered[start..].to_vec(),
+                        reset: true,
+                        error: None,
+                    }));
+                    first = false;
+                } else if !filtered.is_empty() {
+                    yield Ok(sse_event(&FileLogEvent {
+                        lines: filtered,
+                        reset: false,
+                        error: None,
+                    }));
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 #[cfg(test)]

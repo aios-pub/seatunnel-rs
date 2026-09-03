@@ -375,8 +375,42 @@ a:hover { text-decoration: underline; }
 
 .log-head { display: flex; align-items: center; justify-content: space-between; }
 .log-head h2 { margin-bottom: 8px; }
-.log-autoscroll { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; }
-.log-autoscroll input { width: auto; }
+.log-actions { display: flex; gap: 8px; align-items: center; }
+.log-actions .btn { color: #e6edf3; text-decoration: none; }
+
+/* Smart-follow log pane: floating "back to bottom" while detached. */
+.follow-log { position: relative; }
+.follow-btn {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  box-shadow: 0 6px 18px rgba(16, 24, 40, 0.3);
+}
+.follow-btn:hover { color: #fff; opacity: 0.92; }
+
+/* Fullscreen logs panel (Esc or the panel button exits). */
+.panel.logs-fs {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  margin: 0;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.logs-fs .log-group {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 10px;
+}
+.logs-fs .follow-log { flex: 1 1 0; min-height: 0; display: flex; }
+.logs-fs .follow-log .log-box { flex: 1 1 0; max-height: none; min-height: 0; }
 
 /* --- Dynamic admission (cluster view) --- */
 .badge {

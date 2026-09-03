@@ -6470,9 +6470,11 @@ name = "seatunnel-web"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum 0.8.9",
  "clap",
+ "futures",
  "hex",
  "hmac 0.12.1",
  "http-body-util",
