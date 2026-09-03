@@ -102,7 +102,11 @@ pub fn LineChart(
             />
         });
         for (t, v) in &s.points {
-            let title = format!("{} {} {}: {}", s.name, fmt_clock(*t), unit, fmt_value(*v));
+            let title = if unit.is_empty() {
+                format!("{} {}: {}", s.name, fmt_clock(*t), fmt_value(*v))
+            } else {
+                format!("{} {}: {} {}", s.name, fmt_clock(*t), fmt_value(*v), unit)
+            };
             dots.push(view! {
                 <circle cx=x(*t) cy=y(*v) r="2.2" fill=s.color.clone()>
                     <title>{title}</title>
@@ -136,12 +140,18 @@ pub fn LineChart(
                         <svg viewBox=format!("0 0 {} {}", W, H) preserveAspectRatio="xMidYMid meet">
                             {grid_y.iter().map(|f| {
                                 let gy = PAD_T + (1.0 - f) * plot_h;
-                                let label = fmt_value(f * y_max);
+                                // The top gridline is labelled once by the
+                                // standalone y_label (which carries the
+                                // unit); labelling it here as well would
+                                // draw both strings on the same spot.
+                                let label = (*f < 1.0).then(|| fmt_value(*f * y_max));
                                 view! {
                                     <line x1=PAD_L y1=gy x2={W - PAD_R} y2=gy
                                         stroke="var(--border)" stroke-width="1" />
-                                    <text x={PAD_L - 4.0} y={gy + 3.0} text-anchor="end"
-                                        class="chart-tick">{label}</text>
+                                    {label.map(|label| view! {
+                                        <text x={PAD_L - 4.0} y={gy + 3.0} text-anchor="end"
+                                            class="chart-tick">{label}</text>
+                                    })}
                                 }
                             }).collect::<Vec<_>>()}
                             {lines}
