@@ -5,15 +5,24 @@
 
 use wasm_bindgen::JsValue;
 
-/// Render an epoch-milliseconds timestamp as a locale string.
+/// Render an epoch-milliseconds timestamp as `YYYY-MM-DD HH:MM:SS` in the
+/// browser's local timezone. Assembled from date components by hand so every
+/// browser shows the same year-first layout regardless of its locale data
+/// (toLocaleString would render en-GB as 04/09/2026).
 pub fn fmt_time(ms: i64) -> String {
     if ms <= 0 {
         return "-".to_string();
     }
     let date = js_sys::Date::new(&JsValue::from_f64(ms as f64));
-    date.to_locale_string("en-GB", &JsValue::UNDEFINED)
-        .as_string()
-        .unwrap_or_else(|| ms.to_string())
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds()
+    )
 }
 
 /// Human-readable duration between two epoch-milliseconds timestamps.

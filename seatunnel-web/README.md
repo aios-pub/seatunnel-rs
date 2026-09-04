@@ -26,5 +26,11 @@ Common commands (from the repository root):
 cargo build -p seatunnel-web      # server binary, embeds ui/dist as-is
 cargo test -p seatunnel-web       # server unit tests
 trunk serve                       # UI hot-reload dev loop (run in ui/)
-trunk build --release             # regenerate ui/dist, then rebuild the server
+scripts/build-web-ui.sh           # regenerate ui/dist (release profile),
+                                  # then rebuild the server to embed it
 ```
+
+Always (re)build `dist/` through `scripts/build-web-ui.sh` — it passes
+`--release` and fails on a debug-sized bundle. A `dist/` built by a bare
+`trunk build` embeds a ~33 MB debug wasm into every server binary and
+makes the console load ~10 s per page (the release bundle is a few MB).

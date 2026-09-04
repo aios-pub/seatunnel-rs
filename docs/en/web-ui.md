@@ -239,8 +239,16 @@ cargo install trunk
 - Hot-reload dev loop: run `seatunnel-web` on `127.0.0.1:8080`, then
   `trunk serve` inside `seatunnel-web/ui` (it proxies
   `/api/*` and `/metrics` to `127.0.0.1:8080` — see `Trunk.toml`).
-- Production build: `trunk build --release` regenerates `dist/`; commit
-  the result and rebuild `seatunnel-web` to embed it.
+- Production build: `scripts/build-web-ui.sh` (it runs
+  `trunk build --release` and refuses a bundle that looks like a debug
+  build) regenerates `dist/`; commit the result and rebuild
+  `seatunnel-web` to embed it. Never commit a `dist/` produced by a bare
+  `trunk build`: its debug-profile wasm is ~33 MB, which once made the
+  console take ~10 s per page load. The release bundle (size-tuned
+  profile + wasm-opt) is a few MB, and the server compresses assets on
+  the fly (gzip/brotli, static fallback only — SSE streams are never
+  compressed) and marks hashed assets `immutable`, so the console loads
+  in well under a second.
 
 ## Architecture notes
 

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::middleware;
 use axum::routing::get;
+use tower_http::compression::CompressionLayer;
 
 pub use auth::AuthConfig;
 pub use dto::{
@@ -56,59 +57,68 @@ pub struct AppState {
 
 /// Build the full web console router (REST API + metrics + embedded SPA).
 pub fn build_router(state: AppState) -> Router {
+    let api = Router::new()
+        .route("/api/v1/health", get(api::health))
+        .route("/api/v1/login", axum::routing::post(api::auth::login))
+        .route("/api/v1/logout", axum::routing::post(api::auth::logout))
+        .route("/api/v1/whoami", get(api::auth::whoami))
+        .route("/api/v1/overview", get(api::overview))
+        .route(
+            "/api/v1/jobs",
+            get(api::jobs::list_jobs).post(api::jobs::submit_job),
+        )
+        .route("/api/v1/jobs/{job_id}", get(api::jobs::job_detail))
+        .route(
+            "/api/v1/jobs/{job_id}",
+            axum::routing::delete(api::jobs::delete_job),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/cancel",
+            axum::routing::post(api::jobs::cancel_job),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/restart",
+            axum::routing::post(api::jobs::restart_job),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/update",
+            axum::routing::post(api::jobs::update_job),
+        )
+        .route(
+            "/api/v1/jobs/{job_id}/checkpoints",
+            get(api::jobs::job_checkpoints),
+        )
+        .route("/api/v1/jobs/{job_id}/logs", get(api::jobs::job_logs))
+        .route(
+            "/api/v1/jobs/{job_id}/logs/stream",
+            get(api::jobs::job_logs_stream),
+        )
+        .route("/api/v1/jobs/{job_id}/history", get(api::jobs::job_history))
+        .route("/api/v1/cluster", get(api::cluster))
+        .route(
+            "/api/v1/cluster/workers/{worker_id}",
+            get(api::worker_detail),
+        )
+        .route("/api/v1/cluster/history", get(api::cluster_history))
+        .route("/api/v1/logs/files", get(api::logs::log_files))
+        .route("/api/v1/logs/files/{name}", get(api::logs::log_file))
+        .route(
+            "/api/v1/logs/files/{name}/stream",
+            get(api::logs::log_file_stream),
+        )
+        .route("/metrics", get(api::metrics))
+        .with_state(state.clone());
+
+    // Embedded SPA assets. The compression layer is scoped to this fallback
+    // router on purpose: layering it on the whole router would push the SSE
+    // log streams through a compression buffer and stall them. (The default
+    // predicate also skips text/event-stream as a second guard.)
+    let assets = Router::new()
+        .fallback(assets::static_handler)
+        .layer(CompressionLayer::new());
+
     api::http_middleware(
-        Router::new()
-            .route("/api/v1/health", get(api::health))
-            .route("/api/v1/login", axum::routing::post(api::auth::login))
-            .route("/api/v1/logout", axum::routing::post(api::auth::logout))
-            .route("/api/v1/whoami", get(api::auth::whoami))
-            .route("/api/v1/overview", get(api::overview))
-            .route(
-                "/api/v1/jobs",
-                get(api::jobs::list_jobs).post(api::jobs::submit_job),
-            )
-            .route("/api/v1/jobs/{job_id}", get(api::jobs::job_detail))
-            .route(
-                "/api/v1/jobs/{job_id}",
-                axum::routing::delete(api::jobs::delete_job),
-            )
-            .route(
-                "/api/v1/jobs/{job_id}/cancel",
-                axum::routing::post(api::jobs::cancel_job),
-            )
-            .route(
-                "/api/v1/jobs/{job_id}/restart",
-                axum::routing::post(api::jobs::restart_job),
-            )
-            .route(
-                "/api/v1/jobs/{job_id}/update",
-                axum::routing::post(api::jobs::update_job),
-            )
-            .route(
-                "/api/v1/jobs/{job_id}/checkpoints",
-                get(api::jobs::job_checkpoints),
-            )
-            .route("/api/v1/jobs/{job_id}/logs", get(api::jobs::job_logs))
-            .route(
-                "/api/v1/jobs/{job_id}/logs/stream",
-                get(api::jobs::job_logs_stream),
-            )
-            .route("/api/v1/jobs/{job_id}/history", get(api::jobs::job_history))
-            .route("/api/v1/cluster", get(api::cluster))
-            .route(
-                "/api/v1/cluster/workers/{worker_id}",
-                get(api::worker_detail),
-            )
-            .route("/api/v1/cluster/history", get(api::cluster_history))
-            .route("/api/v1/logs/files", get(api::logs::log_files))
-            .route("/api/v1/logs/files/{name}", get(api::logs::log_file))
-            .route(
-                "/api/v1/logs/files/{name}/stream",
-                get(api::logs::log_file_stream),
-            )
-            .route("/metrics", get(api::metrics))
-            .fallback(assets::static_handler)
-            .with_state(state.clone())
+        api.merge(assets)
             // Auth sits inside the metrics layer so 401s are still counted.
             .layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -752,5 +762,30 @@ sink:
             get_json(&state, "/api/v1/jobs/job-1/checkpoints", Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("checkpoint_id"));
+    }
+
+    #[tokio::test]
+    async fn sse_log_stream_is_never_compressed() {
+        // The compression layer is scoped to the static-asset fallback; the
+        // SSE endpoints sit on registered API routes and must stream through
+        // untouched even when the client offers encodings.
+        let state = test_state(FakeEngine::with_running_job());
+        let cookie = login_cookie(&state).await;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs/job-1/logs/stream")
+                    .header("cookie", cookie)
+                    .header("accept-encoding", "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("content-encoding").is_none(),
+            "SSE must not pass through the compression layer"
+        );
     }
 }
