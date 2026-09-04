@@ -248,7 +248,11 @@ cargo install trunk
   profile + wasm-opt) is a few MB, and the server compresses assets on
   the fly (gzip/brotli, static fallback only — SSE streams are never
   compressed) and marks hashed assets `immutable`, so the console loads
-  in well under a second.
+  in well under a second. Two guards keep a debug bundle out of release
+  binaries: `scripts/build-web-ui.sh` fails on an oversized wasm, and the
+  server crate's `build.rs` refuses a `--release` build whenever any wasm
+  under `ui/dist` is ≥10 MB (a bare `trunk build` cannot slip in
+  unnoticed).
 
 ## Architecture notes
 

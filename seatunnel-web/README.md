@@ -34,3 +34,7 @@ Always (re)build `dist/` through `scripts/build-web-ui.sh` — it passes
 `--release` and fails on a debug-sized bundle. A `dist/` built by a bare
 `trunk build` embeds a ~33 MB debug wasm into every server binary and
 makes the console load ~10 s per page (the release bundle is a few MB).
+The crate's `build.rs` backstops this even when plain
+`cargo build --release` embeds the committed bundle directly: the build
+fails when any wasm in `dist/` is ≥10 MB (debug builds only warn), and
+`cargo:rerun-if-changed` re-embeds the assets whenever `dist/` changes.
