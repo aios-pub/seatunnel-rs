@@ -1,4 +1,5 @@
-/* SeaTunnel console styling: light content area with a dark sidebar. */
+/* SeaTunnel console styling. Light and dark share one rule set via CSS
+   variables; every surface (including the sidebar) follows the theme. */
 
 * { box-sizing: border-box; }
 
@@ -9,8 +10,10 @@
   --text: #1f2329;
   --muted: #6b7280;
   --primary: #2563eb;
-  --sidebar: #101828;
-  --sidebar-text: #cdd3de;
+  --sidebar: #ffffff;
+  --sidebar-border: #e3e6ea;
+  --sidebar-text: #57606a;
+  --sidebar-hover: #eef1f5;
   --thead-bg: #f9fafb;
   --input-bg: #ffffff;
   --row-hover: #fafbfc;
@@ -24,8 +27,10 @@ html[data-theme="dark"] {
   --border: #30363d;
   --text: #e6edf3;
   --muted: #8b949e;
-  --sidebar: #010409;
-  --sidebar-text: #cdd3de;
+  --sidebar: #11161d;
+  --sidebar-border: #30363d;
+  --sidebar-text: #adbac7;
+  --sidebar-hover: rgba(255, 255, 255, 0.07);
   --thead-bg: #1c2129;
   --input-bg: #0d1117;
   --row-hover: #1c2129;
@@ -54,6 +59,7 @@ html, body {
   width: 210px;
   flex-shrink: 0;
   background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-border);
   color: var(--sidebar-text);
   display: flex;
   flex-direction: column;
@@ -68,7 +74,7 @@ html, body {
 .sidebar .brand {
   font-size: 16px;
   font-weight: 600;
-  color: #fff;
+  color: var(--text);
   padding: 8px 12px 20px;
 }
 
@@ -81,7 +87,7 @@ html, body {
   border-radius: 6px;
 }
 
-.sidebar nav a:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+.sidebar nav a:hover { background: var(--sidebar-hover); color: var(--text); }
 .sidebar nav a.active { background: var(--primary); color: #fff; }
 
 .content { flex: 1; min-width: 0; padding: 20px 28px; }
@@ -95,6 +101,26 @@ html, body {
 
 .topbar h1 { font-size: 20px; margin: 0; }
 .topbar .controls { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+
+/* Refresh controls: the global `input { width: 100% }` rule would otherwise
+   blow the checkbox up into a full-width bordered box that pushes its label
+   text onto the next line. Keep it a compact native checkbox instead. */
+.topbar .controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.topbar .controls input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: none;
+  accent-color: var(--primary);
+}
 
 /* Panels, cards, tables */
 .panel {
@@ -297,7 +323,14 @@ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-heig
 .inline-select { width: auto; padding: 5px 8px; font-size: 13px; }
 .inline-search { width: 220px; padding: 5px 10px; font-size: 13px; }
 .col-check { width: 34px; text-align: center; }
-.col-check input { width: auto; }
+.col-check input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: none;
+  vertical-align: middle;
+  accent-color: var(--primary);
+}
 .pager { display: flex; gap: 12px; align-items: center; justify-content: center; margin-top: 10px; }
 .loading { color: var(--muted); padding: 24px 0; }
 a { color: var(--primary); text-decoration: none; }
