@@ -1111,7 +1111,7 @@ pub fn create_sink_with_restore(
                     cfg.port,
                     cfg.publisher_confirm
                 );
-                let mut writer = RabbitMqSinkWriter::new(cfg);
+                let mut writer = RabbitMqSinkWriter::new(cfg)?;
                 if let Some(bytes) = restore {
                     let _ = writer.restore_from_state_bytes(bytes);
                 }

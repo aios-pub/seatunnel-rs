@@ -57,6 +57,7 @@ use seatunnel_api::source::{Boundedness, Source};
 use seatunnel_api::{ColumnDef, ColumnType, Field};
 use seatunnel_connector_common::ConnectorConfig;
 use seatunnel_formats::MessageFormat;
+use seatunnel_formats::canal_client_json::{CanalClientConfig, CanalClientEncoder, PAIRING_WINDOW};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -88,6 +89,9 @@ pub struct RabbitMqConfig {
     pub publisher_confirm: bool,
     /// Payload format handled by seatunnel-formats.
     pub format: MessageFormat,
+    /// Stateful canal-client encoder config, present when
+    /// `format: canal_client_json` (mirrors the Kafka sink).
+    pub canal_client: Option<CanalClientConfig>,
     /// Delimiter joining fields for TEXT payloads.
     pub field_delimiter: String,
     /// Optional column list; enables schema-based (de)serialization.
@@ -119,6 +123,7 @@ impl Default for RabbitMqConfig {
             persistent: true,
             publisher_confirm: true,
             format: MessageFormat::Json,
+            canal_client: None,
             field_delimiter: ",".to_string(),
             columns: Vec::new(),
             batch_size: 100,
@@ -161,6 +166,10 @@ fn parse_exchange_kind(s: &str) -> anyhow::Result<ExchangeKind> {
 
 impl RabbitMqConfig {
     pub fn from_config(config: &ConnectorConfig) -> anyhow::Result<Self> {
+        let format = config
+            .get("format")
+            .and_then(|f| MessageFormat::from_str(f))
+            .unwrap_or(MessageFormat::Json);
         Ok(RabbitMqConfig {
             host: config.get_string("host", "127.0.0.1"),
             port: config.get_int("port", 5672).clamp(1, 65_535) as u16,
@@ -179,10 +188,48 @@ impl RabbitMqConfig {
             prefetch_count: config.get_int("prefetch-count", 250).clamp(0, 65_535) as u16,
             persistent: config.get_bool("persistent", true),
             publisher_confirm: config.get_bool("publisher-confirm", true),
-            format: config
-                .get("format")
-                .and_then(|f| MessageFormat::from_str(f))
-                .unwrap_or(MessageFormat::Json),
+            format,
+            // Mirrors the Kafka sink: `format: canal_client_json` enables
+            // the stateful canal-client encoder; the same option names and
+            // aliases apply. Without canal-client.columns the encoder starts
+            // empty and maps tables from the source's initial-schema events.
+            canal_client: (format == MessageFormat::CanalClientJson).then(|| CanalClientConfig {
+                database_name: config.get_string(
+                    "canal-client.database-name",
+                    &config.get_string("database-name", ""),
+                ),
+                table_name: config.get_string(
+                    "canal-client.table-name",
+                    &config.get_string("table-name", ""),
+                ),
+                columns: config
+                    .get_string("canal-client.columns", &config.get_string("columns", ""))
+                    .split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect(),
+                tables: serde_json::from_str(&config.get_string(
+                    "canal-client.sub-table-fields",
+                    &config.get_string("canal-client.sub_table_fields", "{}"),
+                ))
+                .unwrap_or_default(),
+                server_time_zone: config.get_string(
+                    "canal-client.server-time-zone",
+                    &config.get_string(
+                        "server-time-zone",
+                        &config.get_string("server_time_zone", "local"),
+                    ),
+                ),
+                pairing_window_ms: config
+                    .get_int(
+                        "canal-client.pairing-window-ms",
+                        config.get_int(
+                            "canal-client.pairing_window_ms",
+                            PAIRING_WINDOW.as_millis() as i64,
+                        ),
+                    )
+                    .max(0) as u64,
+            }),
             field_delimiter: config.get_string("field.delimiter", ","),
             columns: config
                 .get_string("columns", "")
@@ -789,9 +836,48 @@ impl Source for RabbitMqSource {
 // Sink
 // ---------------------------------------------------------------------------
 
+/// Publish one canal-client JSON payload and await the broker confirm when
+/// publisher confirms are enabled. A free function so the flush loop can
+/// hold the channel borrow without aliasing `&mut self`.
+async fn publish_canal_payload(
+    channel: &Channel,
+    exchange: &str,
+    routing_key: &str,
+    delivery_mode: u8,
+    confirm_enabled: bool,
+    payload: &str,
+) -> anyhow::Result<()> {
+    let properties = BasicProperties::default()
+        .with_delivery_mode(delivery_mode)
+        .with_content_type("application/json".into());
+    let confirm = channel
+        .basic_publish(
+            exchange.into(),
+            routing_key.into(),
+            BasicPublishOptions::default(),
+            payload.as_bytes(),
+            properties,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("basic_publish failed: {}", e))?;
+    if confirm_enabled {
+        match confirm.await {
+            Ok(Confirmation::Ack(_)) => {}
+            other => anyhow::bail!("broker did not confirm message: {:?}", other),
+        }
+    }
+    Ok(())
+}
+
 /// RabbitMQ sink writer: buffered publishes with optional confirms.
 pub struct RabbitMqSinkWriter {
     config: RabbitMqConfig,
+    /// Stateful canal-client encoder (row pairing + JSON envelope), set
+    /// when `format: canal_client_json`. Explicit `canal-client.columns`
+    /// builds a single-table encoder eagerly; otherwise the encoder starts
+    /// EMPTY and registers one state per table as the initial-schema
+    /// events arrive (see `apply_schema_change`).
+    canal_encoder: Option<CanalClientEncoder>,
     batch: Vec<Row>,
     total_written: usize,
     connection: Option<Connection>,
@@ -800,15 +886,55 @@ pub struct RabbitMqSinkWriter {
 }
 
 impl RabbitMqSinkWriter {
-    pub fn new(config: RabbitMqConfig) -> Self {
-        RabbitMqSinkWriter {
+    pub fn new(config: RabbitMqConfig) -> anyhow::Result<Self> {
+        // Explicit canal-client config (columns entry) builds the
+        // single-table encoder eagerly and fails fast on a missing
+        // mapping. Without `canal-client.columns` the encoder starts empty
+        // and registers per-table states from the source's initial-schema
+        // events (automatic column mapping).
+        let canal_encoder = match &config.canal_client {
+            Some(canal) if !canal.columns.is_empty() => Some(
+                CanalClientEncoder::new(canal.clone())
+                    .map_err(|e| anyhow::anyhow!("canal-client format config: {}", e))?,
+            ),
+            Some(canal) => Some(CanalClientEncoder::new_auto(canal.clone())),
+            None => None,
+        };
+        Ok(RabbitMqSinkWriter {
             config,
+            canal_encoder,
             batch: Vec::new(),
             total_written: 0,
             connection: None,
             channel: None,
             last_flush: Instant::now(),
+        })
+    }
+
+    /// Register one table's schema in the schema-driven canal-client
+    /// encoder. Explicit encoders ignore registrations (their static
+    /// column list stays authoritative); replayed events are idempotent.
+    fn register_canal_schema(&mut self, schema: &seatunnel_api::TableSchema) -> anyhow::Result<()> {
+        let Some(encoder) = &mut self.canal_encoder else {
+            return Ok(());
+        };
+        if encoder.is_explicit() {
+            return Ok(());
         }
+        let already_registered = encoder.registered_tables();
+        encoder
+            .register_schema(schema)
+            .map_err(|e| anyhow::anyhow!("canal-client auto mapping: {}", e))?;
+        if encoder.registered_tables() != already_registered {
+            tracing::info!(
+                "RabbitMQ sink: canal-client auto mapping registered schema '{}' \
+                 ({} columns, {} table(s) total)",
+                schema.table_identifier,
+                schema.columns.len(),
+                encoder.registered_tables()
+            );
+        }
+        Ok(())
     }
 
     /// Restore counters from a serialized `snapshot_state` payload. The
@@ -884,6 +1010,67 @@ impl RabbitMqSinkWriter {
             anyhow::bail!("rabbitmq channel unavailable");
         };
         let records = std::mem::take(&mut self.batch);
+
+        // Canal-client format: the stateful encoder pairs update rows and
+        // derives the JSON envelope. Runs even for empty batches so held
+        // before-images whose pairing window expired are emitted as real
+        // deletes. The pending pairing state is intentionally NOT
+        // checkpointed — a crash replays the row pair at-least-once and
+        // the pairing window bounds any torn-pair damage, same as Kafka.
+        if let Some(encoder) = &mut self.canal_encoder {
+            if encoder.registered_tables() == 0 && !records.is_empty() {
+                // Automatic mapping still waiting for every table's
+                // initial-schema event; reaching here with buffered rows
+                // means the source emitted data before its schema (or
+                // never emitted one).
+                anyhow::bail!(
+                    "canal-client automatic column mapping: {} row(s) arrived before any \
+                     initial schema event — the source must emit the table schema first \
+                     (MySQL-CDC does; or configure canal-client.columns explicitly)",
+                    records.len()
+                );
+            }
+            let exchange = self.config.exchange.clone();
+            let routing_key = self.config.effective_routing_key();
+            let delivery_mode: u8 = if self.config.persistent { 2 } else { 1 };
+            let confirm_enabled = self.config.publisher_confirm;
+            let mut sent = 0usize;
+            for record in &records {
+                for message in encoder
+                    .encode(record)
+                    .map_err(|e| anyhow::anyhow!("canal-client encode: {}", e))?
+                {
+                    // Single-queue sink: every table's messages share the
+                    // configured exchange/routing-key (message.table is a
+                    // Kafka-topic routing hint, unused here).
+                    publish_canal_payload(
+                        channel,
+                        &exchange,
+                        &routing_key,
+                        delivery_mode,
+                        confirm_enabled,
+                        &message.payload,
+                    )
+                    .await?;
+                    sent += 1;
+                }
+            }
+            for message in encoder.expire_pending() {
+                publish_canal_payload(
+                    channel,
+                    &exchange,
+                    &routing_key,
+                    delivery_mode,
+                    confirm_enabled,
+                    &message.payload,
+                )
+                .await?;
+                sent += 1;
+            }
+            self.total_written += sent;
+            return Ok(sent);
+        }
+
         if records.is_empty() {
             return Ok(0);
         }
@@ -943,6 +1130,25 @@ impl SinkWriter for RabbitMqSinkWriter {
             );
             Ok(())
         })
+    }
+
+    fn apply_schema_change(
+        &mut self,
+        event: &seatunnel_api::SchemaChangeEvent,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+        // Canal-client automatic mapping: EVERY initial-schema event
+        // registers its table (positional columns, primary key, identity
+        // field mapping), so multi-table sources map each table with its
+        // own schema. Regular DDL changes are still ignored in auto mode;
+        // tracking schema evolution needs the explicit
+        // canal-client.columns config.
+        if self.canal_encoder.is_some()
+            && let Some(schema) = event.initial_schema_snapshot()
+        {
+            let schema = schema.clone();
+            return Box::pin(async move { self.register_canal_schema(&schema) });
+        }
+        Box::pin(async move { Ok(()) })
     }
 
     fn write(
@@ -1035,7 +1241,7 @@ impl Sink for RabbitMqSink {
                 >,
         >,
     > {
-        Ok(Box::new(RabbitMqSinkWriter::new(self.config.clone())))
+        Ok(Box::new(RabbitMqSinkWriter::new(self.config.clone())?))
     }
 
     fn restore_writer(
@@ -1051,7 +1257,7 @@ impl Sink for RabbitMqSink {
                 >,
         >,
     > {
-        let mut writer = RabbitMqSinkWriter::new(self.config.clone());
+        let mut writer = RabbitMqSinkWriter::new(self.config.clone())?;
         if let Some(bytes) = states.last() {
             let _ = writer.restore_from_state_bytes(bytes);
         }
@@ -1175,6 +1381,48 @@ mod tests {
         let rows = decode_payload(MessageFormat::Text, b"hello", None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), &Field::String("hello".into()));
+    }
+
+    #[test]
+    fn test_canal_client_config_parsing() {
+        // Only `format: canal_client_json` enables the encoder config.
+        assert!(config_from(&[]).canal_client.is_none());
+        assert!(config_from(&[("format", "json")]).canal_client.is_none());
+        let config = config_from(&[
+            ("format", "canal_client_json"),
+            ("canal-client.database-name", "db1"),
+            ("canal-client.table-name", "t1"),
+            ("canal-client.pairing_window_ms", "250"),
+        ]);
+        let canal = config.canal_client.expect("canal-client config present");
+        assert_eq!(canal.database_name, "db1");
+        assert_eq!(canal.table_name, "t1");
+        assert!(canal.columns.is_empty());
+        assert_eq!(canal.pairing_window_ms, 250);
+    }
+
+    #[test]
+    fn test_canal_client_writer_encoder_modes() {
+        // Auto mode: encoder built empty, tables registered from the
+        // source's initial-schema events.
+        let config = config_from(&[("format", "canal_client_json")]);
+        let writer = RabbitMqSinkWriter::new(config).expect("auto encoder builds");
+        let encoder = writer.canal_encoder.expect("encoder present");
+        assert!(!encoder.is_explicit());
+        assert_eq!(encoder.registered_tables(), 0);
+
+        // Explicit columns without a sub-table-fields mapping fail fast.
+        let config = config_from(&[
+            ("format", "canal_client_json"),
+            ("canal-client.table-name", "t1"),
+            ("canal-client.columns", "id,name"),
+        ]);
+        assert!(RabbitMqSinkWriter::new(config).is_err());
+
+        // Plain formats build a writer without an encoder.
+        let config = config_from(&[]);
+        let writer = RabbitMqSinkWriter::new(config).expect("plain writer builds");
+        assert!(writer.canal_encoder.is_none());
     }
 
     #[test]

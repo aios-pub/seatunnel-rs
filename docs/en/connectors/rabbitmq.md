@@ -70,3 +70,47 @@ and flags may differ from the connector defaults without failing the job
 `PRECONDITION_FAILED`). `exchange-type` (default `direct`) only applies
 when the exchange does not exist and has to be created. The queue binding
 is applied afterwards and is idempotent.
+
+## Canal-client format (CDC → RabbitMQ)
+
+With `format: canal_client_json` the sink encodes CDC rows through the
+same stateful canal-client encoder the Kafka sink uses, producing the
+Java-`AbstractCanalClient`-compatible envelope:
+
+```json
+{
+  "requestId": "32-hex UUID (fresh per message)",
+  "dbName": "neworiental_user",
+  "tableName": "entity_user",
+  "eventType": "insert | update | delete",
+  "data":    { "<column>": "<value>", ... },
+  "oldData": { "<column>": "<value>", ... }
+}
+```
+
+UPDATE binlog pairs merge into ONE message (`data` = after image,
+`oldData` = before image, both full column maps); a held before-image
+whose after-partner never arrives within
+`canal-client.pairing-window-ms` (default 100) is emitted as a delete.
+Column mapping is automatic: the sink registers each table from the
+source's initial-schema events (the writer must NOT receive rows before
+any schema event), or you can pin an explicit mapping with
+`canal-client.columns` + `canal-client.sub-table-fields`. Options
+(mirroring the Kafka sink): `canal-client.database-name`,
+`canal-client.table-name`, `canal-client.columns`,
+`canal-client.sub-table-fields`, `canal-client.server-time-zone`,
+`canal-client.pairing-window-ms`. All messages share the configured
+exchange/routing-key — `message.table`-based routing is a Kafka-topic
+concept and is ignored here.
+
+```yaml
+sink:
+  RabbitMQ:
+    host: 127.0.0.1
+    port: 5672
+    queue-name: cdc_events
+    exchange: exchange_canal_sync_user
+    routing-key: cdc_events
+    format: canal_client_json
+    canal-client.server-time-zone: local   # per-table automatic mapping
+```
