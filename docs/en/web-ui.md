@@ -281,7 +281,9 @@ are exported as Prometheus gauges (`seatunnel_worker_load_score`,
 The job detail page carries an **编辑配置并重启 (Edit & restart)** button
 (**以同 ID 重新提交** for terminal jobs). It opens an editor pre-filled
 with the job configuration EXACTLY as submitted (stored verbatim at
-submission time and returned by the status API).
+submission time and returned by the status API), plus a format selector —
+"auto-detect" (default), JSON, YAML or TOML, so the pasted config can be
+in the same YAML the job files are authored in.
 
 Confirming runs the update flow — identical to `seatunnel job update`:
 
@@ -298,6 +300,13 @@ wins, then the edited config's own `env.job.name`, and when neither is
 present the job keeps its current name (only a nameless, unknown job
 falls back to the job id). `POST /api/v1/jobs` resolves names the same
 way, falling back to a `job-<uuid prefix>` default.
+
+The update validates the config BEFORE cancelling anything: YAML/TOML
+edits go through the same parser as submit (source/sink presence
+checked, then rebuilt into the canonical JSON document), so an unusable
+edit is rejected with the parse error while the running job keeps its
+current config. A failed update also stays on the page as a sticky
+error banner (not just a transient toast), with the editor kept open.
 
 The request may take up to the cancel timeout (~seconds normally); the
 page shows the progress message while it runs and the status panel

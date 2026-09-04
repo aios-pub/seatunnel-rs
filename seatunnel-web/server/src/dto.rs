@@ -93,9 +93,11 @@ pub struct JobStatusDto {
 /// Request body for `POST /api/v1/jobs/{job_id}/update`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateJobDto {
-    /// Edited job config (JSON text, as returned by job_config).
+    /// Edited job config text.
     pub config_text: String,
-    /// Config format: "json" (default; the edit basis is JSON).
+    /// Config format of `config_text`: "json" (the edit basis returned by
+    /// job detail), "yaml"/"yml", "toml", "hocon"/"conf", or "auto"
+    /// (default: JSON first, then YAML).
     pub format: Option<String>,
     /// Optional display name override; when empty the config's
     /// `env.job.name` is used, then the job's current name.

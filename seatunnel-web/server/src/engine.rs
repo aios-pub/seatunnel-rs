@@ -369,6 +369,8 @@ pub struct FakeEngine {
     pub jobs: std::sync::Mutex<Vec<JobStatusDto>>,
     /// Name passed to the most recent `update_job`, for assertions.
     pub last_update_name: std::sync::Mutex<Option<String>>,
+    /// Config bytes passed to the most recent `update_job`, for assertions.
+    pub last_update_config: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 #[cfg(test)]
@@ -378,6 +380,7 @@ impl FakeEngine {
             unreachable: true,
             jobs: std::sync::Mutex::new(Vec::new()),
             last_update_name: std::sync::Mutex::new(None),
+            last_update_config: std::sync::Mutex::new(None),
         }
     }
 
@@ -410,6 +413,7 @@ impl FakeEngine {
             unreachable: false,
             jobs: std::sync::Mutex::new(vec![job]),
             last_update_name: std::sync::Mutex::new(None),
+            last_update_config: std::sync::Mutex::new(None),
         }
     }
 
@@ -459,7 +463,7 @@ impl EngineOps for FakeEngine {
         &self,
         job_id: &str,
         job_name: &str,
-        _config_bytes: Vec<u8>,
+        config_bytes: Vec<u8>,
         _parallelism: i32,
         _cancel_timeout_secs: u64,
     ) -> Result<UpdateResultDto, EngineError> {
@@ -467,6 +471,7 @@ impl EngineOps for FakeEngine {
             return Err(self.err());
         }
         *self.last_update_name.lock().unwrap() = Some(job_name.to_string());
+        *self.last_update_config.lock().unwrap() = Some(config_bytes);
         Ok(UpdateResultDto {
             job_id: job_id.to_string(),
             cancelled: true,

@@ -331,6 +331,10 @@ pub async fn submit_job(request: SubmitJobRequest) -> Result<SubmitResult, Strin
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct UpdateJobRequest {
     pub config_text: String,
+    /// Declared format of `config_text`: "json", "yaml", "toml" — omitted
+    /// means auto-detect (JSON first, then YAML).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

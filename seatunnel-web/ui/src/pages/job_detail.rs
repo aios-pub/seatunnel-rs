@@ -37,10 +37,15 @@ pub fn JobDetail() -> impl IntoView {
     let (stream_error, set_stream_error) = RwSignal::new_local(None::<String>).split();
     let (history, set_history) = RwSignal::new_local(None::<api::JobHistory>).split();
     let (error, set_error) = RwSignal::new_local(None::<String>).split();
-    // Edit-and-restart state: editor visibility, edited config, flow busy flag.
+    // Edit-and-restart state: editor visibility, edited config, declared
+    // config format ("" = auto-detect) and flow busy flag.
     let (editor_open, set_editor_open) = RwSignal::new_local(false).split();
     let (editor_text, set_editor_text) = RwSignal::new_local(String::new()).split();
+    let (editor_format, set_editor_format) = RwSignal::new_local(String::new()).split();
     let (updating, set_updating) = RwSignal::new_local(false).split();
+    // Sticky failure banner for the edit/restart actions: distinct from
+    // the polling `error`, which the next successful refresh clears.
+    let (action_error, set_action_error) = RwSignal::new_local(None::<String>).split();
     // Confirmation dialogs for the two destructive flows.
     let confirm_restart = RwSignal::new(false);
     let confirm_edit = RwSignal::new(false);
@@ -113,12 +118,15 @@ pub fn JobDetail() -> impl IntoView {
         let job_id = job_id.clone();
         Callback::new(move |_| {
             let text = editor_text.get_untracked();
+            let format = editor_format.get_untracked();
             let job_id = job_id.clone();
             set_updating.set(true);
+            set_action_error.set(None);
             push_toast(ToastKind::Info, t("jd.update_running"));
             spawn_local(async move {
                 let request = api::UpdateJobRequest {
                     config_text: text,
+                    format: (!format.is_empty()).then_some(format),
                     job_name: None,
                     parallelism: None,
                     cancel_timeout_secs: Some(60),
@@ -138,7 +146,14 @@ pub fn JobDetail() -> impl IntoView {
                         request_refresh();
                         set_editor_open.set(false);
                     }
-                    Err(err) => push_toast(ToastKind::Error, tf("jd.update_failed", &[&err])),
+                    Err(err) => {
+                        // Keep the editor open with the edited text and
+                        // surface the failure on the page itself — a
+                        // transient toast is easy to miss while the panel
+                        // still shows the old config.
+                        set_action_error.set(Some(err.clone()));
+                        push_toast(ToastKind::Error, tf("jd.update_failed", &[&err]));
+                    }
                 }
                 set_updating.set(false);
             });
@@ -151,6 +166,7 @@ pub fn JobDetail() -> impl IntoView {
         Callback::new(move |_| {
             let job_id = job_id.clone();
             set_updating.set(true);
+            set_action_error.set(None);
             push_toast(ToastKind::Info, t("jd.restart_started"));
             spawn_local(async move {
                 match api::restart_job(&job_id).await {
@@ -158,7 +174,10 @@ pub fn JobDetail() -> impl IntoView {
                         push_toast(ToastKind::Success, tf("jd.restarted", &[&result.message]));
                         request_refresh();
                     }
-                    Err(err) => push_toast(ToastKind::Error, tf("jd.restart_failed", &[&err])),
+                    Err(err) => {
+                        set_action_error.set(Some(err.clone()));
+                        push_toast(ToastKind::Error, tf("jd.restart_failed", &[&err]));
+                    }
                 }
                 set_updating.set(false);
             });
@@ -184,6 +203,7 @@ pub fn JobDetail() -> impl IntoView {
 
     view! {
         <ErrorBanner message=Signal::derive(move || error.get()) />
+        <ErrorBanner message=Signal::derive(move || action_error.get()) />
         {move || {
             status
                 .get()
@@ -281,6 +301,25 @@ pub fn JobDetail() -> impl IntoView {
                                 view! {
                                     <div class="panel editor-panel">
                                         <h2>{t("jd.editor_title")}</h2>
+                                        <label class="editor-format">
+                                            <span>{t("jd.editor_format")}</span>
+                                            <select
+                                                prop:value=move || editor_format.get()
+                                                on:change=move |ev| {
+                                                    let value = ev
+                                                        .target()
+                                                        .and_then(|t| t.dyn_into::<web_sys::HtmlSelectElement>().ok())
+                                                        .map(|s| s.value())
+                                                        .unwrap_or_default();
+                                                    set_editor_format.set(value);
+                                                }
+                                            >
+                                                <option value="">{t("jd.fmt_auto")}</option>
+                                                <option value="json">JSON</option>
+                                                <option value="yaml">YAML</option>
+                                                <option value="toml">TOML</option>
+                                            </select>
+                                        </label>
                                         <textarea
                                             class="config-editor"
                                             prop:value=move || editor_text.get()

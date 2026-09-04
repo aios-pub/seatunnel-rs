@@ -93,10 +93,7 @@ pub fn build_router(state: AppState) -> Router {
                 "/api/v1/jobs/{job_id}/logs/stream",
                 get(api::jobs::job_logs_stream),
             )
-            .route(
-                "/api/v1/jobs/{job_id}/history",
-                get(api::jobs::job_history),
-            )
+            .route("/api/v1/jobs/{job_id}/history", get(api::jobs::job_history))
             .route("/api/v1/cluster", get(api::cluster))
             .route(
                 "/api/v1/cluster/workers/{worker_id}",
@@ -497,8 +494,8 @@ mod tests {
         let cookie = login_cookie(&state).await;
         let config = serde_json::json!({
             "env": { "job": { "name": "user-role-rabbitmq" } },
-            "source": [],
-            "sink": []
+            "source": [{ "Console": {} }],
+            "sink": [{ "Console": {} }]
         });
         let (status, body) = post_json_body(
             &state,
@@ -519,7 +516,7 @@ mod tests {
         let fake = Arc::new(FakeEngine::with_running_job());
         let state = test_state_shared(fake.clone());
         let cookie = login_cookie(&state).await;
-        let config = serde_json::json!({ "env": {}, "source": [], "sink": [] });
+        let config = serde_json::json!({ "env": {}, "source": [{ "Console": {} }], "sink": [{ "Console": {} }] });
         let (status, body) = post_json_body(
             &state,
             "/api/v1/jobs/job-1/update",
@@ -534,6 +531,44 @@ mod tests {
             *fake.last_update_name.lock().unwrap(),
             Some("demo".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn update_accepts_yaml_config_text_and_canonicalizes_it() {
+        // The edit flow must accept the format job files are authored in,
+        // not just the JSON edit basis — auto-detect parses YAML and
+        // rebuilds the canonical array-valued document.
+        let fake = Arc::new(FakeEngine::with_running_job());
+        let state = test_state_shared(fake.clone());
+        let cookie = login_cookie(&state).await;
+        let yaml = "\
+env:
+  job:
+    name: yaml-named
+source:
+  Console: {}
+sink:
+  Console: {}
+";
+        let (status, body) = post_json_body(
+            &state,
+            "/api/v1/jobs/job-1/update",
+            serde_json::json!({ "config_text": yaml }).to_string(),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {}", body);
+        assert_eq!(
+            *fake.last_update_name.lock().unwrap(),
+            Some("yaml-named".to_string())
+        );
+        let bytes = fake.last_update_config.lock().unwrap().clone().unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            config["source"].as_array().is_some(),
+            "expected canonical array form, got: {config}"
+        );
+        assert_eq!(config["sink"].as_array().unwrap().len(), 1);
     }
 
     /// `delete_json` — DELETE with the session cookie; returns the body.
@@ -635,8 +670,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("task-0"), "body: {}", body);
         assert!(body.contains("demo"), "body: {}", body);
-        let (status, _) =
-            get_json(&state, "/api/v1/cluster/workers/nope", Some(&cookie)).await;
+        let (status, _) = get_json(&state, "/api/v1/cluster/workers/nope", Some(&cookie)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

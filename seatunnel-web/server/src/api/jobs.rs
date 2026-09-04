@@ -116,28 +116,12 @@ pub async fn submit_job(
         Ok(parsed) => parsed,
         Err(e) => return bad_request(format!("config parse error: {}", e)),
     };
-    if parsed.sources.is_empty() {
-        return bad_request("config has no source section".to_string());
-    }
-    if parsed.sinks.is_empty() {
-        return bad_request("config has no sink section".to_string());
+    if let Err(e) = validate_parsed(&parsed) {
+        return bad_request(e);
     }
 
     // Rebuild the canonical JSON document the master's compiler expects.
-    let mut doc = serde_json::Map::new();
-    if let Some(env) = parsed.env {
-        doc.insert("env".to_string(), env);
-    }
-    doc.insert(
-        "source".to_string(),
-        serde_json::Value::Array(parsed.sources),
-    );
-    doc.insert(
-        "transform".to_string(),
-        serde_json::Value::Array(parsed.transforms),
-    );
-    doc.insert("sink".to_string(), serde_json::Value::Array(parsed.sinks));
-    let config = serde_json::Value::Object(doc);
+    let config = canonical_doc(parsed);
     let config_bytes = match serde_json::to_vec(&config) {
         Ok(bytes) => bytes,
         Err(e) => return bad_request(format!("config serialization error: {}", e)),
@@ -164,24 +148,15 @@ pub async fn update_job(
     Path(job_id): Path<String>,
     Json(body): Json<UpdateJobDto>,
 ) -> Response {
-    // The edit basis is the JSON returned by job detail; accept only JSON
-    // (other formats are submit-time concerns).
-    let format = body.format.as_deref().unwrap_or("json");
-    if format != "json" {
-        return error_response(&EngineError::Invalid(
-            "update accepts JSON config text (as returned by the job detail's job_config)"
-                .to_string(),
-        ));
-    }
     let config = match body.config_text.trim() {
         "" => {
             return error_response(&EngineError::Invalid(
                 "config_text must not be empty".to_string(),
             ));
         }
-        text => match serde_json::from_str::<serde_json::Value>(text) {
-            Ok(value) => value,
-            Err(e) => return error_response(&EngineError::Invalid(format!("invalid JSON config: {}", e))),
+        text => match parse_edited_config(text, body.format.as_deref()) {
+            Ok(config) => config,
+            Err(e) => return error_response(&EngineError::Invalid(e)),
         },
     };
     let config_bytes = match serde_json::to_vec(&config) {
@@ -194,10 +169,10 @@ pub async fn update_job(
     // config, not the job's identity — and only a nameless, unknown job
     // falls back to the job id.
     let mut job_name = body.job_name.clone().or_else(|| env_job_name(&config));
-    if job_name.is_none() {
-        if let Ok(status) = state.engine.job_status(&job_id).await {
-            job_name = Some(status.job_name);
-        }
+    if job_name.is_none()
+        && let Ok(status) = state.engine.job_status(&job_id).await
+    {
+        job_name = Some(status.job_name);
     }
     let job_name = job_name.unwrap_or_else(|| job_id.clone());
     match state
@@ -278,6 +253,101 @@ fn parse_format(value: Option<&str>) -> Result<seatunnel_config::ConfigFormat, S
             "unsupported format '{}' (expected yaml, toml or hocon)",
             other
         )),
+    }
+}
+
+/// Source/sink presence checks shared by the submit and update paths.
+fn validate_parsed(parsed: &seatunnel_config::ParsedConfig) -> Result<(), String> {
+    if parsed.sources.is_empty() {
+        return Err("config has no source section".to_string());
+    }
+    if parsed.sinks.is_empty() {
+        return Err("config has no sink section".to_string());
+    }
+    Ok(())
+}
+
+/// Rebuild the canonical JSON document the master's compiler expects
+/// (`env` + array-valued `source`/`transform`/`sink`).
+fn canonical_doc(parsed: seatunnel_config::ParsedConfig) -> serde_json::Value {
+    let mut doc = serde_json::Map::new();
+    if let Some(env) = parsed.env {
+        doc.insert("env".to_string(), env);
+    }
+    doc.insert(
+        "source".to_string(),
+        serde_json::Value::Array(parsed.sources),
+    );
+    doc.insert(
+        "transform".to_string(),
+        serde_json::Value::Array(parsed.transforms),
+    );
+    doc.insert("sink".to_string(), serde_json::Value::Array(parsed.sinks));
+    serde_json::Value::Object(doc)
+}
+
+/// Cheap structural gate for a JSON edit before it enters the update
+/// flow: the master validates deeply at plan time, but that runs AFTER
+/// the old incarnation was cancelled — rejecting an unusable config here
+/// leaves the running job untouched.
+fn validate_sections(config: &serde_json::Value) -> Result<(), String> {
+    if config.get("pipelines").is_some() {
+        return Ok(()); // engine pipeline-list form: master validates deeply
+    }
+    for section in ["source", "sink"] {
+        let usable = match config.get(section) {
+            Some(serde_json::Value::Array(items)) => !items.is_empty(),
+            Some(serde_json::Value::Object(map)) => !map.is_empty(),
+            _ => false,
+        };
+        if !usable {
+            return Err(format!(
+                "config has no usable '{section}' section (rejected before cancel so the \
+                 running job keeps its current config)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse an edited config in the declared format. `json` is the edit
+/// basis (what job detail returns); `yaml`/`toml`/`hocon` go through the
+/// same parser as submit and are rebuilt into the canonical document;
+/// `auto` (default) tries JSON first, then YAML — the format job files
+/// are authored in.
+fn parse_edited_config(text: &str, format: Option<&str>) -> Result<serde_json::Value, String> {
+    match format
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("auto") => {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(text) {
+                validate_sections(&config)?;
+                return Ok(config);
+            }
+            let parsed =
+                seatunnel_config::parse_config_file(text, seatunnel_config::ConfigFormat::YAML)
+                    .map_err(|e| {
+                        format!("config is neither valid JSON nor YAML (YAML error: {})", e)
+                    })?;
+            validate_parsed(&parsed)?;
+            Ok(canonical_doc(parsed))
+        }
+        Some("json") => {
+            let config = serde_json::from_str::<serde_json::Value>(text)
+                .map_err(|e| format!("invalid JSON config: {}", e))?;
+            validate_sections(&config)?;
+            Ok(config)
+        }
+        Some(specified) => {
+            let format = parse_format(Some(specified))?;
+            let parsed = seatunnel_config::parse_config_file(text, format)
+                .map_err(|e| format!("config parse error: {}", e))?;
+            validate_parsed(&parsed)?;
+            Ok(canonical_doc(parsed))
+        }
     }
 }
 
@@ -399,7 +469,9 @@ mod tests {
     use super::tail_delta;
 
     fn lines(start: usize, count: usize) -> Vec<String> {
-        (start..start + count).map(|i| format!("line-{i}")).collect()
+        (start..start + count)
+            .map(|i| format!("line-{i}"))
+            .collect()
     }
 
     #[test]
@@ -467,5 +539,68 @@ mod tests {
             None
         );
         assert_eq!(super::env_job_name(&serde_json::json!({})), None);
+    }
+
+    const YAML_BODY: &str = "\
+env:
+  job:
+    name: edited-job
+source:
+  MySQL-CDC:
+    hostname: localhost
+sink:
+  Console: {}
+";
+
+    #[test]
+    fn edited_config_auto_detects_yaml() {
+        // YAML is not valid JSON, so auto falls through to the YAML parser
+        // and rebuilds the canonical array-valued document.
+        let config = super::parse_edited_config(YAML_BODY, None).unwrap();
+        assert_eq!(config["source"].as_array().unwrap().len(), 1);
+        assert_eq!(config["sink"].as_array().unwrap().len(), 1);
+        assert_eq!(config["env"]["job"]["name"], "edited-job");
+    }
+
+    #[test]
+    fn edited_config_auto_prefers_json() {
+        let json = r#"{"env":{},"source":[{"Console":{}}],"sink":[{"Console":{}}]}"#;
+        let config = super::parse_edited_config(json, None).unwrap();
+        assert!(config.get("transform").is_none()); // passed through as-is
+    }
+
+    #[test]
+    fn edited_config_explicit_formats() {
+        for format in ["json", "yaml", "toml"] {
+            let text = match format {
+                "json" => r#"{"source":[{"Console":{}}],"sink":[{"Console":{}}]}"#.to_string(),
+                "yaml" => YAML_BODY.to_string(),
+                _ => "\
+[source.Console]
+[sink.Console]
+"
+                .to_string(),
+            };
+            let config = super::parse_edited_config(&text, Some(format)).unwrap();
+            assert!(!config["source"].as_array().unwrap().is_empty());
+            assert!(!config["sink"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn edited_config_rejects_unusable_sections_before_cancel() {
+        let json = r#"{"source":[{"Console":{}}],"sink":[]}"#;
+        let err = super::parse_edited_config(json, Some("json")).unwrap_err();
+        assert!(err.contains("'sink'"), "mentions the bad section: {err}");
+        assert!(super::parse_edited_config("not a config", None).is_err());
+    }
+
+    #[test]
+    fn edited_config_accepts_pipeline_list_form() {
+        // The engine's pipelines form has no top-level source/sink; the
+        // master validates it deeply at plan time.
+        let json =
+            r#"{"pipelines":[{"name":"p","source":{"Console":{}},"sinks":[{"Console":{}}]}]}"#;
+        assert!(super::parse_edited_config(json, Some("json")).is_ok());
     }
 }
