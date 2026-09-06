@@ -10,6 +10,7 @@ description = "Apache SeaTunnel Rust - Web management console (REST API + embedd
 seatunnel-engine-client = { workspace = true }
 seatunnel-engine-comm = { workspace = true }
 seatunnel-config = { workspace = true }
+seatunnel-common = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }

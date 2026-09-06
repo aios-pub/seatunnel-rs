@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 seatunnel-api = { path = "../seatunnel-api" }
+seatunnel-common = { path = "../seatunnel-common" }
 seatunnel-engine-core = { path = "../seatunnel-engine/seatunnel-engine-core", features = ["connectors"] }
 seatunnel-engine-client = { path = "../seatunnel-engine/seatunnel-engine-client" }
 seatunnel-config = { path = "../seatunnel-config" }

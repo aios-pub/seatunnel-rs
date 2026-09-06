@@ -14,12 +14,33 @@ use seatunnel_engine_client::EngineClient;
 use seatunnel_engine_comm::{
     CheckpointEntry, ClusterInfo, JobCheckpointHistory, JobList, JobStatus, JobSummary,
 };
+use std::fmt;
 
 use crate::dto::{
     CheckpointEntryDto, CheckpointHistoryDto, ClusterInfoDto, JobLogsDto, JobStatusDto,
     JobSummaryDto, SubmitJobDto, SubmitResultDto, TaskCheckpointDto, TaskLogsDto, TaskStatusDto,
     UpdateResultDto, WorkerDto,
 };
+
+/// A master-side gRPC failure kept whole: code, message and the
+/// underlying transport error stay reachable via [`std::error::Error::source`],
+/// so error logs can walk the full cause chain instead of a folded
+/// string. Display stays the bare status message — HTTP error bodies are
+/// unchanged.
+#[derive(Debug)]
+pub struct RpcStatus(tonic::Status);
+
+impl fmt::Display for RpcStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.message())
+    }
+}
+
+impl std::error::Error for RpcStatus {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
 
 /// Engine operation failures, mapped to HTTP statuses by the handlers.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +51,12 @@ pub enum EngineError {
     Invalid(String),
     #[error("master unreachable: {0}")]
     Unreachable(String),
+    /// Raw master RPC failure with the original status preserved as the
+    /// error source (code, message and transport chain).
+    #[error("{0}")]
+    Rpc(#[from] RpcStatus),
+    /// Folded failure for error text that carries no error object
+    /// (failover loops and client-side message building).
     #[error("{0}")]
     Engine(String),
 }
@@ -42,7 +69,7 @@ impl EngineError {
             EngineError::NotFound(_) => StatusCode::NOT_FOUND,
             EngineError::Invalid(_) => StatusCode::BAD_REQUEST,
             EngineError::Unreachable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            EngineError::Engine(_) => StatusCode::BAD_GATEWAY,
+            EngineError::Engine(_) | EngineError::Rpc(_) => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -55,7 +82,10 @@ impl EngineError {
                     EngineError::Invalid(status.message().to_string())
                 }
                 tonic::Code::Unavailable => EngineError::Unreachable(status.message().to_string()),
-                _ => EngineError::Engine(status.message().to_string()),
+                // Keep the status object: its message and transport source
+                // (e.g. the h2/connect error behind the failure) stay
+                // walkable from the logs.
+                _ => EngineError::Rpc(RpcStatus(status.clone())),
             };
         }
         // Connect failures from EngineClient's failover loop surface here.
@@ -622,5 +652,62 @@ impl EngineOps for FakeEngine {
                 }],
             })
             .ok_or_else(|| EngineError::NotFound(format!("Job {} not found", job_id)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seatunnel_common::error_chain;
+
+    /// A non-classified gRPC status keeps its message as the user-facing
+    /// text (HTTP bodies unchanged) while mapping to BAD_GATEWAY.
+    #[test]
+    fn rpc_errors_keep_the_status_message_as_display() {
+        let status = tonic::Status::new(tonic::Code::Internal, "coordinator write failed");
+        let err = EngineError::from_client(Box::new(status));
+        assert!(matches!(err, EngineError::Rpc(_)), "err: {err:?}");
+        assert_eq!(err.to_string(), "coordinator write failed");
+        assert_eq!(err.http_status(), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    /// The wrapped status stays walkable: the cause chain reaches the
+    /// transport error behind the RPC failure.
+    #[test]
+    fn rpc_error_chain_reaches_the_transport_cause() {
+        let status = tonic::Status::from_error(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused (os error 111)",
+        )));
+        let err = EngineError::from_client(Box::new(status));
+        let chain = error_chain(&err);
+        assert!(
+            chain.contains("caused by: connection refused (os error 111)"),
+            "chain: {chain}"
+        );
+    }
+
+    /// Classified codes are unaffected: still folded variants with the
+    /// same statuses as before.
+    #[test]
+    fn classified_statuses_keep_their_variants() {
+        let cases = [
+            (tonic::Code::NotFound, EngineError::NotFound(String::new())),
+            (
+                tonic::Code::InvalidArgument,
+                EngineError::Invalid(String::new()),
+            ),
+            (
+                tonic::Code::Unavailable,
+                EngineError::Unreachable(String::new()),
+            ),
+        ];
+        for (code, expected) in cases {
+            let err = EngineError::from_client(Box::new(tonic::Status::new(code, "x".to_string())));
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&expected)
+            );
+        }
     }
 }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "seatunnel-api",
+    "seatunnel-common",
     "seatunnel-engine/seatunnel-engine-core",
     "seatunnel-engine/seatunnel-engine-comm",
     "seatunnel-engine/seatunnel-engine-server",
@@ -160,6 +161,7 @@ datafusion-expr = "43"
 
 # Workspace members
 seatunnel-api = { path = "seatunnel-api" }
+seatunnel-common = { path = "seatunnel-common" }
 seatunnel-engine-core = { path = "seatunnel-engine/seatunnel-engine-core" }
 seatunnel-engine-comm = { path = "seatunnel-engine/seatunnel-engine-comm" }
 seatunnel-engine-server = { path = "seatunnel-engine/seatunnel-engine-server" }

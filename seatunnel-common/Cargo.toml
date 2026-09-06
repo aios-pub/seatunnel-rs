@@ -1,0 +1,10 @@
+[package]
+name = "seatunnel-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apache SeaTunnel Rust - Shared process-level observability infrastructure"
+
+[dependencies]
+tracing = { workspace = true }

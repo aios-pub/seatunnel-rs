@@ -6056,6 +6056,7 @@ dependencies = [
  "chrono",
  "clap",
  "seatunnel-api",
+ "seatunnel-common",
  "seatunnel-config",
  "seatunnel-engine-client",
  "seatunnel-engine-core",
@@ -6067,6 +6068,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "seatunnel-common"
+version = "0.5.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
@@ -6401,6 +6409,7 @@ dependencies = [
  "prometheus",
  "rust-rocksdb",
  "seatunnel-api",
+ "seatunnel-common",
  "seatunnel-connector-cdc-mysql",
  "seatunnel-connector-cdc-postgres",
  "seatunnel-connector-cdc-tidb",
@@ -6482,6 +6491,7 @@ dependencies = [
  "mime_guess",
  "prometheus",
  "rust-embed",
+ "seatunnel-common",
  "seatunnel-config",
  "seatunnel-engine-client",
  "seatunnel-engine-comm",

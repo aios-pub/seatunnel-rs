@@ -9,6 +9,7 @@ description = "Apache SeaTunnel Rust - Engine Server: Master + Worker nodes"
 [dependencies]
 seatunnel-engine-core = { path = "../seatunnel-engine-core" }
 seatunnel-engine-comm = { path = "../seatunnel-engine-comm" }
+seatunnel-common = { path = "../../seatunnel-common" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = "0.1"

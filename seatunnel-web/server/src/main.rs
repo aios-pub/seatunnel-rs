@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // Panics (message + site + forced backtrace) go through the logger.
+    seatunnel_common::install_panic_hook();
 
     let args = Args::parse();
 

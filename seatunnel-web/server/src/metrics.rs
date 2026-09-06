@@ -13,6 +13,7 @@ use prometheus::{
     Encoder, GaugeVec, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder,
 };
+use seatunnel_common::Locate;
 
 use crate::AppState;
 use crate::engine::EngineOps;
@@ -324,98 +325,112 @@ impl Metrics {
             self.jobs.with_label_values(&[state]).set(0);
         }
 
-        if let Ok(jobs) = engine.list_jobs().await {
-            self.refresh_last_ok_unix_ts.set(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-            );
-            let now = std::time::Instant::now();
-            let mut live_labels = HashSet::new();
-            let live_jobs: std::collections::HashSet<String> =
-                jobs.iter().map(|j| j.job_id.clone()).collect();
-            for job in jobs {
-                self.jobs.with_label_values(&[&job.state]).inc();
-                if let Ok(status) = engine.job_status(&job.job_id).await {
-                    let mut points = Vec::new();
-                    let mut samples = self.rate_samples.lock().unwrap();
-                    for task in status.tasks {
-                        let key = (job.job_id.clone(), task.task_id.clone());
-                        let labels = [job.job_id.as_str(), task.task_id.as_str()];
-                        self.task_processed_records
-                            .with_label_values(&labels)
-                            .set(task.processed_records);
-                        // Throughput from consecutive refresh samples.
-                        let rate = match samples.get(&key) {
-                            Some((prev_records, prev_at))
-                                if task.processed_records >= *prev_records =>
-                            {
-                                let dt = now.duration_since(*prev_at).as_secs_f64();
-                                if dt > 0.0 {
-                                    ((task.processed_records - prev_records) as f64 / dt) as i64
-                                } else {
-                                    0
-                                }
-                            }
-                            _ => 0,
-                        };
-                        self.task_records_per_second
-                            .with_label_values(&labels)
-                            .set(rate);
-                        samples.insert(key, (task.processed_records, now));
-                        // Liveness: seconds since the last record.
-                        let now_epoch = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        let idle = if task.last_record_ms > 0 {
-                            (now_epoch - task.last_record_ms).max(0) / 1000
-                        } else {
-                            -1
-                        };
-                        self.task_idle_seconds.with_label_values(&labels).set(idle);
-                        if let Some(m) = &task.sink_metrics {
-                            self.task_sink_sent
-                                .with_label_values(&labels)
-                                .set(m.sent as i64);
-                            self.task_sink_delivered
-                                .with_label_values(&labels)
-                                .set(m.delivered as i64);
-                            self.task_sink_failed
-                                .with_label_values(&labels)
-                                .set(m.failed as i64);
-                            self.task_sink_in_flight
-                                .with_label_values(&labels)
-                                .set(m.in_flight as i64);
-                            self.task_sink_delivery_latency_ema_ms
-                                .with_label_values(&labels)
-                                .set(m.latency_ema_ms);
-                            self.task_sink_delivery_latency_max_ms
-                                .with_label_values(&labels)
-                                .set(m.latency_max_ms as i64);
-                        }
-                        points.push(TaskPoint {
-                            task_id: task.task_id.clone(),
-                            records_per_sec: rate as f64,
-                            latency_ema_ms: task
-                                .sink_metrics
-                                .as_ref()
-                                .map(|m| m.latency_ema_ms)
-                                .unwrap_or(0.0),
-                            latency_max_ms: task
-                                .sink_metrics
-                                .as_ref()
-                                .map(|m| m.latency_max_ms)
-                                .unwrap_or(0),
-                        });
-                        live_labels.insert((job.job_id.clone(), task.task_id.clone()));
-                    }
-                    // Feed the console's chart ring with this cycle's rates.
-                    history.record_job(&job.job_id, points);
-                }
+        // Statistic-chain failures say where and why in the log, not only
+        // through the refresh_failures counter: the `{:?}` of the located
+        // error carries the producing file:line plus the full cause chain.
+        let jobs = match engine.list_jobs().await.located() {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                // Gauges keep their last values — a zeroed dashboard is
+                // worse than a stale one; the counter + log mark the gap.
+                self.refresh_failures.inc();
+                tracing::warn!("engine refresh failed to list jobs: {:?}", e);
+                return;
             }
-            // Drop gauges of tasks that disappeared (job finished/evicted).
+        };
+        self.refresh_last_ok_unix_ts.set(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        let now = std::time::Instant::now();
+        let mut live_labels = HashSet::new();
+        let live_jobs: std::collections::HashSet<String> =
+            jobs.iter().map(|j| j.job_id.clone()).collect();
+        for job in jobs {
+            self.jobs.with_label_values(&[&job.state]).inc();
+            if let Ok(status) = engine.job_status(&job.job_id).await {
+                let mut points = Vec::new();
+                let mut samples = self.rate_samples.lock().unwrap();
+                for task in status.tasks {
+                    let key = (job.job_id.clone(), task.task_id.clone());
+                    let labels = [job.job_id.as_str(), task.task_id.as_str()];
+                    self.task_processed_records
+                        .with_label_values(&labels)
+                        .set(task.processed_records);
+                    // Throughput from consecutive refresh samples.
+                    let rate = match samples.get(&key) {
+                        Some((prev_records, prev_at))
+                            if task.processed_records >= *prev_records =>
+                        {
+                            let dt = now.duration_since(*prev_at).as_secs_f64();
+                            if dt > 0.0 {
+                                ((task.processed_records - prev_records) as f64 / dt) as i64
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 0,
+                    };
+                    self.task_records_per_second
+                        .with_label_values(&labels)
+                        .set(rate);
+                    samples.insert(key, (task.processed_records, now));
+                    // Liveness: seconds since the last record.
+                    let now_epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let idle = if task.last_record_ms > 0 {
+                        (now_epoch - task.last_record_ms).max(0) / 1000
+                    } else {
+                        -1
+                    };
+                    self.task_idle_seconds.with_label_values(&labels).set(idle);
+                    if let Some(m) = &task.sink_metrics {
+                        self.task_sink_sent
+                            .with_label_values(&labels)
+                            .set(m.sent as i64);
+                        self.task_sink_delivered
+                            .with_label_values(&labels)
+                            .set(m.delivered as i64);
+                        self.task_sink_failed
+                            .with_label_values(&labels)
+                            .set(m.failed as i64);
+                        self.task_sink_in_flight
+                            .with_label_values(&labels)
+                            .set(m.in_flight as i64);
+                        self.task_sink_delivery_latency_ema_ms
+                            .with_label_values(&labels)
+                            .set(m.latency_ema_ms);
+                        self.task_sink_delivery_latency_max_ms
+                            .with_label_values(&labels)
+                            .set(m.latency_max_ms as i64);
+                    }
+                    points.push(TaskPoint {
+                        task_id: task.task_id.clone(),
+                        records_per_sec: rate as f64,
+                        latency_ema_ms: task
+                            .sink_metrics
+                            .as_ref()
+                            .map(|m| m.latency_ema_ms)
+                            .unwrap_or(0.0),
+                        latency_max_ms: task
+                            .sink_metrics
+                            .as_ref()
+                            .map(|m| m.latency_max_ms)
+                            .unwrap_or(0),
+                    });
+                    live_labels.insert((job.job_id.clone(), task.task_id.clone()));
+                }
+                // Feed the console's chart ring with this cycle's rates.
+                history.record_job(&job.job_id, points);
+            }
+        }
+        // Drop gauges of tasks that disappeared (job finished/evicted).
+        // Scoped so the guard drops before the cluster RPC below.
+        {
             let mut previous = self.task_labels.lock().unwrap();
             for (job, task) in previous.difference(&live_labels) {
                 let _ = self
@@ -423,56 +438,61 @@ impl Metrics {
                     .remove_label_values(&[job, task]);
             }
             *previous = live_labels;
-            // Trim chart series of jobs that left the engine.
-            history.retain_jobs(&live_jobs);
         }
+        // Trim chart series of jobs that left the engine.
+        history.retain_jobs(&live_jobs);
 
-        if let Ok(cluster) = engine.cluster_info().await {
-            self.workers.set(cluster.available_workers as i64);
-            self.running_tasks.set(cluster.running_tasks as i64);
-            let mut live: HashSet<String> = HashSet::new();
-            let worker_points: Vec<WorkerPoint> = cluster
-                .workers
-                .iter()
-                .map(|w| WorkerPoint {
-                    worker_id: w.worker_id.clone(),
-                    load_permille: w.load_score_permille,
-                    lag_ms: w.lag_ms,
-                    mem_permille: w.mem_permille,
-                    cpu_permille: w.cpu_permille,
-                })
-                .collect();
-            history.record_cluster(cluster.running_tasks, worker_points);
-            for w in &cluster.workers {
-                let id = w.worker_id.clone();
-                self.worker_load_score
-                    .with_label_values(&[&id])
-                    .set(w.load_score_permille as i64);
-                self.worker_overloaded
-                    .with_label_values(&[&id])
-                    .set(if w.can_accept { 0 } else { 1 });
-                self.worker_lag_ms
-                    .with_label_values(&[&id])
-                    .set(w.lag_ms as i64);
-                self.worker_mem_ratio
-                    .with_label_values(&[&id])
-                    .set(w.mem_permille as i64);
-                live.insert(id);
+        let cluster = match engine.cluster_info().await.located() {
+            Ok(cluster) => cluster,
+            Err(e) => {
+                // Unreachable master: gauges keep their last values —
+                // count it so a stale console page is visible from the
+                // metrics themselves.
+                self.refresh_failures.inc();
+                tracing::warn!("engine refresh failed to read cluster info: {:?}", e);
+                return;
             }
-            // Drop gauges of workers that disappeared.
-            let mut previous = self.worker_labels.lock().unwrap();
-            for id in previous.difference(&live) {
-                let _ = self.worker_load_score.remove_label_values(&[id]);
-                let _ = self.worker_overloaded.remove_label_values(&[id]);
-                let _ = self.worker_lag_ms.remove_label_values(&[id]);
-                let _ = self.worker_mem_ratio.remove_label_values(&[id]);
-            }
-            *previous = live;
-        } else {
-            // Unreachable master: gauges keep their last values — count it
-            // so a stale console page is visible from the metrics themselves.
-            self.refresh_failures.inc();
+        };
+        self.workers.set(cluster.available_workers as i64);
+        self.running_tasks.set(cluster.running_tasks as i64);
+        let mut live: HashSet<String> = HashSet::new();
+        let worker_points: Vec<WorkerPoint> = cluster
+            .workers
+            .iter()
+            .map(|w| WorkerPoint {
+                worker_id: w.worker_id.clone(),
+                load_permille: w.load_score_permille,
+                lag_ms: w.lag_ms,
+                mem_permille: w.mem_permille,
+                cpu_permille: w.cpu_permille,
+            })
+            .collect();
+        history.record_cluster(cluster.running_tasks, worker_points);
+        for w in &cluster.workers {
+            let id = w.worker_id.clone();
+            self.worker_load_score
+                .with_label_values(&[&id])
+                .set(w.load_score_permille as i64);
+            self.worker_overloaded
+                .with_label_values(&[&id])
+                .set(if w.can_accept { 0 } else { 1 });
+            self.worker_lag_ms
+                .with_label_values(&[&id])
+                .set(w.lag_ms as i64);
+            self.worker_mem_ratio
+                .with_label_values(&[&id])
+                .set(w.mem_permille as i64);
+            live.insert(id);
         }
+        // Drop gauges of workers that disappeared.
+        let mut previous = self.worker_labels.lock().unwrap();
+        for id in previous.difference(&live) {
+            let _ = self.worker_load_score.remove_label_values(&[id]);
+            let _ = self.worker_overloaded.remove_label_values(&[id]);
+            let _ = self.worker_lag_ms.remove_label_values(&[id]);
+            let _ = self.worker_mem_ratio.remove_label_values(&[id]);
+        }
+        *previous = live;
     }
 }
 

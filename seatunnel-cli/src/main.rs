@@ -31,6 +31,8 @@ async fn main() -> Result<()> {
             )),
         )
         .init();
+    // Panics (message + site + forced backtrace) go through the logger.
+    seatunnel_common::install_panic_hook();
     seatunnel_cli::execute(cli).await?;
     Ok(())
 }

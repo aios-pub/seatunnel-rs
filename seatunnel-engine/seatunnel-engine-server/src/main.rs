@@ -211,6 +211,9 @@ async fn main() -> anyhow::Result<()> {
         args.log_dir.as_deref(),
         &engine_config.state_dir,
     );
+    // Panics (message + site + forced backtrace) go through the logger —
+    // stdout plus the daily rolling files, like every other error.
+    seatunnel_common::install_panic_hook();
 
     tracing::info!(
         "Engine config: state_dir={} keep-checkpoint-count={} checkpoint-interval={}ms \

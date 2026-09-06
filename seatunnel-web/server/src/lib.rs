@@ -30,7 +30,7 @@ pub use dto::{
     CheckpointEntryDto, CheckpointHistoryDto, ClusterInfoDto, ErrorDto, JobStatusDto,
     JobSummaryDto, SubmitJobDto, SubmitResultDto, TaskCheckpointDto, TaskStatusDto, WorkerDto,
 };
-pub use engine::{EngineError, EngineOps};
+pub use engine::{EngineError, EngineOps, RpcStatus};
 pub use history::History;
 pub use metrics::{Metrics, spawn_poller};
 
