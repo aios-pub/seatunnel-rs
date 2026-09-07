@@ -41,7 +41,8 @@ struct Args {
     #[arg(long, default_value_t = 240)]
     history_points: usize,
     /// Node log directory exposed to the console's Logs page
-    /// (e.g. <state-dir>/logs of the node this console runs on).
+    /// (e.g. ./logs of the node this console runs on — decoupled from
+    /// the state dir).
     #[arg(long)]
     log_dir: Option<String>,
 }

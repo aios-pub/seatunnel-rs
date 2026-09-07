@@ -13,17 +13,21 @@
 # Env:
 #   HYBRID_ADDR  bind address               (default 127.0.0.1:5800)
 #   STATE_DIR    durable state directory    (default .seatunnel-state/hybrid)
+#   LOG_DIR      rolling log directory      (default ./logs — decoupled from
+#                 the state dir so the engine's state sweeper can never
+#                 delete log files; exported as SEATUNNEL_LOG_DIR)
 #   BIN_DIR      binary directory           (default ./target/debug)
 #   NO_BUILD     set to 1 to skip cargo build
 #
-# Logs go to daily rolling files in $STATE_DIR/logs/hybrid.YYYY-MM-DD
-# (30 days kept); stderr (panics, early startup failures) appends to
-# $STATE_DIR/console.err.
+# Logs go to daily rolling files in $LOG_DIR/hybrid.YYYY-MM-DD (30 days
+# kept); stderr (panics, early startup failures) appends to
+# $LOG_DIR/console.err.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ADDR=${HYBRID_ADDR:-127.0.0.1:5800}
 STATE_DIR=${STATE_DIR:-.seatunnel-state/hybrid}
+LOG_DIR=${LOG_DIR:-logs}
 BIN_DIR=${BIN_DIR:-./target/debug}
 
 port_open() { (exec 3<>"/dev/tcp/${1%:*}/${1##*:}") 2>/dev/null; }
@@ -31,7 +35,7 @@ port_open() { (exec 3<>"/dev/tcp/${1%:*}/${1##*:}") 2>/dev/null; }
 # Newest daily log file, if any (date suffixes sort lexicographically).
 latest_log() {
   local latest="" f
-  for f in "$STATE_DIR/logs"/hybrid.*; do
+  for f in "$LOG_DIR"/hybrid.*; do
     [[ -f "$f" ]] || continue
     if [[ -z "$latest" || "$f" > "$latest" ]]; then latest=$f; fi
   done
@@ -51,7 +55,7 @@ for bin in seatunnel-engine-server seatunnel; do
   [[ -x "$BIN_DIR/$bin" ]] || { echo "error: $BIN_DIR/$bin not found — build first or set BIN_DIR" >&2; exit 1; }
 done
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$LOG_DIR"
 PIDS=()
 cleanup() {
   echo
@@ -60,11 +64,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> starting hybrid node on $ADDR (logs: $STATE_DIR/logs)"
+echo "==> starting hybrid node on $ADDR (logs: $LOG_DIR)"
 # stdout is discarded — the engine logs to the daily rolling files itself;
 # stderr (panics, early failures) lands in console.err.
-RUST_LOG=${RUST_LOG:-info} "$BIN_DIR/seatunnel-engine-server" --role hybrid \
-  --addr "$ADDR" --state-dir "$STATE_DIR" 1>/dev/null 2>>"$STATE_DIR/console.err" &
+RUST_LOG=${RUST_LOG:-info} SEATUNNEL_LOG_DIR="$LOG_DIR" "$BIN_DIR/seatunnel-engine-server" --role hybrid \
+  --addr "$ADDR" --state-dir "$STATE_DIR" 1>/dev/null 2>>"$LOG_DIR/console.err" &
 PIDS+=($!)
 
 for _ in $(seq 1 30); do port_open "$ADDR" && break; sleep 1; done

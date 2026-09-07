@@ -50,3 +50,7 @@ scripts/bench/init_bench_schema.sql
 
 # Binaries staged by scripts/start-hybrid-web-debug.sh
 /bin/
+
+# Engine rolling log dirs (decoupled from the state dir)
+/logs/
+seatunnel-e2e/logs/

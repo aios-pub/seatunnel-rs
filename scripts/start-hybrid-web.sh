@@ -14,6 +14,10 @@
 #   WEB_PASSWORD  console login password       (default "admin" + warning;
 #                 exported so it never shows up in `ps`)
 #   STATE_DIR     durable state directory      (default .seatunnel-state/hybrid-web)
+#   LOG_DIR       rolling log directory        (default ./logs — decoupled
+#                 from the state dir so the engine's state sweeper can
+#                 never delete log files; the engine must agree, so the
+#                 script exports SEATUNNEL_LOG_DIR for it)
 #   BIN_DIR       binary directory             (default ./target/debug)
 #   NO_BUILD      set to 1 to skip cargo build
 #
@@ -23,8 +27,9 @@
 #
 # The state dir is KEPT across stop/start so resubmitted jobs resume from
 # their latest checkpoint. Logs go to daily rolling files in
-# $STATE_DIR/logs/hybrid.YYYY-MM-DD (30 days kept); stderr (panics, early
-# startup failures) appends to $STATE_DIR/console.err.
+# ./logs/hybrid.YYYY-MM-DD (30 days kept) — outside the state dir so the
+# engine's state sweeper can never delete them; stderr (panics, early
+# startup failures) appends to ./logs/console.err.
 #
 # Two run modes:
 #   repo mode     — script inside a checkout: builds (unless NO_BUILD=1)
@@ -54,8 +59,11 @@ WEB_USER=${WEB_USER:-${SEATUNNEL_WEB_USER:-admin}}
 WEB_PASSWORD=${WEB_PASSWORD:-${SEATUNNEL_WEB_PASSWORD:-}}
 STATE_DIR=${STATE_DIR:-.seatunnel-state/hybrid-web}
 PID_FILE="$STATE_DIR/hybrid-web.pid"
-LOG_DIR="$STATE_DIR/logs"
-ERR_FILE="$STATE_DIR/console.err"
+# Logs live OUTSIDE the state dir (the engine's state sweeper removes
+# stale subtrees there and must never be able to take log files with
+# it). Default `./logs` matches the engine binary's own default.
+LOG_DIR=${LOG_DIR:-logs}
+ERR_FILE="$LOG_DIR/console.err"
 ACTION=${1:-start}
 
 command -v curl >/dev/null || { echo "error: curl is required" >&2; exit 1; }
@@ -144,13 +152,13 @@ do_start() {
     echo "==> warning: WEB_PASSWORD unset — using the default 'admin' (set SEATUNNEL_WEB_PASSWORD in production)"
   fi
 
-  mkdir -p "$STATE_DIR"
+  mkdir -p "$STATE_DIR" "$LOG_DIR"
   echo "==> starting hybrid node on $ADDR with web console on $WEB_LISTEN (nohup, logs: $LOG_DIR)"
   # The password rides in the environment, not argv, so it never shows up
   # in `ps` output. stdout is discarded — the engine logs to the daily
   # rolling files itself; stderr (panics, early failures) lands in console.err.
   export SEATUNNEL_WEB_PASSWORD="$WEB_PASSWORD"
-  nohup env RUST_LOG=${RUST_LOG:-info} "$BIN_DIR/seatunnel-engine-server" \
+  nohup env RUST_LOG=${RUST_LOG:-info} SEATUNNEL_LOG_DIR="$LOG_DIR" "$BIN_DIR/seatunnel-engine-server" \
     --role hybrid --addr "$ADDR" --state-dir "$STATE_DIR" \
     --web --web-listen "$WEB_LISTEN" --web-auth-user "$WEB_USER" \
     1>/dev/null 2>>"$ERR_FILE" &
