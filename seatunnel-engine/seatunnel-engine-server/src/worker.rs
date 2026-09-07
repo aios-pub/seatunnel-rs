@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -74,6 +75,35 @@ pub struct RunningTask {
 
 type SharedMasterClient = Arc<Mutex<Option<MasterServiceClient<tonic::transport::Channel>>>>;
 
+/// Per-attempt timeout for a terminal status report RPC.
+const TERMINAL_REPORT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// First backoff when a terminal report delivery fails.
+const TERMINAL_REPORT_BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// Backoff ceiling between terminal report retries.
+const TERMINAL_REPORT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Total budget a terminal report is retried before the worker gives up.
+/// Past the budget the task handle is dropped and the master's heartbeat
+/// reconcile (missing-from-heartbeats → release → re-dispatch) takes over.
+const TERMINAL_REPORT_BUDGET: Duration = Duration::from_secs(600);
+/// Default grace between cancelling a task and force-aborting its
+/// execution — long enough for a normal exit checkpoint, short enough
+/// that a hung sink cannot pin the task (and its id, blocking
+/// re-dispatch) forever.
+const CANCEL_FORCE_ABORT: Duration = Duration::from_secs(60);
+
+/// A finished task's terminal transition awaiting reliable delivery.
+struct TerminalOutcome {
+    job_id: String,
+    task_id: String,
+    /// Execution incarnation this outcome belongs to; guards the report
+    /// loop against stamping/removing a re-dispatched handle.
+    generation: u64,
+    /// Proto task-state code (3 COMPLETED / 4 FAILED / 5 CANCELLED).
+    code: i32,
+    records: u64,
+    error: Option<String>,
+}
+
 /// One task's checkpoint gate: the driver control the heartbeat loop
 /// fires triggers/resolutions on, plus the job id (task reports do not
 /// carry one — the local driver knew it, the forwarder looks it up).
@@ -97,12 +127,24 @@ pub struct WorkerNode {
     storage_type: String,
     /// S3 store when storage_type = s3.
     s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
+    /// Policy when a task HAS checkpoint history but no restorable
+    /// payload is found on restart: "fail" (default — a silent cold
+    /// start skips every change since the last checkpoint) or "warn"
+    /// (log ERROR and cold-start anyway).
+    restore_missing: &'static str,
     worker_id: String,
     #[allow(dead_code)] // reported to the master once registration is wired up
     address: String,
     master_client: SharedMasterClient,
     state_store: Arc<LocalStateStore>,
-    running_tasks: Mutex<HashMap<String, RunningTaskHandle>>,
+    running_tasks: Arc<Mutex<HashMap<String, RunningTaskHandle>>>,
+    /// Per-task execution incarnation counter, bumped on every
+    /// (re-)assignment of a task id. Terminal outcomes carry the value so
+    /// the report loop never touches a newer incarnation's handle.
+    task_generations: StdMutex<HashMap<String, u64>>,
+    /// Finished tasks' terminal transitions awaiting reliable delivery.
+    terminal_tx: mpsc::UnboundedSender<TerminalOutcome>,
+    terminal_rx: Mutex<Option<mpsc::UnboundedReceiver<TerminalOutcome>>>,
     /// Highest fencing term seen from any master (0 = none yet).
     /// Instructions from masters with a lower term are rejected so a
     /// deposed master cannot disturb tasks owned by its successor.
@@ -134,6 +176,19 @@ struct RunningTaskHandle {
     logs: Option<seatunnel_engine_core::task_log::TaskLogRing>,
     /// Log shipping bookmark for the last heartbeat.
     log_cursor: u64,
+    /// Execution incarnation (see `WorkerNode::task_generations`).
+    generation: u64,
+    /// Set once the execution returned: the proto task-state code being
+    /// reported to the master. Heartbeats carry it (truthful state) and
+    /// the report loop clears the entry once the master acks — the task
+    /// must keep showing up in heartbeats until then, otherwise the
+    /// master's reconcile would re-dispatch a task that is mid-report.
+    terminal: Option<i32>,
+    /// Join handle of the spawned pipeline execution — the cancel
+    /// backstop aborts it when a task ignores cancellation for too long.
+    exec: Option<tokio::task::JoinHandle<()>>,
+    /// Cancel-force-abort watcher armed for this task (once).
+    backstop_armed: bool,
 }
 
 impl RunningTaskHandle {
@@ -159,16 +214,21 @@ impl WorkerNode {
         clean_config: Option<CleanConfig>,
     ) -> Self {
         let (checkpoint_report_tx, checkpoint_rx) = mpsc::unbounded_channel();
+        let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         WorkerNode {
             worker_id: worker_id.into(),
             address: address.into(),
             master_client: Arc::new(Mutex::new(None)),
             state_store,
-            running_tasks: Mutex::new(HashMap::new()),
+            running_tasks: Arc::new(Mutex::new(HashMap::new())),
+            task_generations: StdMutex::new(HashMap::new()),
+            terminal_tx,
+            terminal_rx: Mutex::new(Some(terminal_rx)),
             cancel_cleanups: StdMutex::new(HashSet::new()),
             clean_config,
             storage_type: "localfile".to_string(),
             s3_store: None,
+            restore_missing: "fail",
             term: Arc::new(AtomicU64::new(0)),
             checkpoint_gates: Arc::new(Mutex::new(HashMap::new())),
             checkpoint_report_tx,
@@ -211,11 +271,83 @@ impl WorkerNode {
         self.s3_store = s3_store;
     }
 
+    /// Set the behavior when checkpoint history exists but no restorable
+    /// payload is found on restart (`fail` | `warn`).
+    pub fn with_restore_missing(&mut self, policy: &str) {
+        if policy.eq_ignore_ascii_case("warn") {
+            self.restore_missing = "warn";
+        } else {
+            self.restore_missing = "fail";
+        }
+    }
+
     /// Set the gRPC client used for reporting to the master. The first
-    /// call also starts the checkpoint forwarder (it needs the client).
-    pub async fn set_master_client(&self, client: MasterServiceClient<tonic::transport::Channel>) {
+    /// call also starts the checkpoint forwarder and the terminal-report
+    /// loop (both need the client).
+    pub async fn set_master_client(
+        self: &Arc<Self>,
+        client: MasterServiceClient<tonic::transport::Channel>,
+    ) {
         *self.master_client.lock().await = Some(client);
         self.start_checkpoint_forwarder().await;
+        self.start_terminal_reporter().await;
+    }
+
+    /// Start (once) the loop that delivers finished tasks' terminal
+    /// transitions to the master with retry-until-acked semantics. A
+    /// terminal report is the ONLY signal that moves a task out of
+    /// `Running` on the master — losing it pins the job in RUNNING
+    /// forever, so delivery retries within the budget and the handle
+    /// stays in the heartbeat (as terminal) until the master acks.
+    async fn start_terminal_reporter(self: &Arc<Self>) {
+        let Some(rx) = self.terminal_rx.lock().await.take() else {
+            return;
+        };
+        let reporter = TerminalReporter {
+            worker_id: self.worker_id.clone(),
+            master_client: Arc::clone(&self.master_client),
+            term: Arc::clone(&self.term),
+            running_tasks: Arc::clone(&self.running_tasks),
+        };
+        tokio::spawn(async move {
+            run_terminal_reporter(rx, reporter).await;
+        });
+    }
+
+    /// Execution incarnation for a (re-)assigned task id.
+    fn next_generation(&self, task_id: &str) -> u64 {
+        let mut gens = self.task_generations.lock().unwrap();
+        let next = gens.entry(task_id.to_string()).or_insert(0);
+        *next += 1;
+        *next
+    }
+
+    /// Arm (once per task) the watcher that force-aborts an execution
+    /// still running `CANCEL_FORCE_ABORT` after its cancel token fired —
+    /// a hung sink/poll must not pin the task id forever.
+    fn arm_cancel_backstop(self: &Arc<Self>, task_id: String) {
+        let worker = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(CANCEL_FORCE_ABORT).await;
+            let mut tasks = worker.running_tasks.lock().await;
+            let Some(handle) = tasks.get_mut(&task_id) else {
+                return; // exited (and was reported) in time
+            };
+            if handle.terminal.is_some() {
+                return; // execution finished, report in flight
+            }
+            let Some(exec) = handle.exec.take() else {
+                return;
+            };
+            warn!(
+                "Worker {}: task {} still running {}s after cancellation — aborting its execution; \
+                 a CANCELLED terminal report will be synthesized",
+                worker.worker_id,
+                task_id,
+                CANCEL_FORCE_ABORT.as_secs()
+            );
+            exec.abort();
+        });
     }
 
     /// Start (once) the task that drains checkpoint gate reports:
@@ -320,19 +452,59 @@ impl WorkerNode {
     }
 
     /// Accept a task from the master and start executing it asynchronously.
-    /// Completion removes the task from the local registry.
+    /// Completion enqueues the terminal transition for reliable delivery;
+    /// the task handle leaves the registry only once the master acked the
+    /// report (heartbeats keep listing it as terminal meanwhile).
     pub async fn assign_task(self: &Arc<Self>, task: TaskDescriptor) {
         let task_id = task.task_id.clone();
         let job_id = task.job_id.clone();
 
         // Failover dedup: if this worker already runs the task (e.g. the
-        // master re-dispatched during a reconnect window), skip it.
+        // master re-dispatched during a reconnect window), skip it. A
+        // CANCELLED local incarnation (update/restart flow) is the one
+        // exception: wait briefly for it to drain — the resubmit reuses
+        // the same task id, and ignoring the dispatch would leave the
+        // new incarnation dead while the master shows it dispatched.
         if self.running_tasks.lock().await.contains_key(&task_id) {
-            info!(
-                "Worker {}: task {} already running locally — dispatch ignored",
-                self.worker_id, task_id
-            );
-            return;
+            const DRAIN_WAIT: Duration = Duration::from_secs(10);
+            const DRAIN_POLL: Duration = Duration::from_millis(100);
+            let mut waited = Duration::ZERO;
+            loop {
+                enum Observed {
+                    Gone,
+                    Live,
+                    Draining,
+                }
+                let observed = {
+                    let guard = self.running_tasks.lock().await;
+                    match guard.get(&task_id) {
+                        None => Observed::Gone,
+                        Some(handle) if !handle.cancel_token().is_cancelled() => Observed::Live,
+                        Some(_) => Observed::Draining,
+                    }
+                };
+                match observed {
+                    Observed::Gone => break, // old incarnation left the registry — proceed
+                    Observed::Live => {
+                        info!(
+                            "Worker {}: task {} already running locally — dispatch ignored",
+                            self.worker_id, task_id
+                        );
+                        return;
+                    }
+                    Observed::Draining if waited >= DRAIN_WAIT => {
+                        warn!(
+                            "Worker {}: cancelled task {} still draining after {:?} — dispatch \
+                             ignored; the master's reconcile will re-dispatch it",
+                            self.worker_id, task_id, DRAIN_WAIT
+                        );
+                        return;
+                    }
+                    Observed::Draining => {}
+                }
+                tokio::time::sleep(DRAIN_POLL).await;
+                waited += DRAIN_POLL;
+            }
         }
 
         info!(
@@ -340,12 +512,14 @@ impl WorkerNode {
             self.worker_id, task.task_id, task.task_index, task.parallelism
         );
 
+        let generation = self.next_generation(&task_id);
         let cancel = Arc::new(CancellationToken::new());
         self.running_tasks.lock().await.insert(
             task_id.clone(),
             RunningTaskHandle {
                 job_id: job_id.clone(),
                 cancel: Some(cancel.clone()),
+                generation,
                 ..Default::default()
             },
         );
@@ -356,20 +530,57 @@ impl WorkerNode {
             state_store: self.state_store.clone(),
             storage_type: self.storage_type.clone(),
             s3_store: self.s3_store.clone(),
+            restore_missing: self.restore_missing.to_string(),
             term: Arc::clone(&self.term),
         };
 
         let worker = Arc::clone(self);
-        let cleanup_task_id = task_id.clone();
-        tokio::spawn(async move {
-            execute_descriptor(task, ctx, cancel, Arc::clone(&worker)).await;
-            // Detach from the registry once terminal. The checkpoint gate
-            // is NOT removed here: the task's exit barrier (FINAL) report
-            // is still queued behind its Done message, and the forwarder
-            // removes the gate when it processes Done — channel order
-            // guarantees the FINAL state is persisted first.
-            worker.running_tasks.lock().await.remove(&cleanup_task_id);
+        let exec_task_id = task_id.clone();
+        let wrap_job_id = job_id.clone();
+        // Inner task: the actual pipeline execution. The cancel backstop
+        // aborts THIS handle when a task ignores cancellation too long.
+        let inner = tokio::spawn(execute_descriptor(task, ctx, cancel, Arc::clone(&worker)));
+        // Outer wrapper: turns the outcome (or a force-abort JoinError —
+        // synthesized as the truthful CANCELLED) into the reliable
+        // delivery path. This task itself is never aborted.
+        let exec = tokio::spawn(async move {
+            let mut outcome = match inner.await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    error!(
+                        "Task {} execution was force-aborted after cancellation: {}",
+                        exec_task_id, e
+                    );
+                    TerminalOutcome {
+                        job_id: wrap_job_id,
+                        task_id: exec_task_id.clone(),
+                        generation,
+                        code: 5, // CANCELLED
+                        records: 0,
+                        error: Some("execution force-aborted after cancellation".to_string()),
+                    }
+                }
+            };
+            outcome.generation = generation;
+            // Heartbeats report the terminal state from now on; the task
+            // stays listed until the master acks the report (the report
+            // loop removes the handle) so the reconcile cannot double-
+            // dispatch a task that is mid-report.
+            if let Some(handle) = worker.running_tasks.lock().await.get_mut(&exec_task_id)
+                && handle.generation == generation
+            {
+                handle.terminal = Some(outcome.code);
+            }
+            if let Err(e) = worker.terminal_tx.send(outcome) {
+                error!(
+                    "terminal outcome for task {} could not be queued (worker shutting down): {}",
+                    exec_task_id, e
+                );
+            }
         });
+        if let Some(handle) = self.running_tasks.lock().await.get_mut(&task_id) {
+            handle.exec = Some(exec);
+        }
     }
 
     /// Fill in the live status/log handles of a registered task once its
@@ -453,30 +664,57 @@ impl WorkerNode {
         self.running_tasks.lock().await.keys().cloned().collect()
     }
 
+    /// The master's view of a job's state (proto code), or None when the
+    /// master is unreachable. Used by the delayed state cleaner to skip
+    /// jobs that were resubmitted under the same id.
+    async fn job_state_on_master(&self, job_id: &str) -> Option<i32> {
+        let mut client = self.master_client.lock().await.clone()?;
+        let request = tonic::Request::new(seatunnel_engine_comm::JobStatusRequest {
+            job_id: job_id.to_string(),
+        });
+        let response =
+            tokio::time::timeout(TERMINAL_REPORT_RPC_TIMEOUT, client.get_job_status(request))
+                .await
+                .ok()?
+                .ok()?;
+        Some(response.into_inner().state)
+    }
+
     /// Cancel specific tasks that were reassigned elsewhere by the master
     /// (failover fencing) so they are not executed twice.
-    pub async fn preempt_tasks(&self, task_ids: &[String]) {
+    pub async fn preempt_tasks(self: &Arc<Self>, task_ids: &[String]) {
         if task_ids.is_empty() {
             return;
         }
-        let mut tasks = self.running_tasks.lock().await;
-        for task_id in task_ids {
-            if let Some(handle) = tasks.get_mut(task_id) {
-                warn!(
-                    "Worker {}: preempting task {} (reassigned by the master)",
-                    self.worker_id, task_id
-                );
-                handle.cancel_token().cancel();
+        let mut to_arm = Vec::new();
+        {
+            let mut tasks = self.running_tasks.lock().await;
+            for task_id in task_ids {
+                if let Some(handle) = tasks.get_mut(task_id) {
+                    warn!(
+                        "Worker {}: preempting task {} (reassigned by the master)",
+                        self.worker_id, task_id
+                    );
+                    handle.cancel_token().cancel();
+                    if !handle.backstop_armed {
+                        handle.backstop_armed = true;
+                        to_arm.push(task_id.clone());
+                    }
+                }
             }
+        }
+        for tid in to_arm {
+            self.arm_cancel_backstop(tid);
         }
     }
 
     /// Snapshot of running tasks for the next heartbeat: real record
-    /// counters, the last-record timestamp and the task log increment.
+    /// counters, the last-record timestamp, the truthful task state and
+    /// the task log increment.
     pub async fn heartbeat_tasks(&self) -> Vec<seatunnel_engine_comm::TaskHeartbeat> {
         let mut out = Vec::with_capacity(self.running_tasks.lock().await.len());
         for (tid, handle) in self.running_tasks.lock().await.iter_mut() {
-            let (records, last_record_at, logs, last_cp, sink_metrics) =
+            let (state_code, records, last_record_at, logs, last_cp, sink_metrics) =
                 match (&handle.status, &handle.logs) {
                     (Some(status), Some(ring)) => {
                         let snapshot = status.lock().await;
@@ -485,7 +723,11 @@ impl WorkerNode {
                         let lines = entries.iter().map(|e| e.render()).collect::<Vec<_>>();
                         let checkpoint =
                             (snapshot.last_checkpoint_id, snapshot.last_checkpoint_size);
+                        let state_code = handle
+                            .terminal
+                            .unwrap_or_else(|| proto_task_state(&snapshot.state));
                         (
+                            state_code,
                             snapshot.processed_records,
                             snapshot.last_record_at,
                             lines,
@@ -493,11 +735,15 @@ impl WorkerNode {
                             snapshot.sink_metrics.clone(),
                         )
                     }
-                    _ => (0, 0, Vec::new(), (0, 0), None),
+                    // Pipeline not built yet (connector construction) or
+                    // already draining: report the terminal code when one
+                    // is pending, RUNNING otherwise (the historical
+                    // pre-pipeline state).
+                    _ => (handle.terminal.unwrap_or(2), 0, 0, Vec::new(), (0, 0), None),
                 };
             out.push(seatunnel_engine_comm::TaskHeartbeat {
                 task_id: tid.clone(),
-                state: 2, // TASK_RUNNING
+                state: state_code,
                 processed_records: records as i64,
                 last_heartbeat_time: now_millis(),
                 memory_usage: 0,
@@ -512,7 +758,7 @@ impl WorkerNode {
     }
 
     /// Stop all local tasks belonging to the given jobs.
-    pub async fn cancel_jobs(&self, job_ids: &[String]) {
+    pub async fn cancel_jobs(self: &Arc<Self>, job_ids: &[String]) {
         if job_ids.is_empty() {
             return;
         }
@@ -525,20 +771,26 @@ impl WorkerNode {
             let mut scheduled = self.cancel_cleanups.lock().unwrap();
             for job_id in job_ids {
                 if scheduled.insert(job_id.clone()) {
-                    schedule_cancel_cleanup(
-                        Arc::clone(&self.state_store),
-                        job_id.clone(),
-                        clean.grace_secs,
-                    );
+                    schedule_cancel_cleanup(Arc::clone(self), job_id.clone(), clean.grace_secs);
                 }
             }
         }
-        let mut tasks = self.running_tasks.lock().await;
-        for (tid, handle) in tasks.iter_mut() {
-            if job_ids.contains(&handle.job_id) && !handle.cancel_token().is_cancelled() {
-                info!("Cancelling task {} (job cancelled)", tid);
-                handle.cancel_token().cancel();
+        let mut to_arm = Vec::new();
+        {
+            let mut tasks = self.running_tasks.lock().await;
+            for (tid, handle) in tasks.iter_mut() {
+                if job_ids.contains(&handle.job_id) && !handle.cancel_token().is_cancelled() {
+                    info!("Cancelling task {} (job cancelled)", tid);
+                    handle.cancel_token().cancel();
+                    if !handle.backstop_armed {
+                        handle.backstop_armed = true;
+                        to_arm.push(tid.clone());
+                    }
+                }
             }
+        }
+        for tid in to_arm {
+            self.arm_cancel_backstop(tid);
         }
     }
 
@@ -548,8 +800,24 @@ impl WorkerNode {
     }
 }
 
-/// Report a task lifecycle transition to the master. Never consumes the
-/// master client — transient RPC failures must not break later reports.
+/// Map a `TaskState` to its proto task-state code (HeartbeatRequest /
+/// TaskStatusReport state semantics: 0 CREATED, 2 RUNNING, 3 COMPLETED,
+/// 4 FAILED, 5 CANCELLED).
+fn proto_task_state(state: &TaskState) -> i32 {
+    match state {
+        TaskState::Created => 0,
+        TaskState::Running => 2,
+        TaskState::Completed => 3,
+        TaskState::Failed { .. } => 4,
+        TaskState::Cancelled => 5,
+    }
+}
+
+/// Report a task lifecycle transition to the master. Fire-and-forget:
+/// only the initial RUNNING report goes through here — terminal reports
+/// are delivered by the retrying reporter. The client is cloned out of
+/// the shared guard so the RPC never pins the lock across its await
+/// (one hung call must not block every other reporter on the worker).
 async fn report_transition_raw(
     worker_id: &str,
     master_client: &SharedMasterClient,
@@ -560,14 +828,6 @@ async fn report_transition_raw(
     records: u64,
     error: Option<String>,
 ) {
-    let mut guard = master_client.lock().await;
-    let Some(client) = guard.as_mut() else {
-        warn!(
-            "no master client; cannot report state {} for task {} (worker {})",
-            state, task_id, worker_id
-        );
-        return;
-    };
     let report = TaskStatusReport {
         worker_id: worker_id.to_string(),
         task_id: task_id.to_string(),
@@ -578,8 +838,132 @@ async fn report_transition_raw(
         error_message: error.unwrap_or_default(),
         term: term.load(Ordering::SeqCst),
     };
-    if let Err(e) = client.report_task_status(tonic::Request::new(report)).await {
-        warn!("report_task_status failed for {}: {}", task_id, e);
+    let client = master_client.lock().await.clone();
+    let Some(mut client) = client else {
+        warn!(
+            "no master client; cannot report state {} for task {} (worker {})",
+            state, task_id, worker_id
+        );
+        return;
+    };
+    if let Err(e) = tokio::time::timeout(
+        TERMINAL_REPORT_RPC_TIMEOUT,
+        client.report_task_status(tonic::Request::new(report)),
+    )
+    .await
+    {
+        warn!(
+            "report_task_status failed for {} (state {}): {:?}",
+            task_id, state, e
+        );
+    }
+}
+
+/// State needed by the terminal-report delivery loop.
+struct TerminalReporter {
+    worker_id: String,
+    master_client: SharedMasterClient,
+    term: Arc<AtomicU64>,
+    running_tasks: Arc<Mutex<HashMap<String, RunningTaskHandle>>>,
+}
+
+/// Deliver finished tasks' terminal transitions to the master, retrying
+/// until acked (or the budget expires). The task handle is removed only
+/// after delivery, so the heartbeat keeps listing the task (with its
+/// terminal state) and the master's reconcile cannot re-dispatch a task
+/// that is mid-report. Past the budget the handle is dropped with an
+/// ERROR and the reconcile's release → re-dispatch takes over.
+async fn run_terminal_reporter(
+    mut rx: mpsc::UnboundedReceiver<TerminalOutcome>,
+    reporter: TerminalReporter,
+) {
+    while let Some(outcome) = rx.recv().await {
+        let started = std::time::Instant::now();
+        let mut backoff = TERMINAL_REPORT_BACKOFF_MIN;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match send_terminal_report(&reporter, &outcome).await {
+                Ok(()) => {
+                    info!(
+                        "Worker {}: terminal report for task {} (state {}, records {}) delivered",
+                        reporter.worker_id, outcome.task_id, outcome.code, outcome.records
+                    );
+                    remove_reported_handle(&reporter, &outcome).await;
+                    break;
+                }
+                Err(e) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= TERMINAL_REPORT_BUDGET {
+                        error!(
+                            "Worker {}: terminal report for task {} (state {}) DROPPED after \
+                             {:?} / {} attempts: {:?} — the master's heartbeat reconcile will \
+                             release and re-dispatch it",
+                            reporter.worker_id, outcome.task_id, outcome.code, elapsed, attempt, e
+                        );
+                        remove_reported_handle(&reporter, &outcome).await;
+                        break;
+                    }
+                    warn!(
+                        "Worker {}: terminal report for task {} (state {}) attempt {} failed, \
+                         retrying in {:?}: {:?}",
+                        reporter.worker_id, outcome.task_id, outcome.code, attempt, backoff, e
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(TERMINAL_REPORT_BACKOFF_MAX);
+                }
+            }
+        }
+    }
+}
+
+/// One delivery attempt. Never holds the shared client guard across the
+/// RPC; bounded by a per-attempt timeout so a hung master cannot stall
+/// the queue.
+async fn send_terminal_report(
+    reporter: &TerminalReporter,
+    outcome: &TerminalOutcome,
+) -> Result<(), tonic::Status> {
+    let client = reporter.master_client.lock().await.clone();
+    let Some(mut client) = client else {
+        return Err(tonic::Status::unavailable(
+            "no master client (not registered yet)",
+        ));
+    };
+    let report = TaskStatusReport {
+        worker_id: reporter.worker_id.clone(),
+        task_id: outcome.task_id.clone(),
+        job_id: outcome.job_id.clone(),
+        state: outcome.code,
+        timestamp: now_millis(),
+        processed_records: outcome.records as i64,
+        error_message: outcome.error.clone().unwrap_or_default(),
+        term: reporter.term.load(Ordering::SeqCst),
+    };
+    tokio::time::timeout(
+        TERMINAL_REPORT_RPC_TIMEOUT,
+        client.report_task_status(tonic::Request::new(report)),
+    )
+    .await
+    .map_err(|_| {
+        tonic::Status::deadline_exceeded(format!(
+            "report_task_status timed out after {}s",
+            TERMINAL_REPORT_RPC_TIMEOUT.as_secs()
+        ))
+    })?
+    .map(|_| ())
+}
+
+/// Drop a delivered/expired task handle — only when it is still the same
+/// incarnation (a re-dispatch of the id inserts a fresh handle whose
+/// generation differs).
+async fn remove_reported_handle(reporter: &TerminalReporter, outcome: &TerminalOutcome) {
+    let mut tasks = reporter.running_tasks.lock().await;
+    let matches = tasks
+        .get(&outcome.task_id)
+        .is_some_and(|h| h.generation == outcome.generation && h.terminal.is_some());
+    if matches {
+        tasks.remove(&outcome.task_id);
     }
 }
 
@@ -617,44 +1001,130 @@ pub fn spawn_state_cleaner(
 }
 
 /// Fetch the newest checkpoint from the master-backed shared store.
+///
+/// Returns the payload (when one exists) plus the highest checkpoint id
+/// the master ever RECORDED for the task — a non-zero latest with no
+/// payload means "restore expected but unavailable". RPC failures are
+/// returned, not swallowed: the caller decides via the restore-missing
+/// policy.
 async fn fetch_checkpoint_from_master(
     master_client: &SharedMasterClient,
     job_id: &str,
     task_id: &str,
-) -> Option<(u64, Vec<u8>)> {
-    let mut guard = master_client.lock().await;
-    let client = guard.as_mut()?;
+) -> Result<Option<(u64, Vec<u8>)>, i64> {
+    // Err(latest) = the fetch failed but the task HAS checkpoint history.
+    let client = master_client.lock().await.clone();
+    let Some(mut client) = client else {
+        return Err(0);
+    };
     let request = tonic::Request::new(seatunnel_engine_comm::FetchCheckpointRequest {
         job_id: job_id.to_string(),
         task_id: task_id.to_string(),
     });
-    match client.fetch_checkpoint(request).await {
-        Ok(resp) => {
+    let fetched = tokio::time::timeout(
+        TERMINAL_REPORT_RPC_TIMEOUT,
+        client.fetch_checkpoint(request),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(resp)) => {
             let inner = resp.into_inner();
+            let latest = inner.latest_checkpoint_id;
             if inner.checkpoint_id > 0 && !inner.checkpoint_data.is_empty() {
-                Some((inner.checkpoint_id as u64, inner.checkpoint_data))
+                Ok(Some((inner.checkpoint_id as u64, inner.checkpoint_data)))
+            } else if latest > 0 {
+                Err(latest)
             } else {
-                None
+                Ok(None)
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("fetch_checkpoint for {} failed: {}", task_id, e);
-            None
+            Err(-1)
         }
+        Err(_) => {
+            warn!("fetch_checkpoint for {} timed out", task_id);
+            Err(-1)
+        }
+    }
+}
+
+/// Apply the restore-missing policy when a task has checkpoint history
+/// but no restorable payload: `fail` (default) refuses the silent cold
+/// start — for a CDC source it would skip every change since the last
+/// checkpoint — while `warn` logs loudly and cold-starts.
+fn resolve_missing_restore(
+    task: &TaskDescriptor,
+    ctx: &TaskExecCtx,
+    latest_checkpoint_id: i64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if latest_checkpoint_id <= 0 {
+        info!("Task {}: no checkpoint found (cold start)", task.task_id);
+        return Ok(None);
+    }
+    match ctx.restore_missing.as_str() {
+        "warn" => {
+            error!(
+                "Task {}: checkpoint history exists (latest cp-{}) but no restorable payload \
+                 was found — cold-starting anyway (checkpoint.restore-missing=warn); changes \
+                 since the last checkpoint are SKIPPED",
+                task.task_id, latest_checkpoint_id
+            );
+            Ok(None)
+        }
+        _ => Err(anyhow::anyhow!(
+            "restore expected: task {} has checkpoint history (latest cp-{}) but no \
+             restorable payload was found on this worker; refusing a silent cold start \
+             (set checkpoint.restore-missing: warn to allow it)",
+            task.task_id,
+            latest_checkpoint_id
+        )),
     }
 }
 
 /// Schedule deletion of a cancelled job's local state after the grace
 /// window (keeps a restore window for operator intervention).
-pub fn schedule_cancel_cleanup(state_store: Arc<LocalStateStore>, job_id: String, grace_secs: u64) {
+///
+/// The timer re-checks with the master before deleting: the `job update`
+/// flow cancels and RESUBMITS the same job id seconds later, and the new
+/// incarnation checkpoints into the same directory — a blind delete at
+/// T+grace would wipe its state and force a silent cold start. If the
+/// master is unreachable the deletion is skipped (the TTL sweep bounds
+/// leftovers) — deleting a live job's state is never the safe default.
+pub fn schedule_cancel_cleanup(worker: Arc<WorkerNode>, job_id: String, grace_secs: u64) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(grace_secs.max(1))).await;
-        if state_store.drop_job(&job_id) {
-            tracing::info!("state cleaner: removed cancelled job state '{}'", job_id);
-        } else {
-            tracing::debug!("state cleaner: no state left for job '{}'", job_id);
+        match worker.job_state_on_master(&job_id).await {
+            Some(state) if is_terminal_state(state) => {
+                if worker.state_store().drop_job(&job_id) {
+                    tracing::info!("state cleaner: removed cancelled job state '{}'", job_id);
+                } else {
+                    tracing::debug!("state cleaner: no state left for job '{}'", job_id);
+                }
+            }
+            Some(state) => {
+                tracing::info!(
+                    "state cleaner: job '{}' is non-terminal again (proto state {}) — it was \
+                     resubmitted (update/restart); keeping its checkpoint state",
+                    job_id,
+                    state
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "state cleaner: master unreachable — skipping cleanup of cancelled job \
+                     '{}' this round; its state dir remains until a later sweep",
+                    job_id
+                );
+            }
         }
     });
+}
+
+/// Proto task-state / job-state terminal codes (3 COMPLETED, 4 FAILED,
+/// 5 CANCELLED, 6 job-cancelled).
+fn is_terminal_state(code: i32) -> bool {
+    matches!(code, 3 | 4 | 5 | 6)
 }
 
 /// Execution context handed to the spawned task future so it can report
@@ -668,24 +1138,30 @@ struct TaskExecCtx {
     storage_type: String,
     /// S3 store (storage type = s3); workers write directly.
     s3_store: Option<crate::checkpoint_store::S3CheckpointStore>,
+    /// Restore-missing policy: "fail" (default) | "warn".
+    restore_missing: String,
     /// Highest master term seen by this worker (fencing on reports).
     term: Arc<AtomicU64>,
 }
 
 /// Execute one descriptor end-to-end: build connectors, restore state, run
-/// the TaskGroup, and report every transition to the master.
+/// the TaskGroup, and return the terminal transition. Panics inside the
+/// pipeline are caught and converted into a FAILED outcome so a buggy
+/// connector cannot take down the whole worker process silently.
 ///
-/// Panics inside the pipeline are caught and converted into a FAILED report
-/// so a buggy connector cannot take down the whole worker process silently.
+/// The returned outcome is queued for reliable delivery by the caller —
+/// a lost terminal report pins the job in RUNNING on the master forever.
 async fn execute_descriptor(
     task: TaskDescriptor,
     ctx: TaskExecCtx,
     cancel: Arc<CancellationToken>,
     worker: Arc<crate::worker::WorkerNode>,
-) {
+) -> TerminalOutcome {
     let task_id = task.task_id.clone();
     let job_id = task.job_id.clone();
 
+    // Initial RUNNING report (fire-and-forget; a lost one self-heals via
+    // the master's heartbeat reconcile of never-reported tasks).
     report_transition_raw(
         &ctx.worker_id,
         &ctx.master_client,
@@ -711,41 +1187,36 @@ async fn execute_descriptor(
         }
     };
 
-    match result {
+    let outcome = match result {
         Ok(status) => {
             let (code, err) = match status.state {
                 TaskState::Completed => (3, None),
                 TaskState::Cancelled => (5, None),
                 TaskState::Failed { ref error } => (4, Some(error.clone())),
-                other => (2, Some(format!("unexpected state {}", other))),
+                other => (4, Some(format!("unexpected end state {}", other))),
             };
-            report_transition_raw(
-                &ctx.worker_id,
-                &ctx.master_client,
-                &ctx.term,
-                &job_id,
-                &task_id,
+            TerminalOutcome {
+                job_id,
+                task_id: task_id.clone(),
+                generation: 0, // stamped by the caller (assign wrapper)
                 code,
-                status.processed_records,
-                err,
-            )
-            .await;
+                records: status.processed_records,
+                error: err,
+            }
         }
         Err(e) => {
-            error!("Task {} crashed: {}", task_id, e);
-            report_transition_raw(
-                &ctx.worker_id,
-                &ctx.master_client,
-                &ctx.term,
-                &job_id,
-                &task_id,
-                4,
-                0,
-                Some(e.to_string()),
-            )
-            .await;
+            error!("Task {} crashed: {:?}", task_id, e);
+            TerminalOutcome {
+                job_id,
+                task_id,
+                generation: 0,
+                code: 4,
+                records: 0,
+                error: Some(e.to_string()),
+            }
         }
-    }
+    };
+    outcome
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -804,29 +1275,52 @@ async fn run_pipeline(
     // Restore chain: worker-local disk > shared backend (master store /
     // S3 by storage type) > cold start. A task taken over from a dead
     // worker resumes from the shared checkpoint instead of re-snapshotting.
-    let restore_state = if let Some((id, data)) = ctx
+    // A LOCAL read error is fatal (the state exists but is unusable —
+    // silently skipping it would cold-start a task the operator expects
+    // to resume); a MISSING payload with checkpoint history goes through
+    // the checkpoint.restore-missing policy.
+    let restore_state = match ctx
         .state_store
         .load_latest_checkpoint(&task.job_id, &task.task_id)
-        .ok()
-        .flatten()
     {
-        info!(
-            "Task {}: restored checkpoint cp-{} from local",
-            task.task_id, id
-        );
-        Some(data)
-    } else {
-        match ctx.storage_type.as_str() {
+        Err(e) => {
+            error!(
+                "Task {}: local checkpoint state exists but is unreadable: {}",
+                task.task_id, e
+            );
+            anyhow::bail!(
+                "local checkpoint state for job {} task {} is present but unreadable: {e}; \
+                 fix or remove <state-dir>/job-{}/ manually",
+                task.job_id,
+                task.task_id,
+                task.job_id
+            );
+        }
+        Ok(Some((id, data))) => {
+            info!(
+                "Task {}: restored checkpoint cp-{} from local",
+                task.task_id, id
+            );
+            Some(data)
+        }
+        Ok(None) => match ctx.storage_type.as_str() {
             "master" => {
-                fetch_checkpoint_from_master(&ctx.master_client, &task.job_id, &task.task_id)
+                match fetch_checkpoint_from_master(&ctx.master_client, &task.job_id, &task.task_id)
                     .await
-                    .map(|(id, data)| {
+                {
+                    Ok(Some((id, data))) => {
                         info!(
                             "Task {}: restored checkpoint cp-{} from master",
                             task.task_id, id
                         );
-                        data
-                    })
+                        Some(data)
+                    }
+                    Ok(None) => {
+                        info!("Task {}: no checkpoint found (cold start)", task.task_id);
+                        None
+                    }
+                    Err(latest) => resolve_missing_restore(task, &ctx, latest)?,
+                }
             }
             "s3" => {
                 let fetched = if let Some(store) = &ctx.s3_store {
@@ -834,19 +1328,67 @@ async fn run_pipeline(
                 } else {
                     None
                 };
-                fetched.map(|(id, data)| {
-                    info!(
-                        "Task {}: restored checkpoint cp-{} from s3",
-                        task.task_id, id
-                    );
-                    data
-                })
+                match fetched {
+                    Some((id, data)) => {
+                        info!(
+                            "Task {}: restored checkpoint cp-{} from s3",
+                            task.task_id, id
+                        );
+                        Some(data)
+                    }
+                    None => {
+                        // Consult the master's history to tell a fresh
+                        // start from an expected-but-unavailable restore.
+                        match fetch_checkpoint_from_master(
+                            &ctx.master_client,
+                            &task.job_id,
+                            &task.task_id,
+                        )
+                        .await
+                        {
+                            Ok(None) => {
+                                info!("Task {}: no checkpoint found (cold start)", task.task_id);
+                                None
+                            }
+                            Err(latest) if latest > 0 => {
+                                resolve_missing_restore(task, &ctx, latest)?
+                            }
+                            _ => {
+                                warn!(
+                                    "Task {}: s3 checkpoint lookup failed and the master's \
+                                     history is unavailable — cold-starting; if this task had \
+                                     checkpoints, changes since the last one are skipped",
+                                    task.task_id
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
             }
             _ => {
-                info!("Task {}: no checkpoint found (cold start)", task.task_id);
-                None
+                // localfile: no local state. Ask the master whether this
+                // task ever checkpointed — a non-zero history means the
+                // state stayed on another worker's disk (failover) or was
+                // lost, and a cold start would silently skip data.
+                match fetch_checkpoint_from_master(&ctx.master_client, &task.job_id, &task.task_id)
+                    .await
+                {
+                    Ok(Some((id, data))) => {
+                        info!(
+                            "Task {}: restored checkpoint cp-{} from master",
+                            task.task_id, id
+                        );
+                        Some(data)
+                    }
+                    Ok(None) => {
+                        info!("Task {}: no checkpoint found (cold start)", task.task_id);
+                        None
+                    }
+                    Err(latest) => resolve_missing_restore(task, &ctx, latest)?,
+                }
             }
-        }
+        },
     };
 
     let reader = create_source(
@@ -869,15 +1411,32 @@ async fn run_pipeline(
                 .map(String::as_str)
                 .unwrap_or("fail"),
         );
+        // Ceiling for channel sends / acks to every inner sink: a hung
+        // sink must fail or be isolated at this deadline, never freeze
+        // the task loop (a frozen loop ignores cancellation and
+        // heartbeat-reports RUNNING forever).
+        let sink_ack_timeout = std::time::Duration::from_millis(
+            cfg.get("pipeline.sink-ack-timeout-ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(
+                    seatunnel_engine_core::fanout::DEFAULT_SINK_ACK_TIMEOUT.as_millis() as u64,
+                )
+                .max(1000),
+        );
         info!(
-            "Task {}: pipeline '{}' → {} sink(s), on-sink-failure={:?}",
+            "Task {}: pipeline '{}' → {} sink(s), on-sink-failure={:?}, sink-ack-timeout={:?}",
             task.task_id,
             cfg.get("pipeline.name").map(String::as_str).unwrap_or("?"),
             sinks.len(),
-            policy
+            policy,
+            sink_ack_timeout
         );
-        let pipeline =
-            seatunnel_engine_core::connector_factory::create_sink_pipeline(&sinks, policy, None)?;
+        let pipeline = seatunnel_engine_core::connector_factory::create_sink_pipeline(
+            &sinks,
+            policy,
+            None,
+            sink_ack_timeout,
+        )?;
         (pipeline.writer, pipeline.metrics)
     } else {
         let sink_plugin = cfg
@@ -1207,6 +1766,46 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         worker.cancel_jobs(&["j-c".to_string()]).await;
         assert!(worker.running_task_count().await <= 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_truthful_terminal_state_and_keeps_listing_the_task() {
+        let worker = Arc::new(WorkerNode::new("w1", "127.0.0.1:5001", tmp_store("hb")));
+        let mut config = HashMap::new();
+        config.insert("source.plugin".to_string(), "Fake".to_string());
+        config.insert(
+            "source.config".to_string(),
+            serde_json::json!({ "row.num": 1 }).to_string(),
+        );
+        config.insert("sink.plugin".to_string(), "Console".to_string());
+        config.insert("sink.config".to_string(), "{}".to_string());
+        config.insert("transform.config".to_string(), "[]".to_string());
+        config.insert("checkpoint.interval".to_string(), "60000".to_string());
+        let task = TaskDescriptor {
+            task_id: "t-hb".into(),
+            job_id: "j-hb".into(),
+            stage_id: "s".into(),
+            task_name: "pipeline".into(),
+            task_index: 0,
+            source_config_json: String::new(),
+            sink_config_json: String::new(),
+            parallelism: 1,
+            config,
+        };
+        worker.assign_task(task).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The Fake pipeline finished: the heartbeat must carry the real
+        // COMPLETED state — not the historical hardcoded TASK_RUNNING.
+        // The handle stays listed (the terminal report is not acked — no
+        // master client here), which keeps the master's reconcile from
+        // re-dispatching a task that is mid-report.
+        let heartbeats = worker.heartbeat_tasks().await;
+        let hb = heartbeats
+            .iter()
+            .find(|h| h.task_id == "t-hb")
+            .expect("terminal-pending task must stay in heartbeats");
+        assert_eq!(hb.state, 3, "task finished -> COMPLETED in heartbeat");
     }
 
     #[tokio::test]

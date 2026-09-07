@@ -476,6 +476,7 @@ async fn update_flow_resubmits_same_id_via_shared_path() {
     edited["env"]["job.name"] = serde_json::json!("after-edit");
     let options = seatunnel_engine_client::UpdateOptions {
         cancel_timeout_secs: 30,
+        quiesce_timeout_secs: 120,
         settle_ms: 500,
     };
     let outcome = seatunnel_engine_client::update_job(

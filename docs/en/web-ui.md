@@ -124,6 +124,9 @@ Pages:
   task last processed a record — the key lag signal for streaming sync;
   green < 10s, amber < 30s, red beyond), live per-task logs (lifecycle
   events, checkpoints, sampled data rows), and checkpoint history.
+  Task states are truthful: a dispatched-but-unclaimed task shows
+  **DEPLOYING** (not RUNNING), and a finished task keeps showing its
+  terminal state until the master acks the report.
 - **Cluster** — registered workers, leader, heartbeats.
 
 ## REST API

@@ -220,6 +220,11 @@ pub struct StorageSection {
     /// TTL sweep for everything else). Default true.
     #[serde(default)]
     pub auto_clean: Option<bool>,
+    /// Behavior when a task has checkpoint history but no restorable
+    /// payload on restart: `fail` (default — a cold start would silently
+    /// skip data) or `warn` (log ERROR and cold-start anyway).
+    #[serde(default)]
+    pub restore_missing: Option<String>,
     /// Grace period after a job is cancelled before its local state is
     /// deleted (restore window for operator intervention).
     #[serde(default)]
@@ -300,6 +305,9 @@ pub struct EngineServerConfig {
     pub worker_address: String,
     /// Checkpoint storage backend: localfile | master | s3.
     pub storage_type: String,
+    /// Restore policy when checkpoint history exists but no restorable
+    /// payload is found: "fail" (default) | "warn".
+    pub restore_missing: String,
     /// S3 backend settings (when storage_type = s3).
     pub s3: ResolvedS3Config,
     /// Ordered master seed addresses (cluster member list).
@@ -401,6 +409,7 @@ impl Default for EngineServerConfig {
             replication_interval_ms: 5_000,
             worker_address: "127.0.0.1:5001".to_string(),
             storage_type: "localfile".to_string(),
+            restore_missing: "fail".to_string(),
             s3: ResolvedS3Config::default(),
             member_list: vec!["127.0.0.1:5800".to_string()],
             cluster_name: "seatunnel".to_string(),
@@ -504,6 +513,13 @@ impl EngineServerConfig {
         }
         if let Some(minutes) = storage.clean_interval_minutes {
             self.clean_interval_minutes = minutes.max(1);
+        }
+        if let Some(policy) = storage.restore_missing.as_deref() {
+            self.restore_missing = if policy.eq_ignore_ascii_case("warn") {
+                "warn".to_string()
+            } else {
+                "fail".to_string()
+            };
         }
         if let Some(kind) = storage.r#type.as_deref() {
             if !kind.is_empty() {

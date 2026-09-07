@@ -13,6 +13,9 @@ service MasterService {
   // Fetch the newest checkpoint bytes for a task from the master-backed
   // shared checkpoint store (storage type = master).
   rpc FetchCheckpoint(FetchCheckpointRequest) returns (FetchCheckpointResponse);
+  // Worker-side job-state probe (delayed state cleaner must not delete
+  // the state of a job id that was resubmitted via update/restart).
+  rpc GetJobStatus(JobStatusRequest) returns (JobStatus);
 }
 
 // Raft consensus transport between master/hybrid nodes (Stage-3 HA:
@@ -417,5 +420,11 @@ message FetchCheckpointResponse {
   // Highest checkpoint id available for the task (0 = none).
   int64 checkpoint_id = 1;
   bytes checkpoint_data = 2;
+  // Highest checkpoint id the master has ever RECORDED for this task
+  // (heartbeat-reported history), independent of whether a restorable
+  // payload exists. > 0 with an empty payload means "restore expected
+  // but unavailable" — the worker's checkpoint.restore-missing policy
+  // decides between a loud failure and a logged cold start.
+  int64 latest_checkpoint_id = 3;
 }
 

@@ -46,8 +46,14 @@ pub struct UpdateOptions {
     /// aborting (never resubmitting). Big states need longer exit
     /// checkpoints.
     pub cancel_timeout_secs: u64,
-    /// Quiet period after CANCELLED is observed, draining in-flight
-    /// terminal reports.
+    /// Max seconds to wait for the old incarnation's TASKS to reach a
+    /// terminal state after the job itself is CANCELLED. Resubmitting
+    /// earlier collides with the deterministic task ids: the worker's
+    /// dispatch dedup silently ignores the new dispatch while the old
+    /// handle still exists, leaving the new incarnation dead.
+    pub quiesce_timeout_secs: u64,
+    /// Quiet period after quiescence, draining in-flight terminal
+    /// reports.
     pub settle_ms: u64,
 }
 
@@ -55,6 +61,7 @@ impl Default for UpdateOptions {
     fn default() -> Self {
         UpdateOptions {
             cancel_timeout_secs: 60,
+            quiesce_timeout_secs: 120,
             settle_ms: 2_000,
         }
     }
@@ -117,6 +124,30 @@ pub async fn update_job(
                 }
                 // Drain in-flight terminal reports from the old incarnation.
                 tokio::time::sleep(Duration::from_millis(options.settle_ms)).await;
+
+                // Task-level quiescence: the job flips CANCELLED the
+                // moment the cancel applies, but its tasks may still be
+                // draining (exit checkpoint, sink flush). The resubmit
+                // reuses the same deterministic task ids, so a dispatch
+                // landing on a worker whose old handle still exists is
+                // silently ignored — wait until every task is terminal.
+                let quiesce_deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(options.quiesce_timeout_secs.max(1));
+                loop {
+                    let settled = client
+                        .get_job_status(job_id)
+                        .await
+                        .map(|status| status.tasks.iter().all(|t| matches!(t.state, 3 | 4 | 5)))
+                        // Job record gone (e.g. delete) — nothing to wait for.
+                        .unwrap_or(true);
+                    if settled {
+                        info!("Job {} tasks reached terminal states", job_id);
+                        break;
+                    }
+                    assert_not_quiesced_timeout(quiesce_deadline, job_id, options)?;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(options.settle_ms)).await;
             } else {
                 info!(
                     "Job {} already terminal (state {}); resubmitting directly",
@@ -172,6 +203,24 @@ fn assert_not_cancelled_timeout(
     Ok(())
 }
 
+fn assert_not_quiesced_timeout(
+    deadline: tokio::time::Instant,
+    job_id: &str,
+    options: &UpdateOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(format!(
+            "job {} cancelled but its tasks did not all reach a terminal state within {}s; \
+             update ABORTED without resubmitting (the old incarnation still holds the task \
+             ids — a resubmit now would be silently ignored by the workers; inspect it with \
+             `job status` and retry)",
+            job_id, options.quiesce_timeout_secs
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +233,7 @@ mod tests {
             "j1",
             &UpdateOptions {
                 cancel_timeout_secs: 5,
+                quiesce_timeout_secs: 5,
                 settle_ms: 0,
             },
         )

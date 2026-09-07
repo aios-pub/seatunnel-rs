@@ -41,19 +41,28 @@
 //!   the reader checkpoint (best-effort continuity).
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::FutureExt;
 use seatunnel_api::row::Row;
 use seatunnel_api::schema::SchemaChangeEvent;
 use seatunnel_api::sink::sink_committer::SinkCommitter;
 use seatunnel_api::sink::sink_writer::SinkWriter;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::error;
 
 use crate::connector_factory::{BoxedSinkCommitter, BoxedSinkWriter};
 
 /// Bounded per-sink buffer; a slow sink backpressures the reader only
 /// after this many queued commands.
 pub const FANOUT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Default ceiling for every bounded wait on an inner sink (channel
+/// sends and acks). Without it one hung sink freezes the whole task
+/// loop — cancel included — while the heartbeat keeps claiming RUNNING.
+pub const DEFAULT_SINK_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Behavior when an inner sink writer dies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +106,45 @@ const FANOUT_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(1
 
 async fn run_sink_worker(
     name: String,
+    writer: BoxedSinkWriter,
+    rx: mpsc::Receiver<SinkCommand>,
+    errors: SinkErrors,
+) {
+    // Panic isolation: an inner writer's panic must surface as a
+    // diagnosable dead sink (reason recorded in `errors`), not vanish
+    // into an aborted task whose JoinError nobody inspects.
+    let loop_name = name.clone();
+    let loop_errors = Arc::clone(&errors);
+    let inner = async move { run_sink_worker_loop(loop_name, writer, rx, loop_errors).await };
+    match AssertUnwindSafe(inner).catch_unwind().await {
+        Ok(()) => {}
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            error!(
+                "fan-out sink '{}' writer PANICKED — the sink is dead: {}",
+                name, msg
+            );
+            errors
+                .lock()
+                .await
+                .insert(name, format!("writer task panicked: {msg}"));
+        }
+    }
+}
+
+/// Lower-cased panic payload for diagnostics.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+async fn run_sink_worker_loop(
+    name: String,
     mut writer: BoxedSinkWriter,
     mut rx: mpsc::Receiver<SinkCommand>,
     errors: SinkErrors,
@@ -109,8 +157,11 @@ async fn run_sink_worker(
                 // Idle tick: flush tail records whose linger has elapsed so
                 // they do not wait for the next write or checkpoint.
                 if let Err(e) = writer.poll_flush().await {
-                    tracing::error!("fan-out sink '{}' idle flush failed: {}", name, e);
-                    errors.lock().await.insert(name.clone(), e.to_string());
+                    error!(
+                        "fan-out sink '{}' idle flush failed: {e:#} — the sink is dead",
+                        name
+                    );
+                    errors.lock().await.insert(name.clone(), format!("{e:#}"));
                     break;
                 }
                 continue;
@@ -140,8 +191,11 @@ async fn run_sink_worker(
             }
         };
         if let Err(e) = result {
-            tracing::error!("fan-out sink '{}' writer failed: {}", name, e);
-            errors.lock().await.insert(name.clone(), e.to_string());
+            error!(
+                "fan-out sink '{}' writer failed — the sink is dead: {e:#}",
+                name
+            );
+            errors.lock().await.insert(name.clone(), format!("{e:#}"));
             // Exiting drops `rx`; the multiplexer detects the closed
             // channel on its next interaction.
             break;
@@ -165,12 +219,26 @@ pub struct FanoutSinkWriter {
     policy: SinkFailurePolicy,
     handles: Vec<SinkHandle>,
     errors: SinkErrors,
+    /// Ceiling for channel sends and ack waits to any inner sink. A hung
+    /// sink fails (policy=fail) or is isolated (policy=isolate) at this
+    /// deadline instead of freezing the task loop forever.
+    ack_timeout: Duration,
 }
 
 impl FanoutSinkWriter {
     /// `writers` pairs a diagnostic name with each inner writer; spawned
     /// lazily on [`SinkWriter::open`].
     pub fn new(writers: Vec<(String, BoxedSinkWriter)>, policy: SinkFailurePolicy) -> Self {
+        Self::with_ack_timeout(writers, policy, DEFAULT_SINK_ACK_TIMEOUT)
+    }
+
+    /// Like [`Self::new`], with an explicit ceiling for channel sends and
+    /// ack waits (`pipeline.sink-ack-timeout-ms`).
+    pub fn with_ack_timeout(
+        writers: Vec<(String, BoxedSinkWriter)>,
+        policy: SinkFailurePolicy,
+        ack_timeout: Duration,
+    ) -> Self {
         FanoutSinkWriter {
             policy,
             handles: writers
@@ -184,6 +252,7 @@ impl FanoutSinkWriter {
                 })
                 .collect(),
             errors: Arc::new(Mutex::new(HashMap::new())),
+            ack_timeout,
         }
     }
 
@@ -195,67 +264,108 @@ impl FanoutSinkWriter {
 
     /// Handle a closed channel (writer task died). Returns Err under the
     /// Fail policy, marks the sink dead under Isolate.
-    fn on_channel_closed(&mut self, idx: usize) -> anyhow::Result<()> {
-        let handle = &mut self.handles[idx];
-        handle.dead = true;
+    fn on_channel_closed(&mut self, idx: usize, op: &str) -> anyhow::Result<()> {
         let reason = self
             .errors
             .try_lock()
             .ok()
-            .and_then(|errors| errors.get(&handle.name).cloned())
+            .and_then(|errors| errors.get(&self.handles[idx].name).cloned())
             .unwrap_or_else(|| "writer task terminated".to_string());
+        self.mark_dead(idx, format!("{reason} (op: {op})"))
+    }
+
+    /// Mark a sink dead. Fail policy → task error; Isolate → ERROR log
+    /// and continue with the remaining sinks.
+    fn mark_dead(&mut self, idx: usize, reason: String) -> anyhow::Result<()> {
+        if self.handles[idx].dead {
+            return Ok(());
+        }
+        self.handles[idx].dead = true;
+        let name = self.handles[idx].name.clone();
         match self.policy {
             SinkFailurePolicy::Fail => Err(anyhow::anyhow!(
                 "fan-out sink '{}' failed (on-sink-failure=fail): {}",
-                handle.name,
+                name,
                 reason
             )),
             SinkFailurePolicy::Isolate => {
-                tracing::error!(
+                error!(
                     "fan-out sink '{}' isolated (on-sink-failure=isolate): {}",
-                    handle.name,
-                    reason
+                    name, reason
                 );
                 Ok(())
             }
         }
     }
 
+    /// Send a command to one inner sink with a bounded wait. A full
+    /// channel (hung inner writer) times out exactly like a lost ack —
+    /// it can never freeze the task loop again.
+    async fn send_command(
+        &mut self,
+        idx: usize,
+        command: SinkCommand,
+        op: &str,
+    ) -> anyhow::Result<()> {
+        let tx = self.handles[idx].tx.as_ref().expect("opened").clone();
+        match tokio::time::timeout(self.ack_timeout, tx.send(command)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => self.on_channel_closed(idx, op),
+            Err(_) => self.mark_dead(
+                idx,
+                format!(
+                    "channel send timed out after {:?} — the sink writer is hung",
+                    self.ack_timeout
+                ),
+            ),
+        }
+    }
+
     /// Broadcast a command carrying an ack channel and await every ack
-    /// (concurrently). Used by open/prepare_commit/schema-change.
-    async fn broadcast_and_await<T, F>(&mut self, make_command: F) -> anyhow::Result<Vec<T>>
+    /// (concurrently, each bounded by the ack timeout). Used by
+    /// open/prepare_commit/schema-change/snapshot/close.
+    async fn broadcast_and_await<T, F>(
+        &mut self,
+        op: &'static str,
+        make_command: F,
+    ) -> anyhow::Result<Vec<T>>
     where
         F: Fn() -> (SinkCommand, oneshot::Receiver<anyhow::Result<T>>),
     {
         let mut acks = Vec::new();
         for idx in self.alive() {
             let (command, ack) = make_command();
-            if self.handles[idx]
-                .tx
-                .as_ref()
-                .expect("opened")
-                .send(command)
-                .await
-                .is_err()
-            {
-                self.on_channel_closed(idx)?;
-                continue;
-            }
+            self.send_command(idx, command, op).await?;
             acks.push((idx, ack));
         }
         let mut results = Vec::with_capacity(acks.len());
         for (idx, ack) in acks {
-            match ack.await {
-                Ok(Ok(value)) => results.push(value),
-                Ok(Err(e)) => {
-                    let reason = e.to_string();
+            match tokio::time::timeout(self.ack_timeout, ack).await {
+                Ok(Ok(Ok(value))) => results.push(value),
+                Ok(Ok(Err(e))) => {
+                    let reason = format!("{e:#} (op: {op})");
                     self.errors
                         .lock()
                         .await
                         .insert(self.handles[idx].name.clone(), reason.clone());
-                    self.on_channel_closed(idx)?;
+                    self.mark_dead(idx, reason)?;
                 }
-                Err(_) => self.on_channel_closed(idx)?,
+                Ok(Err(_)) => self.on_channel_closed(idx, op)?,
+                Err(_) => {
+                    let name = self.handles[idx].name.clone();
+                    error!(
+                        "fan-out sink '{}' ack timed out after {:?} (op: {}) — the sink \
+                         writer is hung",
+                        name, self.ack_timeout, op
+                    );
+                    self.mark_dead(
+                        idx,
+                        format!(
+                            "ack timed out after {:?} — the sink writer is hung (op: {})",
+                            self.ack_timeout, op
+                        ),
+                    )?;
+                }
             }
         }
         Ok(results)
@@ -285,37 +395,12 @@ impl SinkWriter for FanoutSinkWriter {
                 handle.join = Some(tokio::spawn(run_sink_worker(name, writer, rx, errors)));
                 handle.tx = Some(tx);
             }
-            let mut acks = Vec::new();
-            for idx in self.alive() {
+            self.broadcast_and_await("open", || {
                 let (ack_tx, ack_rx) = oneshot::channel();
-                if self.handles[idx]
-                    .tx
-                    .as_ref()
-                    .expect("opened")
-                    .send(SinkCommand::Open(ack_tx))
-                    .await
-                    .is_err()
-                {
-                    self.on_channel_closed(idx)?;
-                    continue;
-                }
-                acks.push((idx, ack_rx));
-            }
-            for (idx, ack) in acks {
-                match ack.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        let reason = e.to_string();
-                        self.errors
-                            .lock()
-                            .await
-                            .insert(self.handles[idx].name.clone(), reason.clone());
-                        self.on_channel_closed(idx)?;
-                    }
-                    Err(_) => self.on_channel_closed(idx)?,
-                }
-            }
-            Ok(())
+                (SinkCommand::Open(ack_tx), ack_rx)
+            })
+            .await
+            .map(|_| ())
         })
     }
 
@@ -325,37 +410,39 @@ impl SinkWriter for FanoutSinkWriter {
     ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
         Box::pin(async move {
             // The last live sink receives the record by move; the rest clone.
-            // Scanning backwards also avoids a per-write allocation.
-            let Some(last) = (0..self.handles.len())
-                .rev()
-                .find(|i| !self.handles[*i].dead)
-            else {
-                return Ok(());
-            };
-            for idx in 0..last {
-                if self.handles[idx].dead {
-                    continue;
-                }
-                if self.handles[idx]
-                    .tx
-                    .as_ref()
-                    .expect("opened")
-                    .send(SinkCommand::Write(record.clone()))
-                    .await
-                    .is_err()
-                {
-                    self.on_channel_closed(idx)?;
-                }
+            let alive = self.alive();
+            if alive.is_empty() {
+                // Isolate policy with every sink gone must never become a
+                // silent black hole: fail the task; the checkpoint replay
+                // keeps delivery at-least-once.
+                error!(
+                    "fan-out: every sink is dead under on-sink-failure=isolate — failing the \
+                     task instead of silently dropping rows"
+                );
+                anyhow::bail!(
+                    "all fan-out sinks are isolated/dead (on-sink-failure=isolate); rows \
+                     can no longer be delivered"
+                );
             }
-            if self.handles[last]
-                .tx
-                .as_ref()
-                .expect("opened")
-                .send(SinkCommand::Write(record))
-                .await
-                .is_err()
-            {
-                self.on_channel_closed(last)?;
+            let last = alive[alive.len() - 1];
+            for &idx in &alive[..alive.len() - 1] {
+                // Fail policy propagates (task error); Isolate returns
+                // Ok after logging, so remaining sinks keep receiving.
+                self.send_command(idx, SinkCommand::Write(record.clone()), "write")
+                    .await?;
+            }
+            self.send_command(last, SinkCommand::Write(record), "write")
+                .await?;
+            // Under Isolate a dead LAST sink returns Ok — but that row
+            // was moved into it and delivered NOWHERE. A total delivery
+            // failure must stay loud under both policies.
+            if self.handles[last].dead {
+                let name = self.handles[last].name.clone();
+                anyhow::bail!(
+                    "fan-out sink '{}' died mid-write under on-sink-failure=isolate and no \
+                     other sink received the row — failing the task",
+                    name
+                );
             }
             Ok(())
         })
@@ -368,7 +455,7 @@ impl SinkWriter for FanoutSinkWriter {
         Box::pin(async move {
             let cp_id = checkpoint_id;
             let commits = self
-                .broadcast_and_await(move || {
+                .broadcast_and_await("prepare_commit", move || {
                     let (ack_tx, ack_rx) = oneshot::channel();
                     (SinkCommand::PrepareCommit(cp_id, ack_tx), ack_rx)
                 })
@@ -393,7 +480,7 @@ impl SinkWriter for FanoutSinkWriter {
     fn snapshot_state(&mut self) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<u8>> {
         Box::pin(async move {
             let states = self
-                .broadcast_and_await(|| {
+                .broadcast_and_await("snapshot_state", || {
                     let (ack_tx, ack_rx) = oneshot::channel();
                     (SinkCommand::SnapshotState(ack_tx), ack_rx)
                 })
@@ -415,16 +502,33 @@ impl SinkWriter for FanoutSinkWriter {
 
     fn close(&mut self) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, ()> {
         Box::pin(async move {
-            let _ = self
-                .broadcast_and_await(|| {
+            if let Err(e) = self
+                .broadcast_and_await("close", || {
                     let (ack_tx, ack_rx) = oneshot::channel();
                     (SinkCommand::Close(ack_tx), ack_rx)
                 })
-                .await;
+                .await
+            {
+                error!("fan-out close reported failures: {e:#}");
+            }
             for handle in &mut self.handles {
                 handle.tx = None;
                 if let Some(join) = handle.join.take() {
-                    let _ = join.await;
+                    match join.await {
+                        Ok(()) => {}
+                        Err(e) if e.is_cancelled() => {
+                            error!(
+                                "fan-out sink '{}' writer task was cancelled during close",
+                                handle.name
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "fan-out sink '{}' writer task PANICKED during close: {}",
+                                handle.name, e
+                            );
+                        }
+                    }
                 }
             }
             Ok(())
@@ -439,7 +543,7 @@ impl SinkWriter for FanoutSinkWriter {
         Box::pin(async move {
             // Ack awaited per sink: rows enqueued after this call are
             // written with the new shape everywhere.
-            self.broadcast_and_await(move || {
+            self.broadcast_and_await("apply_schema_change", move || {
                 let (ack_tx, ack_rx) = oneshot::channel();
                 (
                     SinkCommand::SchemaChange(Box::new(event.clone()), ack_tx),
@@ -539,12 +643,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// Instrumented sink writer: logs every operation, optionally delays
-    /// writes, and can be armed to fail on the Nth write.
+    /// writes, hangs on prepare_commit, panics, or fails on the Nth write.
     struct TestWriter {
         name: String,
         ops: Arc<Mutex<Vec<String>>>,
         write_delay: Duration,
         fail_on_write: Option<usize>,
+        hang_prepare: Option<Duration>,
+        panic_on_write: bool,
         writes: usize,
     }
 
@@ -555,6 +661,8 @@ mod tests {
                 ops,
                 write_delay: Duration::ZERO,
                 fail_on_write: None,
+                hang_prepare: None,
+                panic_on_write: false,
                 writes: 0,
             }
         }
@@ -566,6 +674,16 @@ mod tests {
 
         fn failing_on(mut self, nth: usize) -> Self {
             self.fail_on_write = Some(nth);
+            self
+        }
+
+        fn hanging_prepare(mut self, delay: Duration) -> Self {
+            self.hang_prepare = Some(delay);
+            self
+        }
+
+        fn panicking_on_write(mut self) -> Self {
+            self.panic_on_write = true;
             self
         }
 
@@ -594,6 +712,7 @@ mod tests {
             self.writes += 1;
             let fail = self.fail_on_write == Some(self.writes);
             let delay = self.write_delay;
+            let panic_on_write = self.panic_on_write;
             let entry = format!("{}:write{}", self.name, self.writes);
             let ops = Arc::clone(&self.ops);
             Box::pin(async move {
@@ -603,6 +722,9 @@ mod tests {
                 ops.lock().unwrap().push(entry);
                 if fail {
                     anyhow::bail!("injected failure");
+                }
+                if panic_on_write {
+                    panic!("injected panic");
                 }
                 Ok(())
             })
@@ -614,7 +736,13 @@ mod tests {
         ) -> seatunnel_api::sink::sink_writer::WriterFuture<'_, Vec<Self::CommitInfo>> {
             self.log("flush");
             let commit = format!("{}-commit", self.name);
-            Box::pin(async move { Ok(vec![commit]) })
+            let hang = self.hang_prepare;
+            Box::pin(async move {
+                if let Some(delay) = hang {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(vec![commit])
+            })
         }
 
         fn snapshot_state(
@@ -855,5 +983,111 @@ mod tests {
         assert!(ops_now.contains(&"a:ddl".to_string()));
         assert!(ops_now.contains(&"b:ddl".to_string()));
         mux.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_policy_fails_prepare_commit_on_hung_sink_ack() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut mux = FanoutSinkWriter::with_ack_timeout(
+            vec![(
+                "hung".to_string(),
+                boxed(
+                    TestWriter::new("hung", Arc::clone(&ops))
+                        .hanging_prepare(Duration::from_secs(5)),
+                ),
+            )],
+            SinkFailurePolicy::Fail,
+            Duration::from_millis(200),
+        );
+        mux.open().await.unwrap();
+        let started = Instant::now();
+        let err = mux.prepare_commit(1).await.unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("timed out") && err.to_string().contains("hung"),
+            "error must name the hung sink and the timeout: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "ack wait must be bounded, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolate_policy_marks_hung_sink_dead_and_continues() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut mux = FanoutSinkWriter::with_ack_timeout(
+            vec![
+                (
+                    "hung".to_string(),
+                    boxed(
+                        TestWriter::new("hung", Arc::clone(&ops))
+                            .hanging_prepare(Duration::from_secs(5)),
+                    ),
+                ),
+                (
+                    "healthy".to_string(),
+                    boxed(TestWriter::new("healthy", Arc::clone(&ops))),
+                ),
+            ],
+            SinkFailurePolicy::Isolate,
+            Duration::from_millis(200),
+        );
+        mux.open().await.unwrap();
+        mux.write(row(1)).await.unwrap();
+        // The hung sink's ack times out, it is isolated, and the
+        // checkpoint still completes against the healthy sink.
+        mux.prepare_commit(1).await.unwrap();
+        mux.close().await.unwrap();
+        assert!(ops.lock().unwrap().contains(&"healthy:flush".to_string()));
+    }
+
+    #[tokio::test]
+    async fn isolate_with_every_sink_dead_fails_writes_loudly() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut mux = FanoutSinkWriter::with_ack_timeout(
+            vec![(
+                "doomed".to_string(),
+                boxed(TestWriter::new("doomed", Arc::clone(&ops)).failing_on(1)),
+            )],
+            SinkFailurePolicy::Isolate,
+            Duration::from_secs(5),
+        );
+        mux.open().await.unwrap();
+        mux.write(row(1)).await.unwrap(); // enqueued; the writer dies
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Row 2 was moved into the dying last sink: loud failure with the
+        // mid-write message, not a silent drop.
+        let err = mux.write(row(2)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("died mid-write"),
+            "last-sink death must fail loudly, got: {err}"
+        );
+        // Row 3 hits the already-all-dead mux: loud failure too.
+        let err = mux.write(row(3)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("all fan-out sinks"),
+            "all-dead isolate must fail loudly, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_inner_writer_is_surfaced_with_reason() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let mut mux = FanoutSinkWriter::new(
+            vec![(
+                "panicky".to_string(),
+                boxed(TestWriter::new("panicky", Arc::clone(&ops)).panicking_on_write()),
+            )],
+            SinkFailurePolicy::Fail,
+        );
+        mux.open().await.unwrap();
+        mux.write(row(1)).await.unwrap(); // enqueued; the writer panics
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let err = mux.write(row(2)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("panicked"),
+            "panic must surface in the error chain, got: {err}"
+        );
     }
 }

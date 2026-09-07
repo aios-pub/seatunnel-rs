@@ -112,7 +112,8 @@ pub fn job_state_name(code: i32) -> &'static str {
     }
 }
 
-/// Name for a proto `TaskState` code (1..=5).
+/// Name for a proto `TaskState` code (1..=5, plus 7 = DEPLOYING: the
+/// task is dispatched but not yet claimed/executed by any worker).
 fn task_state_name(code: i32) -> &'static str {
     match code {
         1 => "CREATED",
@@ -120,6 +121,7 @@ fn task_state_name(code: i32) -> &'static str {
         3 => "COMPLETED",
         4 => "FAILED",
         5 => "CANCELLED",
+        7 => "DEPLOYING",
         _ => "UNKNOWN",
     }
 }

@@ -362,7 +362,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(50),
                 mem_permille: Some(300),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             1,
@@ -378,7 +379,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(900),
                 mem_permille: Some(300),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             1,
@@ -393,7 +395,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(10),
                 mem_permille: Some(800),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             1,
@@ -409,7 +412,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(900),
                 mem_permille: Some(300),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             1,
@@ -419,7 +423,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(50),
                 mem_permille: Some(300),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             5,
@@ -430,7 +435,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(50),
                 mem_permille: Some(300),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             5,
@@ -450,7 +456,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(60_000),
                 mem_permille: Some(999),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &config,
             &mut state,
             1,
@@ -474,7 +481,8 @@ mod tests {
             &AdmissionSignals {
                 lag_ms: Some(250),
                 mem_permille: Some(300),
-                cpu_permille: None,            },
+                cpu_permille: None,
+            },
             &cfg(),
             &mut state,
             1,

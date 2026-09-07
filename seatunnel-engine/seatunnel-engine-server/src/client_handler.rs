@@ -417,7 +417,10 @@ impl seatunnel_engine_comm::ClientService for ClientHandler {
                 state: match &info.state {
                     crate::job_coordinator::JobState::Created => 1,
                     crate::job_coordinator::JobState::Scheduled => 1,
-                    crate::job_coordinator::JobState::Deploying => 2,
+                    // Distinguished for the console (7 = DEPLOYING, like
+                    // the job-level code): a Deploying task is NOT running
+                    // — nothing executes it until a worker claims it.
+                    crate::job_coordinator::JobState::Deploying => 7,
                     crate::job_coordinator::JobState::Running => 2,
                     crate::job_coordinator::JobState::Completed => 3,
                     crate::job_coordinator::JobState::Failed { .. } => 4,

@@ -500,8 +500,13 @@ async fn run_local(
                         .or_insert_with(|| serde_json::json!(subtask));
                 }
             }
-            let sink_pipeline = create_sink_pipeline(&sinks, policy, writer_state.as_deref())
-                .with_context(|| format!("creating sinks for pipeline '{}'", pipe.name))?;
+            let sink_pipeline = create_sink_pipeline(
+                &sinks,
+                policy,
+                writer_state.as_deref(),
+                seatunnel_engine_core::fanout::DEFAULT_SINK_ACK_TIMEOUT,
+            )
+            .with_context(|| format!("creating sinks for pipeline '{}'", pipe.name))?;
 
             let mut context = TaskContext::new(
                 task_id,
@@ -749,6 +754,7 @@ fn state_name(code: i32) -> &'static str {
         4 => "COMPLETED",
         5 => "FAILED",
         6 => "CANCELLED",
+        7 => "DEPLOYING",
         _ => "CREATED",
     }
 }
@@ -910,6 +916,7 @@ async fn show_status(address: &str, job_id: &str) -> Result<()> {
                 3 => "COMPLETED",
                 4 => "FAILED",
                 5 => "CANCELLED",
+                7 => "DEPLOYING",
                 _ => "CREATED",
             },
             t.processed_records

@@ -178,7 +178,7 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
         loop {
             tick.tick().await;
             let tasks = hb_worker.heartbeat_tasks().await;
-            let (load_score, lag_ms, mem_permille, can_accept) = hb_worker.admission_fields().await;
+            let admission = hb_worker.admission_fields().await;
             let Ok(resp) = hb_client
                 .heartbeat(seatunnel_engine_comm::HeartbeatRequest {
                     worker_id: "e2e-worker".into(),
@@ -187,10 +187,11 @@ async fn spawn_worker(master_addr: &str) -> anyhow::Result<Arc<WorkerNode>> {
                     tasks,
                     term: hb_worker.term(),
                     wait_ms: 0,
-                    load_score,
-                    lag_ms,
-                    mem_permille,
-                    can_accept,
+                    load_score: admission.load_score,
+                    lag_ms: admission.lag_ms,
+                    mem_permille: admission.mem_permille,
+                    cpu_permille: admission.cpu_permille,
+                    can_accept: admission.can_accept,
                 })
                 .await
             else {

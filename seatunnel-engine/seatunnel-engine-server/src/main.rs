@@ -30,8 +30,9 @@
 //! to also serve it (see the `--web-*` flags).
 //!
 //! Logs go to stdout and, in addition, to daily rolling files named
-//! `<role>.YYYY-MM-DD` under `<state-dir>/logs` (override with `--log-dir`;
-//! keep at most 30 files).
+//! `<role>.YYYY-MM-DD` under `./logs` — deliberately OUTSIDE the state
+//! dir so the state sweeper can never take log files with it (override
+//! with `--log-dir`; keep at most 30 files).
 
 use clap::Parser;
 use seatunnel_engine_comm::{
@@ -41,7 +42,7 @@ use seatunnel_engine_server::{
     ClientHandler, JobCoordinator, LocalStateStore, MasterHandler, WorkerNode, new_worker_registry,
     server_config::EngineServerConfig,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::Duration;
@@ -101,8 +102,9 @@ struct Args {
     log_level: Option<String>,
 
     /// Directory for the daily rolling log files (<role>.YYYY-MM-DD,
-    /// 30 files kept). Defaults to <state-dir>/logs; "none" disables
-    /// file logging (stdout only).
+    /// 30 files kept). Defaults to ./logs, decoupled from the state dir
+    /// (the state sweeper must never be able to delete log files);
+    /// "none" disables file logging (stdout only).
     #[arg(long, env = "SEATUNNEL_LOG_DIR")]
     log_dir: Option<String>,
 
@@ -190,8 +192,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Precedence: --state-dir > SEATUNNEL_STATE_DIR > config file > default.
-    // Loaded before the subscriber so the rolling log files can default to
-    // <state-dir>/logs.
     let explicit_state_dir = if args.state_dir == ".seatunnel-state" {
         None
     } else {
@@ -205,12 +205,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Dual output: stdout (containers, foreground runs) plus daily rolling
     // files per role. The guard flushes the non-blocking file writer on drop.
-    let _log_guard = init_tracing(
-        filter,
-        &args.role,
-        args.log_dir.as_deref(),
-        &engine_config.state_dir,
-    );
+    let _log_guard = init_tracing(filter, &args.role, args.log_dir.as_deref());
     // Panics (message + site + forced backtrace) go through the logger —
     // stdout plus the daily rolling files, like every other error.
     seatunnel_common::install_panic_hook();
@@ -229,10 +224,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Resolve the log directory once for both file logging and the
     // embedded console's log viewer ("--log-dir none" = stdout only).
+    // Default `./logs` — relative to the working directory and
+    // intentionally NOT derived from the state dir: the state sweeper
+    // removes stale subtrees there and must never be able to take the
+    // live log files with it.
     let resolved_log_dir = match args.log_dir.as_deref().map(str::trim) {
         Some(dir) if dir.eq_ignore_ascii_case("none") => None,
         Some(dir) => Some(dir.to_string()),
-        None => Some(format!("{}/logs", engine_config.state_dir)),
+        None => Some("./logs".to_string()),
     };
 
     let web = args.web.then(|| WebConsoleArgs {
@@ -278,7 +277,6 @@ fn init_tracing(
     filter: EnvFilter,
     role: &str,
     log_dir: Option<&str>,
-    state_dir: &str,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     // "YYYY-MM-DD HH:mm:ss" in the server's local timezone.
     let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S".to_string());
@@ -294,8 +292,9 @@ fn init_tracing(
             return None;
         }
         Some(dir) => PathBuf::from(dir),
-        // Default: <state-dir>/logs so every node keeps its own files.
-        None => Path::new(state_dir).join("logs"),
+        // Default: ./logs relative to the working directory — decoupled
+        // from the state dir so its sweeper can never delete log files.
+        None => PathBuf::from("./logs"),
     };
 
     let appender = match tracing_appender::rolling::RollingFileAppender::builder()
@@ -756,7 +755,12 @@ async fn run_master(
             .master
             .clone()
             .unwrap_or_else(|| advertise_address(advertise, &serving.local_addr));
-        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web), web.log_dir.clone());
+        seatunnel_web::spawn_console(
+            web.listen.clone(),
+            endpoint,
+            web_auth(&web),
+            web.log_dir.clone(),
+        );
     }
     let shutdown = serving.shutdown;
     tokio::select! {
@@ -795,7 +799,12 @@ async fn run_hybrid(
             .master
             .clone()
             .unwrap_or_else(|| format!("127.0.0.1:{}", serving.local_addr.port()));
-        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web), web.log_dir.clone());
+        seatunnel_web::spawn_console(
+            web.listen.clone(),
+            endpoint,
+            web_auth(&web),
+            web.log_dir.clone(),
+        );
     }
     tracing::info!(
         "Hybrid node: coordinator at {} + in-process worker '{}'",
@@ -880,7 +889,12 @@ async fn run_worker(
     // list so it fails over together with the heartbeat loop.
     if let Some(web) = web {
         let endpoint = web.master.clone().unwrap_or_else(|| master_list.join(","));
-        seatunnel_web::spawn_console(web.listen.clone(), endpoint, web_auth(&web), web.log_dir.clone());
+        seatunnel_web::spawn_console(
+            web.listen.clone(),
+            endpoint,
+            web_auth(&web),
+            web.log_dir.clone(),
+        );
     }
 
     // Worker advertise address: --addr > config worker.address > default.
@@ -904,6 +918,11 @@ async fn run_worker(
         });
     let mut worker =
         WorkerNode::new_with_clean(worker_id.to_string(), addr.clone(), state_store, clean);
+    worker.with_restore_missing(&engine_config.restore_missing.clone());
+    tracing::info!(
+        "Worker checkpoint restore-missing policy: {}",
+        engine_config.restore_missing
+    );
     // Dynamic admission: measured pressure (lag + memory watermark), no
     // slot counts. Samplers run inside the controller.
     worker = worker.with_admission(

@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use seatunnel_engine_comm::{
     CheckpointReport, Empty, FetchCheckpointRequest, FetchCheckpointResponse, HeartbeatRequest,
-    HeartbeatResponse, MasterService, TaskStatusReport, UnregisterWorkerRequest,
-    WorkerRegistration, WorkerRegistrationResponse,
+    HeartbeatResponse, JobStatus, JobStatusRequest, MasterService, TaskStatusReport,
+    UnregisterWorkerRequest, WorkerRegistration, WorkerRegistrationResponse,
 };
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -156,6 +156,14 @@ pub struct MasterHandler {
     /// this long are forced CANCELLED (stops the endless cancel
     /// re-broadcast when a task hangs or its terminal report is lost).
     cancel_force_timeout_ms: u64,
+    /// First heartbeat at which each `Running` task (keyed by task id)
+    /// was seen absent from its owner's report — restart-recovery grace
+    /// tracking, see [`Self::reconcile_heartbeat_lost_tasks`].
+    lost_since: std::sync::Mutex<HashMap<String, i64>>,
+    /// How long a Running task may stay absent from its owner's
+    /// heartbeats before it is declared lost work of a previous process
+    /// lifetime and released for re-dispatch.
+    lost_grace_ms: i64,
 }
 
 impl MasterHandler {
@@ -167,6 +175,7 @@ impl MasterHandler {
         worker_soft_timeout_ms: u64,
         writes: Arc<dyn WritePath>,
     ) -> Self {
+        let heartbeat_interval_ms = heartbeat_interval_ms.clamp(250, 60_000);
         MasterHandler {
             state: Mutex::new(MasterState::default()),
             coordinator,
@@ -174,10 +183,17 @@ impl MasterHandler {
             writes,
             wake: Arc::new(tokio::sync::Notify::new()),
             info,
-            heartbeat_interval_ms: heartbeat_interval_ms.clamp(250, 60_000),
+            heartbeat_interval_ms,
             worker_soft_timeout_ms: worker_soft_timeout_ms.max(1_000),
             dispatch_batch_limit: 16,
             cancel_force_timeout_ms: 300_000,
+            lost_since: std::sync::Mutex::new(HashMap::new()),
+            // Six heartbeat periods, floor 30s: comfortably above any
+            // dispatch latency (a freshly dispatched task misses at most
+            // one heartbeat report), far below the zombie-forever
+            // alternative when the registration-time reconcile raced the
+            // Raft replay.
+            lost_grace_ms: ((heartbeat_interval_ms * 6).max(30_000)) as i64,
         }
     }
 
@@ -196,6 +212,54 @@ impl MasterHandler {
     /// The configured cancel deadline.
     pub fn cancel_force_timeout_ms(&self) -> u64 {
         self.cancel_force_timeout_ms
+    }
+
+    /// Heartbeat-time restart recovery: return the active (`Running` /
+    /// `Deploying`) tasks the coordinator still pins on this worker but
+    /// which have now been absent from its heartbeat reports for at
+    /// least the grace window.
+    ///
+    /// Registration-time reconcile ([`Self::reattach_tasks`]) is the
+    /// primary recovery path, but a hybrid node's embedded worker can
+    /// register while the Raft log is still replaying — that reconcile
+    /// then sees an empty coordinator, and once leadership installs the
+    /// replayed tasks nothing re-runs it (the claim rule only releases
+    /// tasks of `Dead` owners), leaving them Running forever with nobody
+    /// executing them. The heartbeat task list is the truth of what this
+    /// process actually runs, so a task missing from it longer than the
+    /// grace window is lost work of a previous process lifetime. The
+    /// grace window rides out the dispatch race where a task was handed
+    /// out in the very heartbeat whose report lacks it.
+    fn reconcile_heartbeat_lost_tasks(
+        &self,
+        worker_id: &str,
+        reported: &[String],
+        now_ms: i64,
+    ) -> Vec<crate::job_coordinator::StuckCancelledTask> {
+        let missing = self
+            .coordinator
+            .reconcile_lost_active_tasks(worker_id, reported);
+        let mut seen = self.lost_since.lock().unwrap();
+        let missing_ids: std::collections::HashSet<&str> =
+            missing.iter().map(|m| m.task_id.as_str()).collect();
+        seen.retain(|task_id, _| {
+            // Running again (dispatch caught up) or no longer active on
+            // this worker in the coordinator (released elsewhere /
+            // terminal) — either way the tracking entry is obsolete.
+            if reported.iter().any(|r| r == task_id) {
+                return false;
+            }
+            missing_ids.contains(task_id.as_str())
+        });
+        let mut due = Vec::new();
+        for lost in missing {
+            let since = *seen.entry(lost.task_id.clone()).or_insert(now_ms);
+            if now_ms.saturating_sub(since) >= self.lost_grace_ms {
+                seen.remove(&lost.task_id);
+                due.push(lost);
+            }
+        }
+        due
     }
 
     /// Wake every parked long-poll heartbeat (new work may exist).
@@ -444,6 +508,30 @@ impl MasterHandler {
             };
             if let Err(e) = self.writes.propose(cmd).await {
                 warn!("cancel reconcile: TaskStatus proposal failed: {}", e);
+            }
+        }
+
+        // Restart recovery (heartbeat): release Running tasks this worker
+        // stopped reporting long ago — see
+        // [`Self::reconcile_heartbeat_lost_tasks`]. Leader-only: it sits
+        // behind the leadership gate above.
+        let heartbeat_lost = self.reconcile_heartbeat_lost_tasks(&worker_id, &reported, now);
+        if !heartbeat_lost.is_empty() {
+            let task_ids: Vec<String> = heartbeat_lost.iter().map(|t| t.task_id.clone()).collect();
+            warn!(
+                "Restart recovery: task(s) {} still Running on worker {} in the coordinator but \
+                 absent from its heartbeats for >{}ms — releasing for re-dispatch (resume from \
+                 checkpoint)",
+                task_ids.join(", "),
+                worker_id,
+                self.lost_grace_ms
+            );
+            let cmd = Command::ReleaseLostTasks {
+                worker_id: worker_id.clone(),
+                task_ids,
+            };
+            if let Err(e) = self.writes.propose(cmd).await {
+                warn!("restart recovery: ReleaseLostTasks proposal failed: {}", e);
             }
         }
 
@@ -717,7 +805,14 @@ impl MasterService for MasterHandler {
             },
         };
         if let Err(e) = self.writes.propose(cmd).await {
+            // Reply with a retryable error: the worker's terminal-report
+            // loop treats any failure as "not delivered" and retries.
+            // Replying Ok here would ack a LOST terminal transition and
+            // pin the job in RUNNING forever.
             warn!("TaskStatus proposal failed: {}", e);
+            return Err(tonic::Status::unavailable(format!(
+                "task status proposal failed: {e}"
+            )));
         }
         // A terminal transition may unblock other dispatch decisions.
         self.wake_heartbeats();
@@ -798,6 +893,19 @@ impl MasterService for MasterHandler {
         request: Request<FetchCheckpointRequest>,
     ) -> Result<Response<FetchCheckpointResponse>, Status> {
         let req = request.into_inner();
+        // Heartbeat-reported history: the highest checkpoint id the
+        // master ever recorded for this task, even when no restorable
+        // payload exists (drives the worker's restore-missing policy).
+        let latest = self
+            .coordinator
+            .get_job(&req.job_id)
+            .map(|job| {
+                job.tasks
+                    .get(&req.task_id)
+                    .map(|info| info.last_checkpoint_id as i64)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
         match self
             .coordinator
             .fetch_checkpoint(&req.job_id, &req.task_id)
@@ -806,12 +914,33 @@ impl MasterService for MasterHandler {
             Some((id, data)) => Ok(Response::new(FetchCheckpointResponse {
                 checkpoint_id: id as i64,
                 checkpoint_data: data,
+                latest_checkpoint_id: latest,
             })),
             None => Ok(Response::new(FetchCheckpointResponse {
                 checkpoint_id: 0,
                 checkpoint_data: Vec::new(),
+                latest_checkpoint_id: latest,
             })),
         }
+    }
+
+    /// Minimal job-state probe for workers (the richer console variant
+    /// lives on the client service).
+    async fn get_job_status(
+        &self,
+        request: Request<JobStatusRequest>,
+    ) -> Result<Response<JobStatus>, Status> {
+        let req = request.into_inner();
+        let job = self
+            .coordinator
+            .get_job(&req.job_id)
+            .ok_or_else(|| Status::not_found(format!("Job {} not found", req.job_id)))?;
+        Ok(Response::new(JobStatus {
+            job_id: job.job_id.clone(),
+            state: job.state.to_proto_state(),
+            job_name: job.job_name.clone(),
+            ..Default::default()
+        }))
     }
 
     async fn unregister_worker(
@@ -860,6 +989,93 @@ mod tests {
         assert_eq!(
             registry_snapshot(&registry),
             vec![("w1".to_string(), "127.0.0.1:5001".to_string())]
+        );
+    }
+
+    #[test]
+    fn heartbeat_grace_releases_absent_running_tasks_only_after_window() {
+        // Regression: a hybrid node's embedded worker registers while the
+        // Raft log is still replaying, so the registration-time reconcile
+        // sees an empty coordinator — and tasks restored afterwards stay
+        // Running on a Healthy worker forever (nothing executes them).
+        // The heartbeat-time grace reconcile is the self-heal path.
+        let coordinator = Arc::new(JobCoordinator::new());
+        let config = serde_json::json!({
+            "env": { "parallelism": 1 },
+            "source": { "Fake": {} },
+            "sink": { "Console": {} }
+        });
+        let (_, tasks) = coordinator
+            .compile_and_install(
+                "jgrace",
+                "job-grace",
+                &config,
+                None,
+                &[(
+                    "worker-0".to_string(),
+                    "127.0.0.1:5001".to_string(),
+                    100,
+                    true,
+                )],
+            )
+            .unwrap();
+        let task_id = tasks[0].task_id.clone();
+        coordinator.mark_tasks_dispatched(std::slice::from_ref(&task_id), "worker-0");
+        coordinator.report_task_status("jgrace", &task_id, "RUNNING", 0, None);
+
+        let handler = MasterHandler::new_direct(
+            coordinator,
+            new_worker_registry(),
+            MasterInfo {
+                advertise_addr: "127.0.0.1:5800".to_string(),
+                role: "hybrid".to_string(),
+            },
+            1000,
+            60_000,
+        );
+
+        // Restart simulation: the worker reports nothing. The task is
+        // missing from the first heartbeat but is only released once the
+        // grace window (30s floor) has fully elapsed.
+        let absent: Vec<String> = Vec::new();
+        assert!(
+            handler
+                .reconcile_heartbeat_lost_tasks("worker-0", &absent, 0)
+                .is_empty()
+        );
+        assert!(
+            handler
+                .reconcile_heartbeat_lost_tasks("worker-0", &absent, 29_999)
+                .is_empty()
+        );
+        let due = handler.reconcile_heartbeat_lost_tasks("worker-0", &absent, 30_000);
+        assert_eq!(due.len(), 1, "missing past the grace window must be due");
+        assert_eq!(due[0].task_id, task_id);
+
+        // Presence resets tracking: after the task is reported running
+        // again, a fresh absence starts a new grace window instead of
+        // firing immediately — it elapses again 30s after the report.
+        let reported = vec![task_id.clone()];
+        assert!(
+            handler
+                .reconcile_heartbeat_lost_tasks("worker-0", &reported, 60_000)
+                .is_empty()
+        );
+        assert!(
+            handler
+                .reconcile_heartbeat_lost_tasks("worker-0", &absent, 60_001)
+                .is_empty()
+        );
+        assert!(
+            handler
+                .reconcile_heartbeat_lost_tasks("worker-0", &absent, 90_000)
+                .is_empty()
+        );
+        assert_eq!(
+            handler
+                .reconcile_heartbeat_lost_tasks("worker-0", &absent, 90_001)
+                .len(),
+            1
         );
     }
 }

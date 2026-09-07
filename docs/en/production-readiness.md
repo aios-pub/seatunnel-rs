@@ -26,6 +26,52 @@ Pseudo-cluster fault-matrix verification: `scripts/e2e-pseudo-cluster.sh`
 - **Restart recovery (Java `restoreAllRunningJobFromMasterNodeSwitch` equivalent)**: job metadata (configs, plans, states, checkpoint-id counters) is durable in the Raft log/snapshot under `<state-dir>/raft`. At boot the coordinator is replayed; when a worker registers, every task the coordinator still believes that worker runs (`Running`/`Deploying`) but the (re)registering process does NOT report — a restarted process reports an empty list — is released back to `Scheduled` (owner/placement kept) and re-dispatched by the normal claim rule. The worker then resumes from its checkpoint restore chain (local disk → master/S3 → cold start); streaming jobs continue from the last checkpoint offset, batch jobs rerun (at-least-once). Owners that never re-register are released by the existing absent-owner reconciliation after the hard timeout. Terminal jobs are never touched (history only).
 - **S3 cleanup**: three layers — write-time retention (`keep-checkpoint-count`), master cancel-grace deletion, TTL sweep (`history-job-expire-minutes`).
 
+## Reliability hardening (silent-failure elimination)
+
+A CDC pipeline that dies silently while the console still shows RUNNING
+is the worst production failure mode. The following guarantees close
+those paths:
+
+- **Terminal reports are reliable.** A finished task's terminal
+  transition is queued on the worker and retried until the master acks
+  (per-attempt timeout, exponential backoff, 10-minute budget). The
+  master replies with a retryable error when its Raft proposal fails —
+  it never acks a report it dropped. While the report is in flight the
+  task keeps appearing in heartbeats with its true terminal state, so
+  the heartbeat reconcile cannot double-dispatch it; past the budget
+  the reconcile's release → re-dispatch takes over.
+- **Heartbeats carry the real task state** (COMPLETED/FAILED/CANCELLED
+  once the task ends — never a hardcoded RUNNING).
+- **Heartbeat-time reconcile** releases `Running`/`Deploying` tasks that
+  a healthy owner stopped reporting past the grace window (restart race,
+  lost dispatch), re-dispatching them from their last checkpoint.
+- **Cancel backstop**: a task that ignores cancellation is force-aborted
+  on the worker after 60 s, synthesizing the CANCELLED report.
+- **Update/restart waits for task-level quiescence** before resubmitting
+  the same job id, and the worker accepts a re-dispatch of a cancelled
+  incarnation once it drained (bounded wait) — the new incarnation can
+  no longer be silently ignored by the dispatch dedup.
+- **Delayed cleanup never eats fresh state**: the cancelled-job state
+  cleaner re-checks with the master at fire time and skips any job id
+  that is non-terminal again (i.e. resubmitted by the update flow).
+- **Restore failures are loud**: an unreadable local checkpoint state
+  fails the task; checkpoint history without a restorable payload
+  follows `checkpoint.storage.restore-missing: fail` (default — refuses
+  a silent cold start that would skip data) or `warn` (ERROR log, cold
+  start). Fresh jobs without history always cold-start normally.
+- **Bounded sinks**: fan-out channel sends and acks are capped by
+  `pipeline.sink-ack-timeout-ms` (default 60000) — a hung sink fails
+  (policy `fail`) or is isolated (policy `isolate`) at the deadline
+  instead of freezing the loop; with `isolate` and every sink dead the
+  task fails instead of silently dropping rows. The RabbitMQ sink bounds
+  connect and publisher-confirm waits and reconnects with backoff on
+  transient failures.
+- **CDC zombie-connection detection**: the MySQL CDC reader sets
+  `@master_heartbeat_period` and TCP keepalive, and recycles the dump
+  stream after `max(3 × heartbeat, 60 s)` of total silence, reconnecting
+  from the last offset (bounded retry window; purged-binlog errors fail
+  immediately with a clear message).
+
 ## Known limitations (before true production hardening)
 
 1. **Security**: no TLS/mTLS on gRPC, no authentication on any service (master/worker/client/replication). Production requires at least TLS + token auth.

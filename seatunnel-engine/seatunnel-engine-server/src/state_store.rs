@@ -35,7 +35,12 @@ pub const DEFAULT_RETAINED_SNAPSHOTS: usize = 3;
 /// that has not written yet has an EMPTY raft dir, and an idle cluster's
 /// raft dir can be older than the job TTL — deleting either kills the
 /// Raft core with a store write error.
-const RESERVED_DIRS: &[&str] = &["raft"];
+/// Directories under the store root that are engine infrastructure, not
+/// job state: the Raft log and the engine's own tracing log directory
+/// (`$STATE_DIR/logs`, written by the rolling appender). The sweeper must
+/// never classify these as expired job state — treating `logs/` as a job
+/// directory deleted the live log files once the directory looked idle.
+const RESERVED_DIRS: &[&str] = &["raft", "logs"];
 
 #[derive(Debug, Clone)]
 pub struct LocalStateStore {
@@ -142,7 +147,8 @@ impl LocalStateStore {
     }
 
     /// All job directories currently under the store root. Reserved
-    /// engine directories (`raft`) are excluded — they are not job state.
+    /// engine directories ([`RESERVED_DIRS`]: the Raft store and the
+    /// engine's own `logs/`) are excluded — they are not job state.
     pub fn job_dirs(&self) -> Vec<(String, PathBuf)> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();
@@ -398,6 +404,29 @@ mod tests {
         fs::create_dir_all(store.root().join("ghost")).unwrap();
         let removed = store.sweep_expired(std::time::Duration::ZERO);
         assert_eq!(removed, vec!["ghost".to_string()]);
+    }
+
+    #[test]
+    fn sweep_never_touches_the_engine_log_directory() {
+        // Regression: in hybrid mode the rolling appender writes the
+        // daily engine logs to <state_dir>/logs. The sweeper classified
+        // that directory as an expired "job" once its newest file looked
+        // idle and deleted the live log files out from under the running
+        // process (production: `removed expired job state 'logs'`).
+        let store = tmp_store("reserved-logs");
+        let logs = store.root().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("hybrid.2026-09-06"),
+            b"2026-09-06 14:54:48  INFO ...\n",
+        )
+        .unwrap();
+        // Even an idle logs dir (ttl 0 expires everything job-shaped)
+        // must survive the sweep.
+        let removed = store.sweep_expired(std::time::Duration::ZERO);
+        assert!(removed.is_empty(), "logs/ must not be swept: {removed:?}");
+        assert!(logs.join("hybrid.2026-09-06").is_file());
+        assert_eq!(store.job_dirs(), Vec::new());
     }
 
     #[test]

@@ -1233,7 +1233,13 @@ pub fn create_sinks(
     sinks: &[SinkDeclaration],
     failure_policy: crate::fanout::SinkFailurePolicy,
 ) -> anyhow::Result<BoxedSinkWriter> {
-    Ok(create_sink_pipeline(sinks, failure_policy, None)?.writer)
+    Ok(create_sink_pipeline(
+        sinks,
+        failure_policy,
+        None,
+        crate::fanout::DEFAULT_SINK_ACK_TIMEOUT,
+    )?
+    .writer)
 }
 
 /// Build a pipeline's full sink side (writer + optional 2PC committer).
@@ -1246,6 +1252,7 @@ pub fn create_sink_pipeline(
     sinks: &[SinkDeclaration],
     failure_policy: crate::fanout::SinkFailurePolicy,
     restore_writer_state: Option<&[u8]>,
+    sink_ack_timeout: std::time::Duration,
 ) -> anyhow::Result<SinkPipeline> {
     if sinks.len() == 1 {
         let sink = &sinks[0];
@@ -1270,9 +1277,10 @@ pub fn create_sink_pipeline(
             metrics = pipeline.metrics;
         }
     }
-    let mux: BoxedSinkWriter = Box::new(crate::fanout::FanoutSinkWriter::new(
+    let mux: BoxedSinkWriter = Box::new(crate::fanout::FanoutSinkWriter::with_ack_timeout(
         writers,
         failure_policy,
+        sink_ack_timeout,
     ));
     let committer = crate::fanout::FanoutCommitter::new(committers)
         .map(|committer| Box::new(committer) as BoxedSinkCommitter);
