@@ -241,6 +241,21 @@ pub struct MySqlCdcConfig {
     pub compat_warnings: Vec<String>,
     /// Schema-evolution settings (DDL-to-schema-change-event pipeline).
     pub schema_evolution: SchemaEvolutionConfig,
+    /// TCP keepalive on every connection (pool + binlog dump), ms.
+    /// Half-open connections (NAT idle expiry, failover) are otherwise
+    /// indistinguishable from a healthy idle stream. 0 = off.
+    pub keepalive_interval_ms: u64,
+    /// Binlog master-heartbeat period (`SET @master_heartbeat_period`),
+    /// ms. An alive-but-idle primary emits a heartbeat event each period,
+    /// making a zombie connection distinguishable from a quiet binlog.
+    /// 0 = off (not recommended).
+    pub heartbeat_interval_ms: u64,
+    /// Recycle the dump stream after this long with NO event at all (not
+    /// even a heartbeat), ms. 0 = auto: max(3x heartbeat, 60 s).
+    pub heartbeat_idle_timeout_ms: u64,
+    /// Total budget for binlog reconnect attempts (ms) before the reader
+    /// fails loudly instead of retrying forever.
+    pub reconnect_retry_window_ms: u64,
 }
 
 impl Default for MySqlCdcConfig {
@@ -270,6 +285,10 @@ impl Default for MySqlCdcConfig {
             stop_mode: MySqlStopMode::Never,
             table_selector: TableSelector::from_legacy("seatunnel", "users"),
             compat_warnings: Vec::new(),
+            keepalive_interval_ms: 60_000,
+            heartbeat_interval_ms: 15_000,
+            heartbeat_idle_timeout_ms: 0,
+            reconnect_retry_window_ms: 600_000,
         }
     }
 }
@@ -424,7 +443,26 @@ impl MySqlCdcConfig {
             stop_mode: parse_stop_mode(config),
             table_selector: build_table_selector(config, &database_name, &table_name),
             compat_warnings: seatunnel_connector_cdc_base::compatibility_warnings(config),
+            keepalive_interval_ms: config.get_int("keepalive.interval.ms", 60_000).max(0) as u64,
+            heartbeat_interval_ms: config.get_int("heartbeat.interval.ms", 15_000).max(0) as u64,
+            heartbeat_idle_timeout_ms: config.get_int("heartbeat.idle-timeout.ms", 0).max(0) as u64,
+            reconnect_retry_window_ms: config
+                .get_int("reconnect.retry-window.ms", 600_000)
+                .max(1_000) as u64,
         }
+    }
+
+    /// Resolved zombie-connection watchdog threshold: total silence on
+    /// the dump stream (no event, no heartbeat) for this long triggers a
+    /// recycle from the last offset. With heartbeats enabled the default
+    /// tolerates three missed periods; without them a quiet-but-healthy
+    /// binlog reconnects at the floor (harmless: the reconnect resumes
+    /// from the recorded offset).
+    pub fn idle_watchdog_ms(&self) -> u64 {
+        if self.heartbeat_idle_timeout_ms > 0 {
+            return self.heartbeat_idle_timeout_ms;
+        }
+        (self.heartbeat_interval_ms.saturating_mul(3)).max(60_000)
     }
 
     /// Effective replication pseudo-server id, unique per dump connection.
@@ -500,6 +538,39 @@ fn parse_mysql_jdbc_url(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, database))
 }
 
+/// Reconnect backoff for attempt `attempt` (1-indexed): 1s, 2s, 4s, …
+/// capped at 30 s so a long outage keeps probing without hammering.
+fn cdc_reconnect_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    std::time::Duration::from_millis(1000u64.saturating_mul(1 << shift).min(30_000))
+}
+
+/// Classify a binlog stream error as PERMANENTLY unrecoverable (returns
+/// a reason) when the source binlog is gone or unreadable — retrying
+/// cannot succeed and must fail the task with a clear message instead of
+/// burning the retry window. Everything else (timeouts, resets, refused
+/// connections) is transient and returns None.
+fn classify_binlog_stream_error(err: &anyhow::Error) -> Option<&'static str> {
+    const FATAL_MARKERS: &[&str] = &[
+        // ER_MASTER_FATAL_ERROR_READING_BINLOG: the recorded offset sits
+        // in a binlog file the server no longer has (purged/rotated).
+        "1236",
+        "er_master_fatal_error_reading_binlog",
+        "could not find first log file name",
+        "source binlog purged",
+        "binlog purged",
+        "slave can not be handled",
+        "replica can not be handled",
+    ];
+    let text = format!("{err:#}").to_lowercase();
+    FATAL_MARKERS
+        .iter()
+        .find(|m| text.contains(**m))
+        .map(|_| {
+            "the source binlog is gone or unreadable (purged/rotated past the recorded              offset); restore requires a fresh snapshot"
+        })
+}
+
 /// MySQL CDC Source.
 #[derive(Debug, Clone)]
 pub struct MySqlCdcSource {
@@ -537,12 +608,24 @@ impl MySqlCdcSource {
         let constraints =
             mysql_async::PoolConstraints::new(1, config.connection_pool_size.max(1) as usize)
                 .expect("valid pool constraints");
+        let keepalive = if config.keepalive_interval_ms > 0 {
+            Some(std::time::Duration::from_millis(
+                config.keepalive_interval_ms,
+            ))
+        } else {
+            None
+        };
         let opts = OptsBuilder::default()
             .ip_or_hostname(&config.hostname)
             .tcp_port(config.port)
             .user(Some(&config.username))
             .pass(Some(&config.password))
             .db_name(config.connect_database.as_deref())
+            // TCP keepalive: an OS-level probe that eventually errors a
+            // half-open connection instead of letting the reader spin on
+            // it forever (the in-reader idle watchdog is the faster,
+            // protocol-level complement).
+            .tcp_keepalive(keepalive)
             .pool_opts(mysql_async::PoolOpts::new().with_constraints(constraints));
         Pool::new(opts)
     }
@@ -778,6 +861,10 @@ pub struct MySqlCdcReader {
     /// Persistent connection pool shared by snapshot batches and metadata
     /// queries (avoids a fresh pool — and TCP churn — per batch).
     pool: Option<Pool>,
+    /// Last time ANY binlog event arrived (heartbeat events included).
+    /// Total silence beyond the idle-watchdog threshold means the TCP
+    /// stream is a corpse (NAT idle expiry, failover) and gets recycled.
+    last_stream_activity: Option<std::time::Instant>,
 }
 
 impl MySqlCdcReader {
@@ -804,6 +891,7 @@ impl MySqlCdcReader {
             stop_reached: false,
             skip_until_ts_ms: None,
             pool: None,
+            last_stream_activity: None,
         }
     }
 
@@ -945,14 +1033,24 @@ impl MySqlCdcReader {
 
     async fn connect_and_prepare(&mut self) -> anyhow::Result<()> {
         let pool = self.build_pool();
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = tokio::time::timeout(
+            std::time::Duration::from_millis(self.config.connect_timeout_ms),
+            pool.get_conn(),
+        )
+        .await
+        .map_err(|_| {
             anyhow::anyhow!(
-                "MySQL CDC cannot connect to {}:{} as {}: {}",
+                "MySQL CDC connect timed out after {}ms ({}:{})",
+                self.config.connect_timeout_ms,
                 self.config.hostname,
-                self.config.port,
-                self.config.username,
-                e
+                self.config.port
             )
+        })?
+        .map_err(|e| {
+            anyhow::Error::new(e).context(format!(
+                "MySQL CDC cannot connect to {}:{} as {}",
+                self.config.hostname, self.config.port, self.config.username
+            ))
         })?;
 
         let _: Option<String> = conn
@@ -1012,6 +1110,7 @@ impl MySqlCdcReader {
                 Ok(stream) => {
                     self.binlog_stream = Some(Box::pin(stream));
                     self.stream_broken = false;
+                    self.last_stream_activity = Some(std::time::Instant::now());
                     // Fallback checkpoint boundary until the first
                     // transaction completes.
                     self.dump_start = Some(self.offset.clone());
@@ -1028,10 +1127,24 @@ impl MySqlCdcReader {
     }
 
     async fn open_binlog_stream(
-        conn: mysql_async::Conn,
+        mut conn: mysql_async::Conn,
         config: &MySqlCdcConfig,
         offset: &BinlogOffset,
     ) -> anyhow::Result<BinlogStream> {
+        // Protocol-level liveness: ask the primary for heartbeat events
+        // while the binlog is idle (canal/Debezium do the same). Without
+        // this, an idle binlog sends NOTHING and a half-open connection
+        // is indistinguishable from a healthy quiet stream. The period
+        // is expressed in nanoseconds.
+        if config.heartbeat_interval_ms > 0 {
+            let period_ns = (config.heartbeat_interval_ms as u64).saturating_mul(1_000_000);
+            conn.query_drop(format!("SET @master_heartbeat_period={period_ns}"))
+                .await
+                .map_err(|e| {
+                    anyhow::Error::new(e)
+                        .context("SET @master_heartbeat_period failed on the dump connection")
+                })?;
+        }
         let mut request = BinlogStreamRequest::new(config.effective_server_id());
         if !offset.file.is_empty() && offset.position > 0 {
             request = request
@@ -1044,9 +1157,10 @@ impl MySqlCdcReader {
                 request = request.with_gtid_set(sids);
             }
         }
-        conn.get_binlog_stream(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))
+        conn.get_binlog_stream(request).await.map_err(|e| {
+            anyhow::Error::new(e)
+                .context("binlog dump request rejected (check REPLICATION SLAVE privilege,                           binlog enabled with ROW format)")
+        })
     }
 
     /// Non-blockingly pull already-available binlog events into the replay
@@ -1091,6 +1205,17 @@ impl MySqlCdcReader {
 
     /// Decode one binlog event into the replay buffer, tracking offsets.
     fn absorb_event(&mut self, event: Event) {
+        // Any event — heartbeat included — proves the stream alive.
+        self.last_stream_activity = Some(std::time::Instant::now());
+        // Master heartbeat (sent only when @master_heartbeat_period is
+        // set): liveness marker ONLY. Heartbeat events carry the
+        // MASTER's current position, not the replica's offset, so they
+        // must never advance offsets or touch decoding.
+        if event.header().event_type_raw() == mysql_async::binlog::EventType::HEARTBEAT_EVENT as u8
+        {
+            tracing::trace!("MySQL CDC: binlog heartbeat received");
+            return;
+        }
         self.offset.position = event.header().log_pos() as u64;
 
         // Timestamp warm-up: discard events older than the requested start
@@ -1326,10 +1451,15 @@ impl MySqlCdcReader {
                 Ok(Some(()))
             }
             Ok(Some(Err(e))) => {
-                tracing::error!("MySQL CDC binlog stream failed: {}", e);
+                // A read failure breaks the stream but is usually
+                // transient (reset, timeout, server restart): schedule a
+                // reconnect instead of failing the task instantly — the
+                // reconnect path retries within its budget and only then
+                // fails loudly.
+                tracing::error!("MySQL CDC binlog stream read failed, will reconnect: {e:#}");
                 self.binlog_stream = None;
                 self.stream_broken = true;
-                Err(anyhow::anyhow!("binlog stream error: {}", e))
+                Ok(None)
             }
             Ok(None) => {
                 // Server closed the dump stream; force a reconnect next poll.
@@ -1341,22 +1471,84 @@ impl MySqlCdcReader {
         }
     }
 
-    /// Re-establish a broken binlog stream from the last known position.
+    /// Re-establish a broken binlog stream from the last known position,
+    /// retrying with backoff within `reconnect.retry-window.ms`. Only a
+    /// permanently unrecoverable condition (binlog purged past the
+    /// offset) or budget exhaustion fails the task.
     async fn maybe_reconnect_stream(&mut self) -> anyhow::Result<()> {
         if !self.stream_broken || self.binlog_stream.is_some() {
             return Ok(());
         }
-        tracing::info!(
-            "MySQL CDC reader: reconnecting binlog stream from {}/{}",
-            self.offset.file,
-            self.offset.position
-        );
-        let pool = self.build_pool();
-        let conn = pool.get_conn().await?;
-        let stream = Self::open_binlog_stream(conn, &self.config, &self.offset).await?;
-        self.binlog_stream = Some(Box::pin(stream));
-        self.stream_broken = false;
-        Ok(())
+        let window = std::time::Duration::from_millis(self.config.reconnect_retry_window_ms);
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            tracing::info!(
+                "MySQL CDC reader: reconnecting binlog stream (attempt {}) from {}/{}",
+                attempt,
+                self.offset.file,
+                self.offset.position
+            );
+            let pool = self.build_pool();
+            let connected = tokio::time::timeout(
+                std::time::Duration::from_millis(self.config.connect_timeout_ms),
+                pool.get_conn(),
+            )
+            .await;
+            let result = match connected {
+                Err(_) => Err(anyhow::anyhow!(
+                    "reconnect timed out after {}ms",
+                    self.config.connect_timeout_ms
+                )),
+                Ok(Err(e)) => Err(anyhow::Error::new(e).context("reconnect failed")),
+                Ok(Ok(conn)) => Self::open_binlog_stream(conn, &self.config, &self.offset).await,
+            };
+            match result {
+                Ok(stream) => {
+                    self.binlog_stream = Some(Box::pin(stream));
+                    self.stream_broken = false;
+                    self.last_stream_activity = Some(std::time::Instant::now());
+                    tracing::info!(
+                        "MySQL CDC reader: binlog stream re-established from {}/{}",
+                        self.offset.file,
+                        self.offset.position
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    let elapsed = started.elapsed();
+                    if let Some(reason) = classify_binlog_stream_error(&e) {
+                        return Err(e.context(format!("binlog reconnect is impossible: {reason}")));
+                    }
+                    if elapsed >= window {
+                        return Err(e.context(format!(
+                            "binlog reconnect failed after {attempt} attempt(s) over                              {elapsed:?} (reconnect.retry-window.ms = {})",
+                            self.config.reconnect_retry_window_ms
+                        )));
+                    }
+                    let backoff = cdc_reconnect_backoff(attempt);
+                    tracing::warn!(
+                        "MySQL CDC reader: reconnect attempt {attempt} failed, retrying in \
+                         {backoff:?}: {e:#}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    /// True when the dump stream has been totally silent (no event, no
+    /// heartbeat) for longer than the watchdog threshold — the signature
+    /// of a zombie connection.
+    fn stream_idle_beyond_watchdog(&self) -> bool {
+        if self.binlog_stream.is_none() {
+            return false;
+        }
+        let Some(last) = self.last_stream_activity else {
+            return false;
+        };
+        last.elapsed() >= std::time::Duration::from_millis(self.config.idle_watchdog_ms())
     }
 
     /// Pop the next change from the replay buffer.
@@ -1730,6 +1922,32 @@ impl MySqlCdcReader {
             }
         }
 
+        // 2b. Zombie-connection watchdog: total silence (no event, no
+        // heartbeat) beyond the threshold means the TCP stream is a
+        // corpse (NAT idle expiry, silent failover). Without this the
+        // reader spins on Empty forever — RUNNING, zero data, no error,
+        // no log — while the connection carries nothing. Recycle it from
+        // the last offset.
+        if self.stream_idle_beyond_watchdog() {
+            let idle_secs = self
+                .last_stream_activity
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            tracing::warn!(
+                "MySQL CDC: no binlog event (incl. heartbeat) for {}s — recycling the dump \
+                 stream from {}/{}",
+                idle_secs,
+                self.offset.file,
+                self.offset.position
+            );
+            self.binlog_stream = None;
+            self.stream_broken = true;
+            self.maybe_reconnect_stream().await?;
+            if self.binlog_stream.is_none() {
+                return Ok(PollResult::Empty);
+            }
+        }
+
         // 3a. Timestamp warm-up: drain historical events in a tight loop
         // (a per-poll single event would crawl through hundreds of stale
         // entries before reaching the requested start time).
@@ -2054,6 +2272,72 @@ mod tests {
             table_selector: TableSelector::from_legacy("testdb", "test_table"),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_and_caps_at_30s() {
+        assert_eq!(cdc_reconnect_backoff(1), std::time::Duration::from_secs(1));
+        assert_eq!(cdc_reconnect_backoff(2), std::time::Duration::from_secs(2));
+        assert_eq!(cdc_reconnect_backoff(3), std::time::Duration::from_secs(4));
+        assert_eq!(cdc_reconnect_backoff(4), std::time::Duration::from_secs(8));
+        assert_eq!(
+            cdc_reconnect_backoff(10),
+            std::time::Duration::from_secs(30),
+            "backoff must cap at 30s"
+        );
+        assert_eq!(
+            cdc_reconnect_backoff(1000),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn binlog_purge_errors_are_fatal_and_transport_errors_are_transient() {
+        let purged = anyhow::anyhow!(
+            "binlog dump request rejected: Error 1236 (500): ER_MASTER_FATAL_ERROR_READING_BINLOG"
+        );
+        assert!(classify_binlog_stream_error(&purged).is_some());
+
+        let rotated = anyhow::anyhow!("could not find first log file name in source binlog files");
+        assert!(classify_binlog_stream_error(&rotated).is_some());
+
+        let transient = anyhow::anyhow!("reconnect failed: connection refused (os error 111)");
+        assert!(classify_binlog_stream_error(&transient).is_none());
+        let timeout = anyhow::anyhow!("reconnect timed out after 30000ms");
+        assert!(classify_binlog_stream_error(&timeout).is_none());
+    }
+
+    #[test]
+    fn idle_watchdog_defaults_tolerate_missed_heartbeats() {
+        let mut cfg = test_config();
+        cfg.heartbeat_interval_ms = 15_000;
+        cfg.heartbeat_idle_timeout_ms = 0;
+        assert_eq!(
+            cfg.idle_watchdog_ms(),
+            60_000,
+            "3x heartbeat stays under the 60s floor"
+        );
+
+        cfg.heartbeat_interval_ms = 30_000;
+        assert_eq!(
+            cfg.idle_watchdog_ms(),
+            90_000,
+            "auto = 3x heartbeat period once above the floor"
+        );
+
+        cfg.heartbeat_interval_ms = 0;
+        assert_eq!(
+            cfg.idle_watchdog_ms(),
+            60_000,
+            "heartbeats disabled -> floor only"
+        );
+
+        cfg.heartbeat_idle_timeout_ms = 10_000;
+        assert_eq!(
+            cfg.idle_watchdog_ms(),
+            10_000,
+            "explicit threshold always wins"
+        );
     }
 
     #[test]

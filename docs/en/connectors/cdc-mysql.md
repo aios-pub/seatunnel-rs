@@ -35,6 +35,10 @@ source:
 | `server-time-zone` | UTC | informational |
 | `connection.pool.size` | 20 | pool max connections |
 | `connect.timeout.ms` / `connect.max-retries` | 30000 / 3 | accepted; reconnect loop handles retries |
+| `keepalive.interval.ms` | 60000 | TCP keepalive on every connection (pool + binlog dump); `0` disables |
+| `heartbeat.interval.ms` | 15000 | binlog master-heartbeat period (`SET @master_heartbeat_period`); an idle primary emits heartbeat events so a dead connection stays detectable; `0` disables |
+| `heartbeat.idle-timeout.ms` | auto | recycle the dump stream after this much TOTAL silence (no event, no heartbeat); auto = `max(3 × heartbeat, 60000)` |
+| `reconnect.retry-window.ms` | 600000 | total budget for binlog reconnect attempts; backoff grows 1s→30s. Past the window (or on an unrecoverable error such as a purged binlog, error 1236) the task FAILS loudly instead of spinning silently |
 
 ### Table selection
 
