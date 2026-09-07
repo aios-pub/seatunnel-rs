@@ -59,8 +59,17 @@ pub enum Commands {
         /// SEATUNNEL_STATE_DIR, else ./state)
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Follow the submitted cluster job until it finishes
-        #[arg(long, default_value_t = true)]
+        /// Follow the submitted cluster job until it finishes.
+        /// Accepts `--watch`, `--watch=false` and `--watch true|false`
+        /// (same tolerant form as the update command).
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args(0..=1),
+            require_equals = false,
+            default_value_t = true,
+            default_missing_value = "true"
+        )]
         watch: bool,
     },
     /// Manage jobs on a cluster
@@ -119,8 +128,18 @@ pub enum JobCommand {
         /// (an aborted update NEVER resubmits — no parallel old/new).
         #[arg(long, default_value_t = 60)]
         cancel_timeout_secs: u64,
-        /// Follow the resubmitted job until it reaches RUNNING
-        #[arg(long, default_value_t = true)]
+        /// Follow the resubmitted job until it reaches RUNNING.
+        /// Accepts `--watch`, `--watch=false` and `--watch true|false`:
+        /// the start-canal-sync-jobs script passes `--watch=false` for
+        /// fire-and-forget updates, which a bare SetTrue flag rejects.
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args(0..=1),
+            require_equals = false,
+            default_value_t = true,
+            default_missing_value = "true"
+        )]
         watch: bool,
     },
     /// List all jobs
