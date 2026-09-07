@@ -41,6 +41,32 @@ Semantics (verified by `scripts/e2e-mysql-cdc-timestamp.sh`):
   (`binlog_expire_logs_seconds`), replay starts at the oldest retained
   event — same limitation as any MySQL replica.
 
+### Choosing the timestamp
+
+`startup.timestamp` is an integer **milliseconds since the Unix epoch
+(UTC)** — timezone-independent, because binlog event headers store epoch
+seconds. Both the `startup.timestamp` and `startup_timestamp` spellings
+are accepted; a missing or non-positive value fails the job at submit
+time.
+
+Generate it at the moment that should become the boundary:
+
+```bash
+date +%s%3N                                            # GNU date (Linux)
+echo "$(date +%s)000"                                  # macOS date (second precision)
+mysql -h <host> -e 'SELECT ROUND(UNIX_TIMESTAMP(NOW(3))*1000)'   # the source server's own clock
+```
+
+Two caveats verified against a live server:
+
+- **±1s boundary granularity** — binlog event headers carry second
+  precision, so changes committed in the same second as the boundary can
+  land on either side. Leave a small gap before the boundary when the
+  exact cut matters.
+- the timestamp must lie within the binlog retention window
+  (`binlog_expire_logs_seconds`); older values silently start at the
+  oldest retained event.
+
 `startup.mode = specific` starts at an exact position:
 
 ```yaml
