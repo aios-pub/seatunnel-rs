@@ -59,7 +59,22 @@ sink:
     format: json
     max-batch-size: 100
     batch.timeout.ms: 100
+    connect.timeout.ms: 10000        # bound the connect/channel/declare handshake
+    confirm.timeout.ms: 30000        # bound one publisher-confirm wait
+    reconnect.max-retries: 3         # flush retries on failure (backoff 1s/2s/4s)
 ```
+
+### Failure behavior (sink)
+
+Every wait on the broker is bounded. A publish or confirm failure resets
+the connection and the flush is retried with a fresh one (up to
+`reconnect.max-retries`, backoff 1s/2s/4s, each attempt logged with the
+full error chain). When the budget is exhausted the task FAILS with the
+rows still buffered — the checkpoint replay re-delivers them
+(at-least-once); a hung broker can therefore never freeze the pipeline
+while it keeps reporting RUNNING. The canal-client pairing window is
+also honored on the idle path: a held DELETE before-image is emitted as
+soon as its window expires, not at the next checkpoint.
 
 ## Topology declaration
 

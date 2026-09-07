@@ -105,6 +105,17 @@ pub struct RabbitMqConfig {
     pub pipeline: String,
     /// Subtask index injected by the engine (consumer tag namespace).
     pub subtask_index: usize,
+    /// Ceiling for connect + channel + topology declares. A black-holed
+    /// broker must fail (or trigger a reconnect) at this deadline instead
+    /// of hanging `open()`/`write()` forever.
+    pub connect_timeout_ms: u64,
+    /// Ceiling for one publisher-confirm wait. A broker that accepts
+    /// frames but never acks must error the write at this deadline
+    /// instead of freezing the poll loop (task stays RUNNING, no data).
+    pub confirm_timeout_ms: u64,
+    /// Flush attempts after a publish/confirm failure (total attempts =
+    /// 1 + this). Each retry reconnects from scratch; backoff is 1s, 2s, 4s.
+    pub reconnect_max_retries: usize,
 }
 
 impl Default for RabbitMqConfig {
@@ -131,6 +142,9 @@ impl Default for RabbitMqConfig {
             poll_timeout_ms: 250,
             pipeline: "p0".to_string(),
             subtask_index: 0,
+            connect_timeout_ms: 10_000,
+            confirm_timeout_ms: 30_000,
+            reconnect_max_retries: 3,
         }
     }
 }
@@ -244,6 +258,9 @@ impl RabbitMqConfig {
             poll_timeout_ms: config.get_int("poll.timeout.ms", 250).max(10) as u64,
             pipeline: config.get_string("pipeline.name", "p0"),
             subtask_index: config.get_int("subtask.index", 0).max(0) as usize,
+            connect_timeout_ms: config.get_int("connect.timeout.ms", 10_000).max(1) as u64,
+            confirm_timeout_ms: config.get_int("confirm.timeout.ms", 30_000).max(1) as u64,
+            reconnect_max_retries: config.get_int("reconnect.max-retries", 3).clamp(0, 10) as usize,
         })
     }
 
@@ -839,12 +856,18 @@ impl Source for RabbitMqSource {
 /// Publish one canal-client JSON payload and await the broker confirm when
 /// publisher confirms are enabled. A free function so the flush loop can
 /// hold the channel borrow without aliasing `&mut self`.
+///
+/// The confirm wait is bounded: a broker that accepts the publish frame
+/// but never acks (stalled, memory-alarm blocked, half-open TCP) must
+/// error the write at the deadline instead of freezing the poll loop
+/// with the task still reporting RUNNING.
 async fn publish_canal_payload(
     channel: &Channel,
     exchange: &str,
     routing_key: &str,
     delivery_mode: u8,
     confirm_enabled: bool,
+    confirm_timeout_ms: u64,
     payload: &str,
 ) -> anyhow::Result<()> {
     let properties = BasicProperties::default()
@@ -859,14 +882,51 @@ async fn publish_canal_payload(
             properties,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("basic_publish failed: {}", e))?;
+        .map_err(|e| anyhow::Error::new(e).context("basic_publish failed"))?;
     if confirm_enabled {
-        match confirm.await {
-            Ok(Confirmation::Ack(_)) => {}
-            other => anyhow::bail!("broker did not confirm message: {:?}", other),
+        match tokio::time::timeout(Duration::from_millis(confirm_timeout_ms), confirm).await {
+            Ok(Ok(Confirmation::Ack(_))) => {}
+            Ok(Ok(other)) => {
+                anyhow::bail!("broker did not confirm message: {other:?}");
+            }
+            Ok(Err(e)) => {
+                return Err(anyhow::Error::new(e).context("publisher-confirm wait failed"));
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "publisher-confirm timed out after {confirm_timeout_ms}ms — the broker \
+                     accepted the publish but never acked (stalled or half-open connection)"
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Bounded publisher-confirm wait for the plain (non-canal) path.
+async fn await_confirm(
+    confirm: impl Future<Output = lapin::Result<Confirmation>>,
+    confirm_timeout_ms: u64,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(Duration::from_millis(confirm_timeout_ms), confirm).await {
+        Ok(Ok(Confirmation::Ack(_))) => Ok(()),
+        Ok(Ok(other)) => Err(anyhow::anyhow!("broker did not confirm message: {other:?}")),
+        Ok(Err(e)) => Err(anyhow::Error::new(e).context("publisher-confirm wait failed")),
+        Err(_) => Err(anyhow::anyhow!(
+            "publisher-confirm timed out after {confirm_timeout_ms}ms — the broker accepted \
+             the publish but never acked (stalled or half-open connection)"
+        )),
+    }
+}
+
+/// Backoff before flush retry `attempt` (1-indexed): 1s, 2s, 4s… capped
+/// at 4s so a broker outage cycles at most every few seconds.
+fn reconnect_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(
+        1000u64
+            .saturating_mul(1 << (attempt.saturating_sub(1) as u32))
+            .min(4000),
+    )
 }
 
 /// RabbitMQ sink writer: buffered publishes with optional confirms.
@@ -954,62 +1014,130 @@ impl RabbitMqSinkWriter {
             return Ok(());
         }
         let uri = self.config.amqp_uri();
-        let connection = Connection::connect(uri.as_str(), ConnectionProperties::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("RabbitMQ connect failed: {}", e))?;
-        let mut channel = connection
-            .create_channel()
-            .await
-            .map_err(|e| anyhow::anyhow!("RabbitMQ channel failed: {}", e))?;
-        // Publish topology: the exchange, queue and binding must EXIST
-        // before the first basic.publish — publishing to a missing
-        // exchange kills the channel with a 404. Declared passive-first:
-        // entities that already exist are left untouched (a mismatched
-        // active redeclare is rejected with PRECONDITION_FAILED).
-        if !self.config.exchange.is_empty() {
-            ensure_exchange(
-                &connection,
-                &mut channel,
-                &self.config.exchange,
-                self.config.exchange_type.clone(),
-            )
-            .await?;
-        }
-        if !self.config.queue_name.is_empty() {
-            ensure_queue(&connection, &mut channel, &self.config.queue_name).await?;
-            if !self.config.exchange.is_empty() {
-                channel
-                    .queue_bind(
-                        self.config.queue_name.as_str().into(),
-                        self.config.exchange.as_str().into(),
-                        self.config.effective_routing_key().as_str().into(),
-                        QueueBindOptions::default(),
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("queue_bind failed: {}", e))?;
-            }
-        }
-        if self.config.publisher_confirm {
-            // Confirm mode follows the topology declares: a NOT_FOUND probe
-            // recreates the channel, which would otherwise lose the mode.
-            channel
-                .confirm_select(ConfirmSelectOptions::default())
+        let connect_timeout = Duration::from_millis(self.config.connect_timeout_ms);
+        // The whole handshake is bounded: a firewalled/black-holed broker
+        // must fail at the deadline, not hang open()/write() forever.
+        let connected = tokio::time::timeout(connect_timeout, async {
+            let connection = Connection::connect(uri.as_str(), ConnectionProperties::default())
                 .await
-                .map_err(|e| anyhow::anyhow!("confirm_select failed: {}", e))?;
-        }
+                .map_err(|e| anyhow::Error::new(e).context("RabbitMQ connect failed"))?;
+            let mut channel = connection
+                .create_channel()
+                .await
+                .map_err(|e| anyhow::Error::new(e).context("RabbitMQ channel failed"))?;
+            // Publish topology: the exchange, queue and binding must EXIST
+            // before the first basic.publish — publishing to a missing
+            // exchange kills the channel with a 404. Declared passive-first:
+            // entities that already exist are left untouched (a mismatched
+            // active redeclare is rejected with PRECONDITION_FAILED).
+            if !self.config.exchange.is_empty() {
+                ensure_exchange(
+                    &connection,
+                    &mut channel,
+                    &self.config.exchange,
+                    self.config.exchange_type.clone(),
+                )
+                .await?;
+            }
+            if !self.config.queue_name.is_empty() {
+                ensure_queue(&connection, &mut channel, &self.config.queue_name).await?;
+                if !self.config.exchange.is_empty() {
+                    channel
+                        .queue_bind(
+                            self.config.queue_name.as_str().into(),
+                            self.config.exchange.as_str().into(),
+                            self.config.effective_routing_key().as_str().into(),
+                            QueueBindOptions::default(),
+                            FieldTable::default(),
+                        )
+                        .await
+                        .map_err(|e| anyhow::Error::new(e).context("queue_bind failed"))?;
+                }
+            }
+            if self.config.publisher_confirm {
+                // Confirm mode follows the topology declares: a NOT_FOUND probe
+                // recreates the channel, which would otherwise lose the mode.
+                channel
+                    .confirm_select(ConfirmSelectOptions::default())
+                    .await
+                    .map_err(|e| anyhow::Error::new(e).context("confirm_select failed"))?;
+            }
+            Ok::<(Connection, Channel), anyhow::Error>((connection, channel))
+        })
+        .await;
+        let (connection, channel) = match connected {
+            Ok(ok) => ok?,
+            Err(_) => anyhow::bail!(
+                "RabbitMQ connect timed out after {}ms (host {}:{}) — broker unreachable",
+                self.config.connect_timeout_ms,
+                self.config.host,
+                self.config.port
+            ),
+        };
         self.connection = Some(connection);
         self.channel = Some(channel);
         Ok(())
     }
 
+    /// Flush the buffered batch, retrying transient publish/confirm
+    /// failures with a fresh connection. The batch is restored on final
+    /// failure so `snapshot_state`'s pending count stays truthful before
+    /// the task fails (the checkpoint replay re-delivers at-least-once).
     async fn flush_batch(&mut self) -> anyhow::Result<usize> {
         self.last_flush = Instant::now();
-        self.ensure_connection().await?;
+        let records = std::mem::take(&mut self.batch);
+        let max_attempts = self.config.reconnect_max_retries + 1;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let outcome = async {
+                self.ensure_connection().await?;
+                self.flush_records(&records).await
+            }
+            .await;
+            match outcome {
+                Ok(sent) => {
+                    self.total_written += sent;
+                    return Ok(sent);
+                }
+                Err(e) => {
+                    // The failed channel is a zombie — drop it so the next
+                    // attempt reconnects from scratch.
+                    if self.channel.take().is_some() {
+                        tracing::warn!(
+                            "RabbitMQ sink: connection reset after flush failure (attempt \
+                             {attempt}/{max_attempts})"
+                        );
+                    }
+                    self.connection = None;
+                    if attempt >= max_attempts {
+                        tracing::error!(
+                            "RabbitMQ sink: flush failed after {attempt} attempt(s): {e:#} — \
+                             {} row(s) stay buffered; failing the task (checkpoint replay \
+                             re-delivers them)",
+                            records.len()
+                        );
+                        self.batch = records;
+                        return Err(e);
+                    }
+                    let backoff = reconnect_backoff(attempt);
+                    tracing::warn!(
+                        "RabbitMQ sink: flush attempt {attempt}/{max_attempts} failed, \
+                         reconnecting in {backoff:?}: {e:#}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    /// Publish every buffered row on the CURRENT channel (bounded waits;
+    /// any error leaves the channel unusable and must be retried by the
+    /// caller after a reconnect).
+    async fn flush_records(&mut self, records: &[Row]) -> anyhow::Result<usize> {
         let Some(channel) = self.channel.as_ref() else {
             anyhow::bail!("rabbitmq channel unavailable");
         };
-        let records = std::mem::take(&mut self.batch);
 
         // Canal-client format: the stateful encoder pairs update rows and
         // derives the JSON envelope. Runs even for empty batches so held
@@ -1034,11 +1162,12 @@ impl RabbitMqSinkWriter {
             let routing_key = self.config.effective_routing_key();
             let delivery_mode: u8 = if self.config.persistent { 2 } else { 1 };
             let confirm_enabled = self.config.publisher_confirm;
+            let confirm_timeout_ms = self.config.confirm_timeout_ms;
             let mut sent = 0usize;
-            for record in &records {
+            for record in records {
                 for message in encoder
                     .encode(record)
-                    .map_err(|e| anyhow::anyhow!("canal-client encode: {}", e))?
+                    .map_err(|e| e.context("canal-client encode"))?
                 {
                     // Single-queue sink: every table's messages share the
                     // configured exchange/routing-key (message.table is a
@@ -1049,6 +1178,7 @@ impl RabbitMqSinkWriter {
                         &routing_key,
                         delivery_mode,
                         confirm_enabled,
+                        confirm_timeout_ms,
                         &message.payload,
                     )
                     .await?;
@@ -1062,12 +1192,12 @@ impl RabbitMqSinkWriter {
                     &routing_key,
                     delivery_mode,
                     confirm_enabled,
+                    confirm_timeout_ms,
                     &message.payload,
                 )
                 .await?;
                 sent += 1;
             }
-            self.total_written += sent;
             return Ok(sent);
         }
 
@@ -1082,8 +1212,9 @@ impl RabbitMqSinkWriter {
         } else {
             "application/json"
         };
+        let confirm_timeout_ms = self.config.confirm_timeout_ms;
         let mut sent = 0usize;
-        for record in &records {
+        for record in records {
             let payload = encode_row(record, &self.config.format, &self.config.field_delimiter);
             let properties = BasicProperties::default()
                 .with_delivery_mode(delivery_mode)
@@ -1097,16 +1228,12 @@ impl RabbitMqSinkWriter {
                     properties,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("basic_publish failed: {}", e))?;
+                .map_err(|e| anyhow::Error::new(e).context("basic_publish failed"))?;
             if self.config.publisher_confirm {
-                match confirm.await {
-                    Ok(Confirmation::Ack(_)) => {}
-                    other => anyhow::bail!("broker did not confirm message: {:?}", other),
-                }
+                await_confirm(confirm, confirm_timeout_ms).await?;
             }
             sent += 1;
         }
-        self.total_written += sent;
         Ok(sent)
     }
 }
@@ -1172,7 +1299,15 @@ impl SinkWriter for RabbitMqSinkWriter {
         _checkpoint_id: u64,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<Self::CommitInfo>>> + Send + '_>> {
         Box::pin(async move {
-            if self.channel.is_some() {
+            // Always attempt the flush when rows are buffered or a canal
+            // before-image waits: flush_batch reconnects on demand, so a
+            // checkpoint must never ack progress over undelivered rows.
+            let due = !self.batch.is_empty()
+                || self
+                    .canal_encoder
+                    .as_ref()
+                    .is_some_and(|e| e.has_expired_pending());
+            if due {
                 self.flush_batch().await?;
             }
             Ok(vec![format!("written={}", self.total_written)])
@@ -1190,10 +1325,19 @@ impl SinkWriter for RabbitMqSinkWriter {
     }
 
     fn poll_flush(&mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
-        let due = !self.batch.is_empty()
+        // Flush the tail of a partial batch once the linger elapsed; a
+        // canal-client held delete whose pairing window expired must also
+        // fire here: with an empty batch nothing else calls flush_batch
+        // before the next checkpoint, which would pin standalone deletes
+        // to the checkpoint interval (same as the Kafka sink).
+        let linger_due = !self.batch.is_empty()
             && self.last_flush.elapsed() >= Duration::from_millis(self.config.batch_timeout_ms);
+        let pairing_due = self
+            .canal_encoder
+            .as_ref()
+            .is_some_and(|e| e.has_expired_pending());
         Box::pin(async move {
-            if due {
+            if linger_due || pairing_due {
                 self.flush_batch().await?;
             }
             Ok(())
@@ -1329,6 +1473,37 @@ mod tests {
         assert_eq!(
             config.amqp_uri(),
             "amqp://guest:p%40ss%2Fword@127.0.0.1:5672/%2F"
+        );
+    }
+
+    #[test]
+    fn timeout_and_retry_options_parse_with_defaults() {
+        // Defaults keep existing configs working.
+        let config = config_from(&[]);
+        assert_eq!(config.connect_timeout_ms, 10_000);
+        assert_eq!(config.confirm_timeout_ms, 30_000);
+        assert_eq!(config.reconnect_max_retries, 3);
+
+        // Explicit values (kebab-case) win.
+        let config = config_from(&[
+            ("connect.timeout.ms", "2500"),
+            ("confirm.timeout.ms", "5000"),
+            ("reconnect.max-retries", "6"),
+        ]);
+        assert_eq!(config.connect_timeout_ms, 2500);
+        assert_eq!(config.confirm_timeout_ms, 5000);
+        assert_eq!(config.reconnect_max_retries, 6);
+    }
+
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        assert_eq!(reconnect_backoff(1), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(4));
+        assert_eq!(
+            reconnect_backoff(9),
+            Duration::from_secs(4),
+            "backoff caps at 4s so broker outages probe every few seconds"
         );
     }
 
