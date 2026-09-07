@@ -90,11 +90,7 @@ impl History {
     }
 
     /// Record one poller cycle's per-task rates for a job.
-    pub fn record_job(
-        &self,
-        job_id: &str,
-        samples: impl IntoIterator<Item = TaskPoint>,
-    ) {
+    pub fn record_job(&self, job_id: &str, samples: impl IntoIterator<Item = TaskPoint>) {
         let point = JobPoint {
             ts_ms: now_ms(),
             tasks: samples.into_iter().collect(),
@@ -108,7 +104,11 @@ impl History {
     }
 
     /// Record one poller cycle's cluster/worker signals.
-    pub fn record_cluster(&self, running_tasks: i32, workers: impl IntoIterator<Item = WorkerPoint>) {
+    pub fn record_cluster(
+        &self,
+        running_tasks: i32,
+        workers: impl IntoIterator<Item = WorkerPoint>,
+    ) {
         let point = ClusterPoint {
             ts_ms: now_ms(),
             running_tasks,

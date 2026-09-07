@@ -9,16 +9,16 @@
 //! appender's `<role>.<date>.log` shape, so the endpoint can never escape
 //! the configured log directory.
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::dto::ErrorDto;
 use crate::AppState;
+use crate::dto::ErrorDto;
 
 /// A daily rolling file name, e.g. `master.2026-09-02` (the rolling
 /// appender joins prefix and date with a dot, no extension) or
@@ -116,11 +116,7 @@ pub async fn log_files(State(state): State<AppState>) -> Response {
         })
         .unwrap_or_default();
     files.sort();
-    Json(LogFileListDto {
-        files,
-        error: None,
-    })
-    .into_response()
+    Json(LogFileListDto { files, error: None }).into_response()
 }
 
 /// `GET /api/v1/logs/files/{name}?tail=500&q=&level=ERROR,WARN` — the
@@ -164,7 +160,10 @@ pub async fn log_file(
         Ok((raw, truncated)) => (raw, truncated),
         Err(err) => {
             let (status, message) = if err.kind() == std::io::ErrorKind::NotFound {
-                (StatusCode::NOT_FOUND, format!("log file {} not found", name))
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("log file {} not found", name),
+                )
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -179,7 +178,10 @@ pub async fn log_file(
     let needle = query.q.clone().unwrap_or_default().to_lowercase();
     let levels = parse_levels(&query.level);
 
-    let all_lines: Vec<String> = raw.split_inclusive('\n').map(|l| l.trim_end_matches('\n').to_string()).collect();
+    let all_lines: Vec<String> = raw
+        .split_inclusive('\n')
+        .map(|l| l.trim_end_matches('\n').to_string())
+        .collect();
     let filtered = filter_lines(&all_lines, &levels, &needle);
     let lines: Vec<String> = filtered
         .iter()

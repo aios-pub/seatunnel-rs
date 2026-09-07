@@ -113,11 +113,7 @@ pub async fn worker_detail(
         Ok(info) => info,
         Err(e) => return error_response(&e),
     };
-    let Some(worker) = info
-        .workers
-        .into_iter()
-        .find(|w| w.worker_id == worker_id)
-    else {
+    let Some(worker) = info.workers.into_iter().find(|w| w.worker_id == worker_id) else {
         return error_response(&EngineError::NotFound(format!(
             "worker {} not found",
             worker_id

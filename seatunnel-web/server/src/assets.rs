@@ -105,7 +105,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers()["content-encoding"], "br",
+            response.headers()["content-encoding"],
+            "br",
             "the wasm bundle dominates page weight and must be compressed"
         );
         assert_eq!(

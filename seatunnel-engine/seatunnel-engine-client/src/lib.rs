@@ -218,13 +218,21 @@ impl EngineClient {
     /// Delete a TERMINAL job from history (state + checkpoint metadata).
     /// Follows the leader hint like the other mutating RPCs; the server
     /// rejects deleting a non-terminal job.
-    pub async fn delete_job(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_job(
+        &self,
+        job_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = DeleteJobRequest {
             job_id: job_id.to_string(),
         };
-        self.with_leader_follow("delete", job_id, request, |mut client, request| async move {
-            client.delete_job(Request::new(request)).await.map(|_| ())
-        })
+        self.with_leader_follow(
+            "delete",
+            job_id,
+            request,
+            |mut client, request| async move {
+                client.delete_job(Request::new(request)).await.map(|_| ())
+            },
+        )
         .await?;
         info!("Job {} deleted", job_id);
         Ok(())
