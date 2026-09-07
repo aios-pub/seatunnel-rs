@@ -256,6 +256,11 @@ pub struct MySqlCdcConfig {
     /// Total budget for binlog reconnect attempts (ms) before the reader
     /// fails loudly instead of retrying forever.
     pub reconnect_retry_window_ms: u64,
+    /// Behavior when `startup.mode: timestamp` requests a moment OLDER
+    /// than the earliest retained binlog event (the binlog for that gap
+    /// was already purged): "fail" (default — refuse the silent data
+    /// gap) or "warn" (log ERROR and start at the oldest retained event).
+    pub timestamp_retention_check: String,
 }
 
 impl Default for MySqlCdcConfig {
@@ -289,6 +294,7 @@ impl Default for MySqlCdcConfig {
             heartbeat_interval_ms: 15_000,
             heartbeat_idle_timeout_ms: 0,
             reconnect_retry_window_ms: 600_000,
+            timestamp_retention_check: "fail".to_string(),
         }
     }
 }
@@ -449,6 +455,17 @@ impl MySqlCdcConfig {
             reconnect_retry_window_ms: config
                 .get_int("reconnect.retry-window.ms", 600_000)
                 .max(1_000) as u64,
+            timestamp_retention_check: {
+                let policy = config.get_string(
+                    "startup.timestamp.retention-check",
+                    &config.get_string("startup.timestamp_retention_check", "fail"),
+                );
+                if policy.eq_ignore_ascii_case("warn") {
+                    "warn".to_string()
+                } else {
+                    "fail".to_string()
+                }
+            },
         }
     }
 
@@ -536,6 +553,40 @@ fn parse_mysql_jdbc_url(url: &str) -> Option<(String, u16, String)> {
         return None;
     }
     Some((host, port, database))
+}
+
+/// Render epoch milliseconds as `YYYY-MM-DD HH:MM:SS.mmm UTC` for error
+/// messages (panic-free for out-of-range inputs).
+fn fmt_epoch_ms_utc(ms: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    if ms < 0 {
+        return format!("{ms} (epoch ms)");
+    }
+    match UNIX_EPOCH.checked_add(Duration::from_millis(ms as u64)) {
+        Some(instant) => {
+            let secs = instant
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let millis = ms.rem_euclid(1000);
+            // days -> y/m/d civil conversion (Howard Hinnant's algorithm).
+            let days = (secs / 86_400) as i64;
+            let rem = secs % 86_400;
+            let (h, m, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+            let z = days + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z.rem_euclid(146_097);
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = if month <= 2 { y + 1 } else { y };
+            format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{sec:02}.{millis:03} UTC")
+        }
+        None => format!("{ms} (epoch ms)"),
+    }
 }
 
 /// Reconnect backoff for attempt `attempt` (1-indexed): 1s, 2s, 4s, …
@@ -865,6 +916,16 @@ pub struct MySqlCdcReader {
     /// Total silence beyond the idle-watchdog threshold means the TCP
     /// stream is a corpse (NAT idle expiry, failover) and gets recycled.
     last_stream_activity: Option<std::time::Instant>,
+    /// Armed only on a FRESH `startup.mode: timestamp` start: the
+    /// requested boundary. The first replayed event reveals how far back
+    /// the retained binlog actually reaches; a request older than that
+    /// is a silent data gap and fails (or warns) per
+    /// `startup.timestamp.retention-check`. Never armed on checkpoint
+    /// resume (the gap was validated at the original start).
+    ts_retention_check: Option<i64>,
+    /// A validation failure awaiting propagation at the next poll
+    /// (absorb_event cannot return errors).
+    pending_failure: Option<String>,
 }
 
 impl MySqlCdcReader {
@@ -892,6 +953,8 @@ impl MySqlCdcReader {
             skip_until_ts_ms: None,
             pool: None,
             last_stream_activity: None,
+            ts_retention_check: None,
+            pending_failure: None,
         }
     }
 
@@ -1218,6 +1281,41 @@ impl MySqlCdcReader {
         }
         self.offset.position = event.header().log_pos() as u64;
 
+        // Retention-gap validation (fresh timestamp starts only): the
+        // first REAL replayed event's timestamp is how far back the
+        // retained binlog reaches. A requested boundary OLDER than that
+        // means the binlog for [boundary, first event] was already
+        // purged — a silent data gap that either fails the task or logs
+        // a loud ERROR, per startup.timestamp.retention-check.
+        //
+        // The dump opens with an ARTIFICIAL rotate event whose timestamp
+        // is 0 — it carries no wall-clock information and must not
+        // consume the check (0 < requested would read as "no gap").
+        if event.header().timestamp() > 0
+            && let Some(requested) = self.ts_retention_check.take()
+        {
+            let first_ts_ms = i64::from(event.header().timestamp()) * 1000;
+            if requested < first_ts_ms {
+                let requested_utc = fmt_epoch_ms_utc(requested);
+                let first_utc = fmt_epoch_ms_utc(first_ts_ms);
+                let msg = format!(
+                    "startup.timestamp {requested_utc} predates the earliest retained binlog \
+                     event ({first_utc}) — the binlog for the gap was already purged, so \
+                     changes in between can never be captured; raise binlog_expire_logs_seconds, \
+                     pick a later boundary, or use startup.mode: initial for the current state \
+                     (startup.timestamp.retention-check: warn allows starting anyway)"
+                );
+                if self.config.timestamp_retention_check == "warn" {
+                    tracing::error!(
+                        "MySQL CDC: {msg} — starting at the oldest retained event anyway"
+                    );
+                } else {
+                    tracing::error!("MySQL CDC: {msg} — failing the task");
+                    self.pending_failure = Some(msg);
+                }
+            }
+        }
+
         // Timestamp warm-up: discard events older than the requested start
         // time; only the offset (and binlog rotation) is tracked.
         if let Some(ts_ms) = self.skip_until_ts_ms {
@@ -1448,6 +1546,9 @@ impl MySqlCdcReader {
         {
             Ok(Some(Ok(event))) => {
                 self.absorb_event(event);
+                if let Some(msg) = self.pending_failure.take() {
+                    return Err(anyhow::anyhow!(msg));
+                }
                 Ok(Some(()))
             }
             Ok(Some(Err(e))) => {
@@ -1653,6 +1754,11 @@ impl SourceReader for MySqlCdcReader {
                     self.phase = CdcPhase::Incremental;
                     self.splits.clear();
                     self.skip_until_ts_ms = Some(timestamp);
+                    // Arm the retention-gap check: the first replayed
+                    // event reveals how far back the retained binlog
+                    // reaches (checkpoint resume never arms this — the
+                    // gap was validated at the original start).
+                    self.ts_retention_check = Some(timestamp);
                     // Start from the earliest retained binlog so changes
                     // between `timestamp` and now are captured; older
                     // events are discarded by the warm-up filter. The
@@ -2272,6 +2378,45 @@ mod tests {
             table_selector: TableSelector::from_legacy("testdb", "test_table"),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fmt_epoch_ms_utc_renders_civil_time() {
+        // 2026-09-07 07:33:38.344 UTC (the value used in the manual
+        // timestamp verification run).
+        assert_eq!(
+            fmt_epoch_ms_utc(1788766418344),
+            "2026-09-07 07:33:38.344 UTC"
+        );
+        // Epoch itself, and the millisecond remainder path.
+        assert_eq!(fmt_epoch_ms_utc(0), "1970-01-01 00:00:00.000 UTC");
+        assert_eq!(fmt_epoch_ms_utc(1500), "1970-01-01 00:00:01.500 UTC");
+        // Negative inputs render as the raw value instead of panicking.
+        assert_eq!(fmt_epoch_ms_utc(-5), "-5 (epoch ms)");
+        // Leap-year day: 2024-02-29 12:00:00.000 UTC.
+        assert_eq!(
+            fmt_epoch_ms_utc(1709208000000),
+            "2024-02-29 12:00:00.000 UTC"
+        );
+    }
+
+    #[test]
+    fn timestamp_retention_check_parses_fail_by_default_and_warn_optin() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let props: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            MySqlCdcConfig::from_config(&ConnectorConfig::new(props)).timestamp_retention_check
+        };
+        assert_eq!(mk(&[]), "fail");
+        assert_eq!(mk(&[("startup.timestamp.retention-check", "warn")]), "warn");
+        assert_eq!(mk(&[("startup.timestamp_retention_check", "WARN")]), "warn");
+        // Anything else falls back to the safe default.
+        assert_eq!(
+            mk(&[("startup.timestamp.retention-check", "ignore")]),
+            "fail"
+        );
     }
 
     #[test]

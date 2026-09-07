@@ -68,6 +68,7 @@ template resolve one topic per table or per table group (see the
 | --- | --- |
 | `startup.mode` | `initial` \| `snapshot-only` \| `earliest` \| `latest` \| `timestamp` \| `specific` |
 | `startup.timestamp` | ms since epoch (for `timestamp`; streaming-only, replays retained binlog discarding older events) |
+| `startup.timestamp.retention-check` | `fail` (default) when the timestamp predates the earliest retained binlog event — the purged gap fails the task with the exact UTC boundaries; `warn` logs ERROR and starts at the oldest retained event |
 | `startup.specific-offset.file` / `.pos` / `.gtid-set` | exact binlog position (aliases: `startup.specific.*`) |
 | `stop.mode` | `never` (default) \| `latest` \| `specific` \| `timestamp` |
 | `stop.specific-offset.file` / `.pos`, `stop.timestamp` | stop boundary; the reader EOFs once the boundary is passed and buffered rows are drained |

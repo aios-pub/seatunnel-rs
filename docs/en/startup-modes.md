@@ -63,9 +63,11 @@ Two caveats verified against a live server:
   precision, so changes committed in the same second as the boundary can
   land on either side. Leave a small gap before the boundary when the
   exact cut matters.
-- the timestamp must lie within the binlog retention window
-  (`binlog_expire_logs_seconds`); older values silently start at the
-  oldest retained event.
+- **retention-gap check** — if the timestamp is OLDER than the earliest
+  retained binlog event, the purged gap can never be captured, and the
+  task FAILS at startup with the exact UTC timestamps involved
+  (`startup.timestamp.retention-check: warn` downgrades this to an ERROR
+  log and starts at the oldest retained event anyway).
 
 `startup.mode = specific` starts at an exact position:
 
