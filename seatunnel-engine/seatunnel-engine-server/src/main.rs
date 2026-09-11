@@ -270,14 +270,15 @@ const MAX_LOG_FILES: usize = 30;
 
 /// Install the global subscriber: a stdout layer (containers, foreground
 /// runs) plus, unless disabled, a daily rolling file layer named
-/// `<role>.YYYY-MM-DD` under the log directory, pruning files beyond
-/// [`MAX_LOG_FILES`]. Returns the guard that flushes the non-blocking file
-/// writer on drop; `None` when file logging is off or unusable.
+/// `<role>.YYYY-MM-DD` under the log directory, rolling at local midnight
+/// and pruning files beyond [`MAX_LOG_FILES`]. Returns the guard that
+/// flushes the non-blocking file writer on drop; `None` when file logging
+/// is off or unusable.
 fn init_tracing(
     filter: EnvFilter,
     role: &str,
     log_dir: Option<&str>,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Option<tracing_appender_localtime::non_blocking::WorkerGuard> {
     // "YYYY-MM-DD HH:mm:ss" in the server's local timezone.
     let timer = tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S".to_string());
     let stdout_layer = Layer::default().with_timer(timer.clone());
@@ -297,8 +298,8 @@ fn init_tracing(
         None => PathBuf::from("./logs"),
     };
 
-    let appender = match tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
+    let appender = match tracing_appender_localtime::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender_localtime::rolling::Rotation::DAILY)
         // The builder joins prefix and date with '.' → master.YYYY-MM-DD.
         .filename_prefix(role)
         .max_log_files(MAX_LOG_FILES)
@@ -319,7 +320,7 @@ fn init_tracing(
         }
     };
 
-    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let (writer, guard) = tracing_appender_localtime::non_blocking(appender);
     tracing_subscriber::registry()
         .with(filter)
         .with(stdout_layer)
