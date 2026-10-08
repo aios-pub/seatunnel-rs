@@ -57,7 +57,9 @@ use seatunnel_api::source::{Boundedness, Source};
 use seatunnel_api::{ColumnDef, ColumnType, Field};
 use seatunnel_connector_common::ConnectorConfig;
 use seatunnel_formats::MessageFormat;
-use seatunnel_formats::canal_client_json::{CanalClientConfig, CanalClientEncoder, PAIRING_WINDOW};
+use seatunnel_formats::canal_client_json::{
+    CanalClientConfig, CanalClientEncoder, KeyNaming, PAIRING_WINDOW,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -243,6 +245,10 @@ impl RabbitMqConfig {
                         ),
                     )
                     .max(0) as u64,
+                key_naming: KeyNaming::parse(&config.get_string(
+                    "canal-client.key-naming",
+                    &config.get_string("canal-client.key_naming", ""),
+                )),
             }),
             field_delimiter: config.get_string("field.delimiter", ","),
             columns: config
@@ -1568,12 +1574,19 @@ mod tests {
             ("canal-client.database-name", "db1"),
             ("canal-client.table-name", "t1"),
             ("canal-client.pairing_window_ms", "250"),
+            ("canal-client.key-naming", "snake_case"),
         ]);
         let canal = config.canal_client.expect("canal-client config present");
         assert_eq!(canal.database_name, "db1");
         assert_eq!(canal.table_name, "t1");
         assert!(canal.columns.is_empty());
         assert_eq!(canal.pairing_window_ms, 250);
+        assert_eq!(canal.key_naming, KeyNaming::SnakeCase);
+        // Unset → default camelCase envelope.
+        let canal = config_from(&[("format", "canal_client_json")])
+            .canal_client
+            .expect("canal-client config present");
+        assert_eq!(canal.key_naming, KeyNaming::CamelCase);
     }
 
     #[test]

@@ -48,7 +48,7 @@ sink:
     bootstrap.servers: "127.0.0.1:9092"
     topic: users-canal-auto
     format: canal_client_json
-    # Message dbName/tableName (lowercased in the payload).
+    # Message dbName/tableName (source identifier's original case).
     canal-client.database-name: seatunnel
     canal-client.table-name: users
     # Automatic mapping: columns + primary key from the initial-schema

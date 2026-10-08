@@ -911,6 +911,12 @@ impl KafkaSinkConfig {
                                 ),
                             )
                             .max(0) as u64,
+                        key_naming: seatunnel_formats::canal_client_json::KeyNaming::parse(
+                            &config.get_string(
+                                "canal-client.key-naming",
+                                &config.get_string("canal-client.key_naming", ""),
+                            ),
+                        ),
                     })
                 })
                 .flatten(),
@@ -2321,6 +2327,10 @@ mod tests {
         assert_eq!(canal.database_name, "MyDb");
         assert_eq!(canal.columns, vec!["id", "name", "status"]);
         assert_eq!(canal.server_time_zone, "local"); // default: server zone
+        assert_eq!(
+            canal.key_naming,
+            seatunnel_formats::canal_client_json::KeyNaming::CamelCase
+        ); // default envelope style
         assert!(canal.tables.contains_key("lClassStudent"));
         // Encoder builds and finds the mapping.
         assert!(seatunnel_formats::canal_client_json::CanalClientEncoder::new(canal).is_ok());
@@ -2332,6 +2342,44 @@ mod tests {
             KafkaSinkConfig::from_config(&ConnectorConfig::new(props2))
                 .canal_client
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn test_canal_client_key_naming_parsing() {
+        use seatunnel_formats::canal_client_json::KeyNaming;
+        let parse = |extra: &[(&str, &str)]| {
+            let base = [
+                ("format", "canal_client_json"),
+                ("canal-client.database-name", "MyDb"),
+                ("canal-client.table-name", "users"),
+            ];
+            let props: HashMap<String, String> = base
+                .iter()
+                .chain(extra.iter())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            KafkaSinkConfig::from_config(&ConnectorConfig::new(props))
+                .canal_client
+                .expect("canal config present")
+                .key_naming
+        };
+        // Unset → default camelCase.
+        assert_eq!(parse(&[]), KeyNaming::CamelCase);
+        // kebab option name, snake value.
+        assert_eq!(
+            parse(&[("canal-client.key-naming", "snake_case")]),
+            KeyNaming::SnakeCase
+        );
+        // snake_case alias of the option name.
+        assert_eq!(
+            parse(&[("canal-client.key_naming", "camelCase")]),
+            KeyNaming::CamelCase
+        );
+        // Unrecognized values fall back to the default.
+        assert_eq!(
+            parse(&[("canal-client.key-naming", "bogus")]),
+            KeyNaming::CamelCase
         );
     }
 

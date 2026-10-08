@@ -31,11 +31,15 @@ sink:
     bootstrap.servers: "127.0.0.1:9092"
     topic: users-canal-client
     format: canal_client_json
-    # Message dbName/tableName (lowercased in the payload); the camelCase
-    # form of the table name (l_class_student → lClassStudent) selects
-    # the sub-table-fields entry.
+    # Message dbName/tableName (source identifier's original case); the
+    # camelCase form of the table name (l_class_student → lClassStudent)
+    # selects the sub-table-fields entry.
     canal-client.database-name: seatunnel
     canal-client.table-name: users
+    # Envelope key style: camelCase (default) | snake_case
+    # (request_id/db_name/table_name/event_type/old_data). Data field
+    # names are never converted.
+    canal-client.key-naming: camelCase
     # Positional → db column names (CDC rows arrive positionally).
     canal-client.columns: "id,name,score,created_at"
     # Java subTableFieldsJson shape: camel table → {key, must, update}.

@@ -114,9 +114,13 @@ any schema event), or you can pin an explicit mapping with
 (mirroring the Kafka sink): `canal-client.database-name`,
 `canal-client.table-name`, `canal-client.columns`,
 `canal-client.sub-table-fields`, `canal-client.server-time-zone`,
-`canal-client.pairing-window-ms`. All messages share the configured
-exchange/routing-key — `message.table`-based routing is a Kafka-topic
-concept and is ignored here.
+`canal-client.pairing-window-ms`, `canal-client.key-naming`
+(`camelCase` (default) | `snake_case` — switches ONLY the envelope keys
+to `request_id` / `db_name` / `table_name` / `event_type` / `old_data`;
+`data` field names stay as configured and `dbName` / `tableName` values
+keep the source identifier's original case). All messages share the
+configured exchange/routing-key — `message.table`-based routing is a
+Kafka-topic concept and is ignored here.
 
 ```yaml
 sink:

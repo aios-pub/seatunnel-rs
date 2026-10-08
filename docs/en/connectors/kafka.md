@@ -29,6 +29,13 @@ Reproduces the Java `AbstractCanalClient` message shape for the Kafka sink:
 }
 ```
 
+Envelope keys are camelCase by default. Set `canal-client.key-naming:
+snake_case` to spell them `request_id` / `db_name` / `table_name` /
+`event_type` / `data` / `old_data` instead. Only the envelope keys follow
+the style — `data` / `oldData` field names always stay exactly as
+configured, and the `dbName` / `tableName` values keep the source
+identifier's original case (no lowercasing).
+
 Transformation rules (faithful to the Java implementation):
 
 - table name → camelCase (`l_class_student` → `lClassStudent`) selects the
@@ -61,6 +68,7 @@ sink:
     format: canal_client_json
     canal-client.database-name: seatunnel
     canal-client.table-name: users
+    canal-client.key-naming: camelCase           # camelCase (default) | snake_case
     canal-client.columns: "id,name,score"        # positional → db column
     canal-client.sub-table-fields: >-
       { "users": { "key": "id",

@@ -23,13 +23,19 @@
 //! ```json
 //! {
 //!   "requestId": "32-hex UUID without dashes",
-//!   "dbName": "lowercase database name",
-//!   "tableName": "lowercase table name",
+//!   "dbName": "database name in its original case",
+//!   "tableName": "table name in its original case",
 //!   "eventType": "insert | update | delete",
 //!   "data":    { "<target field>": <converted value>, ... },
 //!   "oldData": { ... update events only ... }
 //! }
 //! ```
+//!
+//! The envelope keys follow [`KeyNaming`] (`canal-client.key-naming`):
+//! camelCase (default, above) or snake_case (`request_id`, `db_name`,
+//! `table_name`, `event_type`, `old_data`). `data`/`oldData` field names
+//! and the `dbName`/`tableName` values are never converted — they carry
+//! the source identifiers as-is.
 //!
 //! Transformation rules (faithful to the Java implementation):
 //! - table names are looked up in the per-table field config by their
@@ -172,6 +178,55 @@ fn parse_fixed_offset(value: &str) -> Option<chrono::FixedOffset> {
     }
 }
 
+/// Naming style of the message ENVELOPE keys (`canal-client.key-naming`).
+/// Only the outer envelope keys follow the style; `data`/`oldData` field
+/// names always stay as configured, and `dbName`/`tableName` values are
+/// emitted in the source identifier's original case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyNaming {
+    /// `requestId`/`dbName`/`tableName`/`eventType`/`data`/`oldData`
+    /// (default — the historical canal-client shape).
+    #[default]
+    CamelCase,
+    /// `request_id`/`db_name`/`table_name`/`event_type`/`data`/`old_data`.
+    SnakeCase,
+}
+
+impl KeyNaming {
+    /// Accepts `camelCase`/`camel_case`/`camel` and `snake_case`/`snake`
+    /// (case- and separator-insensitive). Empty falls back to the default;
+    /// unrecognized values warn and fall back (mirroring
+    /// [`ServerTz::parse`]).
+    pub fn parse(value: &str) -> KeyNaming {
+        let normalized: String = value
+            .trim()
+            .chars()
+            .filter(|c| *c != '-' && *c != '_')
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        match normalized.as_str() {
+            "" | "camel" | "camelcase" => KeyNaming::CamelCase,
+            "snake" | "snakecase" => KeyNaming::SnakeCase,
+            _ => {
+                tracing::warn!(
+                    "canal-client: unrecognized key-naming '{}', using camelCase",
+                    value.trim()
+                );
+                KeyNaming::CamelCase
+            }
+        }
+    }
+
+    /// The envelope key literal for this style, given its camelCase and
+    /// snake_case spellings.
+    fn envelope(&self, camel: &'static str, snake: &'static str) -> &'static str {
+        match self {
+            KeyNaming::CamelCase => camel,
+            KeyNaming::SnakeCase => snake,
+        }
+    }
+}
+
 /// Full canal-client format configuration.
 #[derive(Debug, Clone)]
 pub struct CanalClientConfig {
@@ -194,6 +249,9 @@ pub struct CanalClientConfig {
     /// microseconds-to-milliseconds apart in the binlog stream).
     /// Default: [`PAIRING_WINDOW`].
     pub pairing_window_ms: u64,
+    /// Envelope key naming style of the produced messages.
+    /// Default: [`KeyNaming::CamelCase`].
+    pub key_naming: KeyNaming,
 }
 
 /// snake_case → camelCase with the FIRST letter left untouched
@@ -332,6 +390,7 @@ struct TableState {
     table_name: String,
     fields: TableFields,
     tz: ServerTz,
+    key_naming: KeyNaming,
     column_positions: HashMap<String, usize>,
     /// Adjacent UPDATE before-image awaiting its UPDATE_AFTER partner
     /// (or the torn-pair expiry).
@@ -408,18 +467,34 @@ impl TableState {
     ) -> CanalMessage {
         let mut message = Map::new();
         message.insert(
-            "requestId".into(),
+            self.key_naming
+                .envelope("requestId", "request_id")
+                .into(),
             Value::String(uuid::Uuid::new_v4().simple().to_string()),
         );
-        message.insert("dbName".into(), Value::String(self.db_name.to_lowercase()));
         message.insert(
-            "tableName".into(),
-            Value::String(self.table_name.to_lowercase()),
+            self.key_naming.envelope("dbName", "db_name").into(),
+            Value::String(self.db_name.clone()),
         );
-        message.insert("eventType".into(), Value::String(event_type.to_string()));
+        message.insert(
+            self.key_naming
+                .envelope("tableName", "table_name")
+                .into(),
+            Value::String(self.table_name.clone()),
+        );
+        message.insert(
+            self.key_naming
+                .envelope("eventType", "event_type")
+                .into(),
+            Value::String(event_type.to_string()),
+        );
+        // Spelled `data` in both naming styles.
         message.insert("data".into(), Value::Object(data));
         if let Some(old) = old_data {
-            message.insert("oldData".into(), Value::Object(old));
+            message.insert(
+                self.key_naming.envelope("oldData", "old_data").into(),
+                Value::Object(old),
+            );
         }
         CanalMessage {
             table: format!("{}.{}", self.db_name, self.table_name),
@@ -584,6 +659,7 @@ impl CanalClientEncoder {
                 table_name: config.table_name.clone(),
                 fields,
                 tz,
+                key_naming: config.key_naming,
                 column_positions,
                 pending: None,
             },
@@ -738,6 +814,7 @@ impl CanalClientEncoder {
                 table_name: table_name.to_string(),
                 fields,
                 tz: self.tz,
+                key_naming: self.config.key_naming,
                 column_positions,
                 pending: None,
             },
@@ -892,6 +969,7 @@ pub fn deserialize(bytes: &[u8], schema: &TableSchema) -> Result<Vec<Row>, Box<d
     let value: Value = serde_json::from_slice(bytes)?;
     let event_type = value
         .get("eventType")
+        .or_else(|| value.get("event_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("insert");
     let kind = match event_type {
@@ -958,10 +1036,10 @@ pub fn serialize(schema: &TableSchema, row: &Row) -> Result<Vec<u8>, Box<dyn Err
         .as_deref()
         .map(split_table_identifier)
         .unwrap_or(("", ""));
-    message.insert("dbName".to_string(), Value::String(db_name.to_lowercase()));
+    message.insert("dbName".to_string(), Value::String(db_name.to_string()));
     message.insert(
         "tableName".to_string(),
-        Value::String(table_name.to_lowercase()),
+        Value::String(table_name.to_string()),
     );
     let (event_type, _) = match row.kind {
         RowKind::Insert => ("insert", ()),
@@ -1089,6 +1167,7 @@ mod tests {
             tables,
             server_time_zone: "UTC".to_string(),
             pairing_window_ms: PAIRING_WINDOW.as_millis() as u64,
+            key_naming: KeyNaming::CamelCase,
         }
     }
 
@@ -1111,7 +1190,8 @@ mod tests {
         let (key, payload) = (&messages[0].key, &messages[0].payload);
         assert_eq!(key, "1001");
         let json: Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(json["dbName"], "neworiental_data_recommand");
+        // Names keep the source identifier's original case.
+        assert_eq!(json["dbName"], "NewOriental_Data_Recommand");
         assert_eq!(json["tableName"], "l_class_student");
         assert_eq!(json["eventType"], "insert");
         assert_eq!(json["data"]["id"], 1001);
@@ -1290,6 +1370,7 @@ mod tests {
             tables: HashMap::new(),
             server_time_zone: "UTC".to_string(),
             pairing_window_ms: PAIRING_WINDOW.as_millis() as u64,
+            key_naming: KeyNaming::CamelCase,
         }
     }
 
@@ -1441,6 +1522,7 @@ mod tests {
             tables: HashMap::new(),
             server_time_zone: "UTC".to_string(),
             pairing_window_ms: PAIRING_WINDOW.as_millis() as u64,
+            key_naming: KeyNaming::CamelCase,
         };
         let encoder = CanalClientEncoder::from_schema(config, &schema).unwrap();
         assert_eq!(encoder.fields().key, "code");
@@ -1622,7 +1704,64 @@ mod tests {
         row.origin_table = Some("MyDb.MyTable".to_string());
         let bytes = serialize(&auto_schema(), &row).unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["dbName"], "mydb");
-        assert_eq!(json["tableName"], "mytable");
+        // Origin identifiers keep their original case.
+        assert_eq!(json["dbName"], "MyDb");
+        assert_eq!(json["tableName"], "MyTable");
+    }
+
+    #[test]
+    fn test_key_naming_parse_forms() {
+        assert_eq!(KeyNaming::parse(""), KeyNaming::CamelCase);
+        assert_eq!(KeyNaming::parse("camelCase"), KeyNaming::CamelCase);
+        assert_eq!(KeyNaming::parse("CAMEL_CASE"), KeyNaming::CamelCase);
+        assert_eq!(KeyNaming::parse(" camel "), KeyNaming::CamelCase);
+        assert_eq!(KeyNaming::parse("snake_case"), KeyNaming::SnakeCase);
+        assert_eq!(KeyNaming::parse("SnakeCase"), KeyNaming::SnakeCase);
+        assert_eq!(KeyNaming::parse(" snake "), KeyNaming::SnakeCase);
+        // Bogus values warn and fall back to the default.
+        assert_eq!(KeyNaming::parse("kebab"), KeyNaming::CamelCase);
+        assert_eq!(KeyNaming::default(), KeyNaming::CamelCase);
+    }
+
+    #[test]
+    fn test_encoder_snake_case_envelope_keeps_field_names() {
+        // snake_case rewrites ONLY the envelope keys; data field names and
+        // the dbName/tableName values stay exactly as configured.
+        let mut config = fields_config();
+        config.key_naming = KeyNaming::SnakeCase;
+        let mut encoder = CanalClientEncoder::new(config).unwrap();
+        encoder
+            .encode(&row_of(RowKind::UpdateBefore, 1001, "李四", 0))
+            .unwrap();
+        let messages = encoder
+            .encode(&row_of(RowKind::UpdateAfter, 1001, "张三", 0))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let json: Value = serde_json::from_str(&messages[0].payload).unwrap();
+        assert_eq!(json["event_type"], "update");
+        assert_eq!(json["db_name"], "NewOriental_Data_Recommand");
+        assert_eq!(json["table_name"], "l_class_student");
+        assert_eq!(json["request_id"].as_str().unwrap().len(), 32);
+        // data/old_data field names are NOT converted.
+        assert_eq!(json["data"]["name"], "张三");
+        assert_eq!(json["old_data"]["name"], "李四");
+        assert_eq!(json["old_data"]["status"], 0);
+        // camelCase spellings are absent.
+        assert!(json.get("eventType").is_none());
+        assert!(json.get("dbName").is_none());
+        assert!(json.get("oldData").is_none());
+        assert!(json.get("requestId").is_none());
+    }
+
+    #[test]
+    fn test_deserialize_accepts_both_key_naming_styles() {
+        // camelCase (default production style).
+        let camel = r#"{"eventType":"delete","data":{"id":7}}"#;
+        let rows = deserialize(camel.as_bytes(), &auto_schema()).unwrap();
+        assert_eq!(rows[0].kind, RowKind::Delete);
+        // snake_case envelope decodes identically.
+        let snake = r#"{"event_type":"delete","data":{"id":7}}"#;
+        let rows = deserialize(snake.as_bytes(), &auto_schema()).unwrap();
+        assert_eq!(rows[0].kind, RowKind::Delete);
     }
 }
