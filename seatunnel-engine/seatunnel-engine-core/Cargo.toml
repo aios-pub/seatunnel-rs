@@ -8,6 +8,7 @@ description = "Apache SeaTunnel Rust - Engine Core: DAG, Plan, Task model"
 
 [dependencies]
 seatunnel-api = { path = "../../seatunnel-api" }
+seatunnel-common = { path = "../../seatunnel-common" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }

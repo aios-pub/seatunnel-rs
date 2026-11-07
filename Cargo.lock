@@ -6375,6 +6375,7 @@ dependencies = [
  "parking_lot",
  "prost 0.13.5",
  "seatunnel-api",
+ "seatunnel-common",
  "seatunnel-connector-cdc-mysql",
  "seatunnel-connector-cdc-postgres",
  "seatunnel-connector-cdc-tidb",

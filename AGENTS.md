@@ -7,6 +7,14 @@ Requirements:
 2. Git commit messages must be written in English, follow conventional‑commits specification.
 3. Follow Rust idioms, keep code consistent with existing project style.
 
+## String Truncation (iron rule)
+
+Rust `str` is UTF-8: `len()` counts **bytes**, and `&s[..n]` / `s.truncate(n)` **panic** when `n` lands inside a multi-byte character. CDC rows routinely carry Chinese text, and byte-index truncation crashed a production task exactly this way (byte 200 fell inside '刻', bytes 198..201).
+
+1. Never slice or truncate a `str` by a byte count. Truncation must go through `seatunnel_common::truncate_chars(s, n)` — char-boundary based (`chars().take(n)`), appends `…` when it cuts, cannot panic on any input.
+2. Any code that must index into a `str` by position first proves the index is a char boundary (`is_char_boundary`) or is provably operating on ASCII-only content.
+3. Slicing `&[u8]` buffers or `Vec` elements is unaffected — this rule is about `str`/`String` only.
+
 ## Error Observability
 
 Error logs must answer three questions: which `file:line` produced the error, what the underlying cause chain is, and what the stack was on a panic. The shared infrastructure lives in the `seatunnel-common` crate; follow these rules:

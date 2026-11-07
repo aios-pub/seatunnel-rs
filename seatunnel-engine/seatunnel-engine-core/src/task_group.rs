@@ -153,17 +153,17 @@ struct StageTimes {
 }
 
 /// Compact `f0=.., f1=..` rendering of a row for DATA log lines.
+///
+/// Capped via `truncate_chars` — rows routinely carry Chinese text, and
+/// byte slicing (`&joined[..200]`) panicked in production when the cut
+/// landed inside a multi-byte character.
 fn row_summary(row: &seatunnel_api::Row) -> String {
     let mut parts = Vec::new();
     for i in 0..row.field_count() {
         parts.push(format!("f{}={:?}", i, row.get(i)));
     }
     let joined = parts.join(", ");
-    if joined.len() > 200 {
-        format!("{}…", &joined[..200])
-    } else {
-        joined
-    }
+    seatunnel_common::truncate_chars(&joined, 200).into_owned()
 }
 
 /// Checkpoint id used for the final checkpoint at task exit (Java's

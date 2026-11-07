@@ -3,15 +3,17 @@
  * contributor license agreements.
  */
 
-//! Shared process-level observability infrastructure.
+//! Shared process-level infrastructure: observability helpers every
+//! SeaTunnel binary wires in, plus small always-safe string utilities.
 //!
-//! Small, dependency-light helpers every SeaTunnel binary wires in, so a
-//! failure in the logs can answer three questions: where it was produced
-//! (file:line, via [`Located`]/[`Locate::located`]), what the underlying
-//! cause chain is ([`error_chain`]), and — for panics — the full stack
-//! trace ([`install_panic_hook`], routed through the structured logger so
-//! it lands in the rolling log files like any other error).
+//! The observability helpers make a failure in the logs answer three
+//! questions: where it was produced (file:line, via
+//! [`Located`]/[`Locate::located`]), what the underlying cause chain is
+//! ([`error_chain`]), and — for panics — the full stack trace
+//! ([`install_panic_hook`], routed through the structured logger so it
+//! lands in the rolling log files like any other error).
 
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::panic::Location;
@@ -72,6 +74,38 @@ pub fn error_chain(err: &(impl StdError + ?Sized)) -> String {
         cause = e.source();
     }
     out
+}
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, appending an
+/// ellipsis (`…`) when something was cut. This is the unified truncation
+/// helper (see AGENTS.md "String truncation"): never slice a `str` by a
+/// byte count — `len()` counts bytes and `&s[..n]` panics when `n` lands
+/// inside a multi-byte character (Chinese CDC data made exactly that
+/// panic in production: byte 200 fell mid-'刻').
+///
+/// Char-boundary based (`chars().take(n)`), so it cannot panic on any
+/// input. `str::floor_char_boundary` would keep a byte budget instead but
+/// is nightly-only; callers here cap log verbosity, where a char budget
+/// is the meaningful unit anyway.
+///
+/// ```rust
+/// use seatunnel_common::truncate_chars;
+///
+/// // Short input comes back borrowed, untouched.
+/// assert_eq!(truncate_chars("hello", 10), "hello");
+/// // Multi-byte text truncates on a char boundary, ellipsis marks the cut.
+/// let s = "时刻".repeat(3);
+/// assert_eq!(truncate_chars(&s, 4), "时刻时刻…");
+/// ```
+pub fn truncate_chars(s: &str, max_chars: usize) -> Cow<'_, str> {
+    // `nth(max_chars)` is `Some` only when the string outlives the budget,
+    // so short inputs stay borrowed without counting every char.
+    if s.chars().nth(max_chars).is_none() {
+        return Cow::Borrowed(s);
+    }
+    let mut truncated: String = s.chars().take(max_chars).collect();
+    truncated.push('…');
+    Cow::Owned(truncated)
 }
 
 /// An error stamped with the location of the code that produced it — the
@@ -244,5 +278,40 @@ mod tests {
         // Idempotent global install; the hook only logs, so a panic later
         // in the test process still unwinds through the harness normally.
         install_panic_hook();
+    }
+
+    #[test]
+    fn truncate_chars_short_input_is_borrowed_untouched() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("", 5), "");
+        // Exactly at the budget: no ellipsis.
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        assert!(matches!(truncate_chars("时刻", 2), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn truncate_chars_cuts_on_char_boundaries_with_ellipsis() {
+        assert_eq!(truncate_chars("hello world", 5), "hello…");
+        assert_eq!(truncate_chars("时刻时刻时刻", 4), "时刻时刻…");
+        assert_eq!(truncate_chars("a时刻b", 3), "a时刻…");
+        // Budget 0 keeps only the ellipsis marker.
+        assert_eq!(truncate_chars("时刻", 0), "…");
+    }
+
+    #[test]
+    fn truncate_chars_never_panics_where_byte_slicing_did() {
+        // The production incident: the old code sliced `&s[..200]` and
+        // byte 200 fell inside '刻' (bytes 198..201), panicking. Here
+        // '刻' still straddles byte 200, but the 100-char string fits the
+        // 200-char budget untouched — no byte slicing ever runs.
+        let incident = "时".repeat(66) + "刻" + &"时".repeat(33);
+        assert_eq!(incident.len(), 300); // '刻' occupies bytes 198..201
+        assert_eq!(truncate_chars(&incident, 200), incident);
+
+        // Even with truncation, the cut lands after a whole character.
+        let long = "刻".repeat(300);
+        let cut = truncate_chars(&long, 200);
+        assert_eq!(cut.chars().count(), 201); // 200 chars + ellipsis
+        assert!(cut.ends_with('…'));
     }
 }
